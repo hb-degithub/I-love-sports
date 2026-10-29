@@ -22,13 +22,21 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # 直接使用 GitHub runner 预装的 Android SDK（不依赖 setup-android 动作，
+      # 该动作自带的 sdkmanager --licenses 在新版 cmdline-tools 上会异常退出）
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android platform / build-tools
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::找不到 sdkmanager"; exit 1
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          ( yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 ) || true
+          "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0" "platform-tools" || true
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
 
       - name: Cache Gradle
         uses: actions/cache@v4
