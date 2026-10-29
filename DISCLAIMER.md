@@ -1,5 +1,7 @@
 # 免责声明与使用限制（必读）
 
+> 许可证：[PolyForm Noncommercial License 1.0.0](LICENSE) —— **禁止任何商业用途**（要点见 [LICENSE-ZH.md](LICENSE-ZH.md)）。
+
 > **本项目仅供学习、研究与自有设备上的技术验证使用。**
 > **严禁用于任何违规、违法或损害他人权益的用途。**
 
