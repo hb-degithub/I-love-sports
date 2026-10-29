@@ -69,7 +69,7 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="$(sed -n 's/.*versionName "\(.*\)".*/\1/p' app/build.gradle | head -1)"
           APK="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
-          OUT="virtual-motion-${TAG}-v${VERSION}.apk"
+          OUT="virtual-motion-${VERSION}.apk"
           cp "$APK" "$OUT"
           echo "ASSET=$OUT" >> "$GITHUB_ENV"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
@@ -96,7 +96,7 @@ jobs:
 
             ### 安装
             ```bash
-            adb install -r virtual-motion-${{ env.TAG }}-v*.apk
+            adb install -r virtual-motion-*.apk
             ```
             - 需要 root（Magisk / KernelSU / APatch）；隐藏模块需 LSPosed 并勾选作用域
             - 这是 **debug 签名** 的构建产物，仅供测试

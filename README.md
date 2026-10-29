@@ -1,5 +1,20 @@
 # 虚拟运动（root 版）
 
+<p>
+  <a href="https://github.com/hb-degithub/I-love-sports/actions/workflows/android.yml">
+    <img src="https://github.com/hb-degithub/I-love-sports/actions/workflows/android.yml/badge.svg" alt="Android CI"></a>
+  <a href="https://github.com/hb-degithub/I-love-sports/releases/latest">
+    <img src="https://img.shields.io/github/v/release/hb-degithub/I-love-sports" alt="Release"></a>
+  <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-red" alt="禁止商用">
+  <img src="https://img.shields.io/badge/camera-未完成-orange" alt="虚拟摄像头未完成">
+</p>
+
+## 📦 下载
+
+最新构建（CI 自动产出）：**[Releases](https://github.com/hb-degithub/I-love-sports/releases/latest)** ——
+`virtual-motion-<版本>.apk` + `.sha256`；每次打 `v*` tag 会自动构建并发布。
+
+
 > ## ⚠️ 项目状态：虚拟摄像头功能**尚未完成**
 >
 > - **定位/运动模拟：可用**（虚拟定位注入、路径播放、拟真、GNSS 卫星回放、计步/IMU、LSPosed 隐藏模块）
