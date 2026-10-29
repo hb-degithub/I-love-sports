@@ -16,18 +16,25 @@ android {
         resourceConfigurations += ['zh', 'en']
     }
 
+    // 调试签名：本地有自备 debug.keystore 就用它，否则回退到 Android 默认 debug 签名
+    // （CI/新克隆的仓库里没有 .toolchain/keystore，必须能正常构建）
+    def localDebugKeystore = rootProject.file('.toolchain/keystore/debug.keystore')
     signingConfigs {
-        debug {
-            storeFile rootProject.file('.toolchain/keystore/debug.keystore')
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
+        if (localDebugKeystore.exists()) {
+            debug {
+                storeFile localDebugKeystore
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
         }
     }
 
     buildTypes {
         debug {
-            signingConfig signingConfigs.debug
+            if (localDebugKeystore.exists()) {
+                signingConfig signingConfigs.debug
+            }
         }
         release {
             minifyEnabled false

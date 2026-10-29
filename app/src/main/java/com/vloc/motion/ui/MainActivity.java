@@ -2094,6 +2094,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                         + "· 至少 2 个点后可播放，速度/循环可调\n"
                         + "· 通过 root 给应用授予模拟位置权限，再接管系统 gps/network Provider\n"
                         + "· 停止或退出后会还原真实定位\n\n"
+                        + "\n⚠️ 仅供学习与技术研究，严禁用于打卡作弊、位置欺诈、绕过风控等违规违法用途。"
+                        + "使用违反多数应用的用户协议，可能导致账号封禁；一切后果自负。完整条款见仓库 DISCLAIMER.md。\n\n"
                         + "注意：测试 Provider 写入的定位在系统层会被标记为模拟位置，"
                         + "部分应用会检测并拒绝。安装 hidden 隐藏模块并在 LSPosed 中启用，可清除该标记。")
                 .setPositiveButton("知道了", null)
