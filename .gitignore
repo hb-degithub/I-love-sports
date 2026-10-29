@@ -1,0 +1,29 @@
+# 构建产物
+build/
+app/build/
+hidden/build/
+dist/
+*.apk
+*.aab
+*.ap_
+*.log
+
+# 本地工具链与缓存（体积大，不入库）
+.toolchain/
+.gradle-home/
+.gradle/
+local.properties
+.env
+
+# 签名与密钥（绝对不要入库）
+*.jks
+*.keystore
+keystore/
+debug.keystore
+google-services.json
+
+# IDE / 系统
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

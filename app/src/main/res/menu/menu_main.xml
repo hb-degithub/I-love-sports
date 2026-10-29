@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/action_setup"
+        android:title="@string/menu_setup"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_save_route"
+        android:title="@string/menu_save_route"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_route_library"
+        android:title="@string/menu_route_library"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_tile_source"
+        android:title="地图源"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_presets"
+        android:title="预设路线…"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_goal"
+        android:title="目标配速…"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_locate"
+        android:title="定位到当前位置"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_add_coord"
+        android:title="输入坐标添加点"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_import"
+        android:title="@string/menu_import"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_export"
+        android:title="@string/menu_export"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_float"
+        android:checkable="true"
+        android:title="悬浮窗"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_module_status"
+        android:title="模块状态与启用步骤"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_map_diag"
+        android:title="地图诊断"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_root_diag"
+        android:title="Root 诊断"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_camera"
+        android:title="虚拟摄像头…"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_settings"
+        android:title="@string/menu_settings"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_about"
+        android:title="@string/menu_about"
+        app:showAsAction="never" />
+</menu>

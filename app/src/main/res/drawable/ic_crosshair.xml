@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- 外圈 -->
+    <path
+        android:fillColor="#E53935"
+        android:pathData="M24,8a16,16 0 1,0 0.001,0z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,12a12,12 0 1,0 0.001,0z" />
+    <path
+        android:fillColor="#E53935"
+        android:pathData="M24,17a7,7 0 1,0 0.001,0z" />
+    <!-- 十字准星 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M23,2h2v8h-2zM23,38h2v8h-2zM2,23h8v2h-8zM38,23h8v2h-8z" />
+</vector>

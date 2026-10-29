@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchGoalEnabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="启用目标配速模式"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="单圈距离"
+            android:textStyle="bold" />
+
+        <Spinner
+            android:id="@+id/spinnerLap"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="目标距离"
+            android:textStyle="bold" />
+
+        <Spinner
+            android:id="@+id/spinnerDistance"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="目标配速（分钟/公里）"
+            android:textStyle="bold" />
+
+        <Spinner
+            android:id="@+id/spinnerPace"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="最大速度（km/h，正常成年人约 5–20）"
+            android:textStyle="bold" />
+
+        <Spinner
+            android:id="@+id/spinnerMaxSpeed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchSpeedVariance"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="速度混淆（时快时慢，随机化每段速度）" />
+
+        <TextView
+            android:id="@+id/goalPreview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="#0A2962FF"
+            android:lineSpacingExtra="2dp"
+            android:padding="10dp"
+            android:text=""
+            android:textColor="@color/brand"
+            android:textSize="13sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:lineSpacingExtra="2dp"
+            android:text="自动计算：实际距离 = 圈数 × 单圈距离（≥ 目标距离）；目标时间 = 实际距离 × 配速；播放时按分段随机速度，总时长误差 ≤10 秒，单段速度不超过平均速度 1.25 倍且不超过最大速度。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+    </LinearLayout>
+</ScrollView>

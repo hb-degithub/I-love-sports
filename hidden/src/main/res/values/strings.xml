@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">虚拟运动·隐藏模块</string>
+
+    <string name="info_version">版本 %1$s · LSPosed 模块 · 仅用于测试与学习</string>
+
+    <string name="info_intro_title">模块作用</string>
+    <string name="info_intro_body">主 App 在 root 环境下用 appops 取得模拟位置权限，再通过 LocationManager 的测试 provider 注入坐标；系统会把注入的 Location 标记为“模拟位置”，严格检测的 App 会据此识破。\n本模块通过 LSPosed 注入目标 App 进程，清除 Location 上的模拟标记，并遮蔽 Settings / AppOps / ContentProvider / Parcel 等旁路自查，还能按主 App 的环境快照回放基站 / Wi-Fi（或清空），让目标 App 认为定位来自真实传感器。\n模块只处理标记与旁路查询，不参与坐标计算，也不修改坐标、速度、海拔、时间、精度等定位数据本身（这些由主 App 的拟真模式负责）。</string>
+
+    <string name="info_hooks_title">已注入的 Hook</string>
+    <string name="info_hooks_body">【Location 标记】\n1. isFromMockProvider() → 恒为 false（Android 8 起）\n2. isMock() → 恒为 false（Android 12 起；低版本自动跳过）\n3. setMock(boolean) / setIsFromMockProvider(boolean) → 空操作\n4. getExtras() → 剔除 key 含 mock 的残留字段（复制副本后删除，不改原对象）\n\n【Settings 旁证】\n5. Settings$Secure / $System / $Global 的 getInt / getLong 及 *ForUser：name 为 mock_location 时返回 0（历史语义：1 = 允许模拟，0 = 不允许）\n6. 同组 getString / getStringForUser：返回 null（Android 6+ 真机该设置已不存在，真值就是 null）\n7. Settings$NameValueCache#getStringForUser 兜底（@hide 内部缓存类，找不到自动跳过；同样返回 null）\n\n【AppOps 旁证】\n8. 8 个 checkOp / unsafeCheckOp 系列方法：op 为 android:mock_location 时表现为“无权限”——NoThrow / Raw 变体返回 MODE_ERRORED，checkOp / unsafeCheckOp 抛 SecurityException（与真机无权限时一致）；其它 op 放行。\n9. getPackagesForOps / getOpsForPackage：把请求里的 mock op 从入参数组剔除；只剩 mock op 时直接返回空 List。\n10. noteOp / noteOpNoThrow / startOp / startOpNoThrow / finishOp：mock op 时抛 SecurityException（throwing 变体）/ 返回 MODE_ERRORED（*NoThrow）/ 空操作（finishOp）。\n\n【ContentProvider 直查】\n11. ContentResolver#query：settings provider 的 secure / system / global 查询若点名 mock_location（含 selection、selectionArgs、Bundle 查询参数、单项 URI），改写为恒假条件，由系统自然返回空 Cursor（不自己造 Cursor）。\n12. ContentResolver#call：settings provider 的 GET_* 且参数为 mock_location → 返回 null。\n\n【Parcel 序列化】\n13. Location#writeToParcel：序列化前临时清掉 mock 位（mFieldsMask 的 HAS_MOCK_PROVIDER_MASK，或旧版 mIsFromMockProvider），序列化完成立刻只恢复这一位，其它掩码位不受影响。\n\n【基站 / Wi-Fi 环境回放（v0.4.0，依赖主 App 快照）】\n14. TelephonyManager#getAllCellInfo()：mode=hide → 空 ArrayList；mode=replay → 按快照构造 CellInfoGsm / CellInfoLte / CellInfoNr（构造失败的类型自动跳过，全部失败返回空列表）。\n15. TelephonyManager#getCellLocation()：mode=hide → null；mode=replay → GsmCellLocation（gsm 用 lac/cid，lte 用 tac/ci 映射）。\n16. WifiManager#getScanResults()：mode=hide → 空 List；mode=replay → 按快照构造 ScanResult 列表（SSID 同时写入 SSID 字段与 wifiSsid，SSID 带双引号；BSSID / level / frequency / capabilities / timestamp）。\n17. WifiInfo#getBSSID() / getSSID()：mode=hide → null；mode=replay → 快照里第一条 wifi（SSID 带双引号，与真机一致）。\n18. 快照来源：content://com.vloc.motion.env/snapshot（主 App 提供，exported 无权限），列 mode = replay / hide / off；无行、查询失败、超时、解析失败一律透传真实值；模块侧缓存 3 秒。\n\n已核对 AOSP 源码（Android 8.1 ~ 14）：模拟标记是 Location.mFieldsMask 中的 HAS_MOCK_PROVIDER_MASK 位，对外只能通过 getter 读取。</string>
+
+    <string name="info_usage_title">使用步骤</string>
+    <string name="info_usage_body">1. 安装本模块 APK（与主 App 在同一台设备），不要卸载主 App。\n2. 打开 LSPosed 管理器 → 模块 → 启用“虚拟运动·隐藏模块”。\n3. 在“作用域”里勾选需要伪装的目标 App（被测 App）；不要勾选主 App 和本模块。\n4. 强制停止目标 App 后重新打开（LSPosed 需要目标进程重启后才生效）。\n5. 回到主 App 选择路线并开始模拟运动（可开启拟真模式）；如需基站 / Wi-Fi 与环境一致，在主 App 打开环境回放（快照由主 App 生成并写入 provider）。\n6. 目标 App 读到的定位、基站、Wi-Fi 都来自快照；主 App 关闭回放（off）或无快照时自动透传真实值。\n\n自检：在 LSPosed 日志中过滤 VLocHidden，应看到 hooks installed in 目标包名 (location=..., settings=..., appops_check=..., appops_extra=..., resolver=..., parcel=..., env=...)。</string>
+
+    <string name="info_limit_title">生效范围与已知限制</string>
+    <string name="info_limit_body">• 只在目标 App 进程内生效；系统设置、其他 App、服务端看到的仍是真实状态。\n• 仍无法覆盖：dumpsys appops 等系统侧 dump、系统 UI 里的「模拟位置应用」列表、传感器物理一致性（加速度计 / 陀螺仪 / 计步器）、服务端轨迹风控与行为分析、root 与 LSPosed 痕迹（su / Magisk / 模块列表 / 栈帧特征）、自定义 Location 子类重写 getter。\n• GnssMeasurements / GnssNavigationMessage / NMEA 句子与 Wi-Fi BSSID / 基站 / IP 归属地交叉校验无法伪造（GnssStatus 卫星状态已由内置模块 v0.18.0 回放，见 docs/phase2-hidden.md）。\n• Location 的 mFieldsMask 只在 writeToParcel 期间临时清位：进程内经反射直接读该字段仍会看到原值。\n• 基站 / Wi-Fi 回放依赖主 App 提供的快照：主 App 未运行、无快照或 mode=off 时直接透传真实基站 / Wi-Fi；查询失败 / 超时也一律透传。\n• 回放的细节字段可能不如真机完整：BSIC / PSC / bands / cqi / timing advance 等使用缺省值，部分 ROM 定制的 ScanResult（如 mWifiSsid、厂商扩展字段）可能为 null；hide 模式下 App 看到“无基站 / 无 Wi-Fi”，若 GPS 仍有位置可能与真实环境矛盾。\n• 被 hook 的方法在异常栈 / Thread.getStackTrace 中可能暴露 XposedBridge / LSPosed 帧，属本方案固有特征。\n• AppOps 的 noteOp / startOp 对 mock op 会被改成“无权限”并吞掉真实调用：若目标 App 真的要用 mock op 做合法操作，会拿到 SecurityException 或 MODE_ERRORED。</string>
+
+    <string name="info_disclaimer_title">免责声明</string>
+    <string name="info_disclaimer_body">本模块仅用于合法授权的测试、学习与自有应用调试，例如验证自家 App 的定位风控是否有效。\n严禁用于打卡作弊、位置造假、欺诈、绕过第三方服务的安全策略或其他违法违规用途；由此产生的一切后果由使用者自行承担，作者不承担任何责任。\n模块不联网、不收集、不上传任何数据，不申请任何敏感权限，也不修改除模拟标记之外的定位内容。</string>
+
+    <string name="info_log_filter_label">日志过滤命令</string>
+    <string name="info_log_filter">adb logcat -s LSPosed-Bridge | grep VLocHidden</string>
+    <string name="info_copy_log">复制日志过滤命令</string>
+    <string name="info_copied">已复制到剪贴板</string>
+    <string name="info_copy_failed">复制失败，请手动输入</string>
+</resources>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">虚拟运动</string>
+    <string name="action_undo">撤销</string>
+    <string name="action_clear">清空</string>
+    <string name="action_spot">临时定位</string>
+    <string name="action_start">开始</string>
+    <string name="action_pause">暂停</string>
+    <string name="action_resume">继续</string>
+    <string name="action_stop">停止</string>
+    <string name="menu_import">导入 GPX</string>
+    <string name="menu_export">导出 GPX</string>
+    <string name="menu_settings">设置</string>
+    <string name="menu_about">关于</string>
+    <string name="hint_pick">轻点地图选点 → 确认添加；长按地图可临时定位；右下角按钮定位真实位置</string>
+    <string name="speed_value">%1$d km/h</string>
+    <string name="action_float">悬浮窗</string>
+    <string name="action_restart">重新开始</string>
+    <string name="setup_title">开工向导</string>
+    <string name="menu_setup">开工向导</string>
+    <string name="menu_save_route">保存当前路线</string>
+    <string name="menu_route_library">路线库</string>
+</resources>
