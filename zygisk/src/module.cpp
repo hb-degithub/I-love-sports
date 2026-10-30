@@ -32,7 +32,7 @@ constexpr const char *kStatePath = "/data/local/tmp/vloc/state.bin";
 /** 状态超过这个时间视为过期（主 App 可能已被杀），透传真实传感器。 */
 constexpr int64_t kStaleMs = 2500;
 
-/** 与 app 侧 VlocStateFile 完全一致的布局（128 字节，小端）。 */
+/** 与 app 侧 VlocStateFile 完全一致的布局（112 字节，小端）。 */
 struct VlocState {
     uint32_t magic;
     uint32_t version;
@@ -51,7 +51,7 @@ struct VlocState {
     int64_t updatedAtMs;
 };
 
-static_assert(sizeof(VlocState) == 128, "VlocState 布局必须与 Java 侧一致");
+static_assert(sizeof(VlocState) == 112, "VlocState 布局必须与 Java 侧一致");
 
 // ---- 传感器类型（android.hardware.Sensor）----
 constexpr int TYPE_ACCELEROMETER = 1;

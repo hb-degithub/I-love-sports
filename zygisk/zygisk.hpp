@@ -319,8 +319,11 @@ inline bool Api::pltHookCommit() {
 
 } // namespace zygisk
 
-[[gnu::visibility("default")]] [[gnu::used]]
-extern "C" void zygisk_module_entry(zygisk::internal::api_table *, JNIEnv *);
+// 注：上游写法是 [[gnu::visibility("default")]] extern "C" ...，clang 会报
+// "an attribute list cannot appear here"（属性不能出现在 linkage 说明符之前），
+// 这里改成 GNU 属性语法并放在 extern "C" 之后，语义相同。
+extern "C" __attribute__((visibility("default"), used))
+void zygisk_module_entry(zygisk::internal::api_table *, JNIEnv *);
 
-[[gnu::visibility("default")]] [[gnu::used]]
-extern "C" void zygisk_companion_entry(int);
+extern "C" __attribute__((visibility("default"), used))
+void zygisk_companion_entry(int);

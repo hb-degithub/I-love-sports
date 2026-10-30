@@ -33,8 +33,12 @@ public final class VlocStateFile {
     /** 'V''L''O''C'，模块用它校验文件有效性。 */
     private static final int MAGIC = 0x434F4C56;
     private static final int VERSION = 1;
-    /** 定长：4+4+4+8 + 4*4 + 4*3 + 4*3 + 4*3 + 4*4 + 4*3 + 4 + 8 = 128 字节。 */
-    public static final int SIZE = 128;
+    /**
+     * 定长 112 字节：magic4 + version4 + active4 + padding4 + steps8 +
+     * cadence4 + speed4 + heading4 + attitude4 + accel12 + gyro12 + gravity12 +
+     * rotation16 + magnetic12 + updatedAt8。
+     */
+    public static final int SIZE = 112;
 
     private static final Object LOCK = new Object();
     private static ByteBuffer sBuffer;
