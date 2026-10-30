@@ -788,48 +788,57 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         statusText.setText(status);
         updateInfoTexts();
 
-        // ===== 交互重构：按"当前能做什么"显示控件，而不是一屏全显 =====
-        // 空闲：可以选点、调速度、改循环；运行中这些都会隐藏，避免误触导致轨迹/速度被改。
-        final boolean idle = session.mode == Session.Mode.IDLE;
-        final int editVisibility = idle ? View.VISIBLE : View.GONE;
-
-        // 目标配速模式下速度完全由配速决定：隐藏手动速度/循环控件，避免"多个速度以哪个为准"
+        // ===== 交互重构：显示规则集中在 MotionUiState（可单元测试） =====
         boolean goalConfigured = RouteStore.loadGoalEnabled(this);
-        boolean hideManualSpeed = goalConfigured || goalMode;
-        boolean hideSettings = hideManualSpeed || !idle;
+        final com.vloc.motion.core.MotionUiState uiState =
+                com.vloc.motion.core.MotionUiState.compute(
+                        session.mode == Session.Mode.ROUTE
+                                ? com.vloc.motion.core.MotionUiState.Mode.ROUTE
+                                : session.mode == Session.Mode.SPOT
+                                        ? com.vloc.motion.core.MotionUiState.Mode.SPOT
+                                        : com.vloc.motion.core.MotionUiState.Mode.IDLE,
+                        session.paused, session.held, session.arrived,
+                        session.traveledMeters, goalMode, goalConfigured);
+
         View speedRow = findViewById(R.id.speedRow);
         if (speedRow != null) {
-            speedRow.setVisibility(hideSettings ? View.GONE : View.VISIBLE);
+            speedRow.setVisibility(uiState.settingsVisible ? View.VISIBLE : View.GONE);
         }
-        loopSwitch.setVisibility(hideSettings ? View.GONE : View.VISIBLE);
-        speedBar.setEnabled(!hideManualSpeed && idle);
-        loopSwitch.setEnabled(!hideManualSpeed && idle);
+        loopSwitch.setVisibility(uiState.settingsVisible ? View.VISIBLE : View.GONE);
+        speedBar.setEnabled(uiState.speedEnabled);
+        loopSwitch.setEnabled(uiState.loopEnabled);
 
-        // 选点类操作只在空闲时可用（运行中改点会让轨迹跳变）
+        final int editVisibility = uiState.editButtonsVisible ? View.VISIBLE : View.GONE;
         findViewById(R.id.btnUndo).setVisibility(editVisibility);
         findViewById(R.id.btnClear).setVisibility(editVisibility);
         findViewById(R.id.btnSpot).setVisibility(editVisibility);
-        if (!hideManualSpeed && session.mode == Session.Mode.IDLE) {
+        if (uiState.speedEnabled) {
             speedValue.setText(getString(R.string.speed_value,
                     speedBar.getProgress() + 1));
         }
-        if (session.mode == Session.Mode.ROUTE) {
-            if (session.held && session.traveledMeters <= 0.5) {
+        switch (uiState.primaryAction) {
+            case START_MOVE:
                 btnStartStop.setText("开始移动");
-            } else if (session.arrived) {
+                break;
+            case RESTART:
                 btnStartStop.setText(R.string.action_restart);
-            } else {
-                btnStartStop.setText(session.paused ? R.string.action_resume : R.string.action_pause);
-            }
-            btnStartStop.setEnabled(true);
-        } else if (session.mode == Session.Mode.SPOT) {
-            btnStartStop.setText(R.string.action_spot);
-            btnStartStop.setEnabled(false);
-        } else {
-            btnStartStop.setText(R.string.action_start);
-            btnStartStop.setEnabled(true);
+                break;
+            case RESUME:
+                btnStartStop.setText(R.string.action_resume);
+                break;
+            case PAUSE:
+                btnStartStop.setText(R.string.action_pause);
+                break;
+            case SPOT:
+                btnStartStop.setText(R.string.action_spot);
+                break;
+            case START:
+            default:
+                btnStartStop.setText(R.string.action_start);
+                break;
         }
-        btnStop.setEnabled(session.mode != Session.Mode.IDLE);
+        btnStartStop.setEnabled(uiState.primaryEnabled());
+        btnStop.setEnabled(uiState.stopEnabled);
         btnStop.setText(session.mode == Session.Mode.IDLE ? "停止" : "彻底停止");
         if (hintText != null) {
             if (session.arrived) {
