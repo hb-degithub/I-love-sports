@@ -788,16 +788,27 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         statusText.setText(status);
         updateInfoTexts();
 
+        // ===== 交互重构：按"当前能做什么"显示控件，而不是一屏全显 =====
+        // 空闲：可以选点、调速度、改循环；运行中这些都会隐藏，避免误触导致轨迹/速度被改。
+        final boolean idle = session.mode == Session.Mode.IDLE;
+        final int editVisibility = idle ? View.VISIBLE : View.GONE;
+
         // 目标配速模式下速度完全由配速决定：隐藏手动速度/循环控件，避免"多个速度以哪个为准"
         boolean goalConfigured = RouteStore.loadGoalEnabled(this);
         boolean hideManualSpeed = goalConfigured || goalMode;
+        boolean hideSettings = hideManualSpeed || !idle;
         View speedRow = findViewById(R.id.speedRow);
         if (speedRow != null) {
-            speedRow.setVisibility(hideManualSpeed ? View.GONE : View.VISIBLE);
+            speedRow.setVisibility(hideSettings ? View.GONE : View.VISIBLE);
         }
-        loopSwitch.setVisibility(hideManualSpeed ? View.GONE : View.VISIBLE);
-        speedBar.setEnabled(!hideManualSpeed);
-        loopSwitch.setEnabled(!hideManualSpeed && session.mode == Session.Mode.IDLE);
+        loopSwitch.setVisibility(hideSettings ? View.GONE : View.VISIBLE);
+        speedBar.setEnabled(!hideManualSpeed && idle);
+        loopSwitch.setEnabled(!hideManualSpeed && idle);
+
+        // 选点类操作只在空闲时可用（运行中改点会让轨迹跳变）
+        findViewById(R.id.btnUndo).setVisibility(editVisibility);
+        findViewById(R.id.btnClear).setVisibility(editVisibility);
+        findViewById(R.id.btnSpot).setVisibility(editVisibility);
         if (!hideManualSpeed && session.mode == Session.Mode.IDLE) {
             speedValue.setText(getString(R.string.speed_value,
                     speedBar.getProgress() + 1));

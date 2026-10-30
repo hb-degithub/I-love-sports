@@ -48,6 +48,17 @@
             android:textSize="11sp" />
 
         <TextView
+            android:id="@+id/textModuleStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:padding="10dp"
+            android:background="#11223344"
+            android:text="模块状态：查询中…"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
@@ -60,17 +71,6 @@
             android:layout_height="220dp"
             android:layout_marginTop="6dp"
             android:background="#22000000" />
-
-        <TextView
-            android:id="@+id/textModuleStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:padding="10dp"
-            android:background="#11223344"
-            android:text="模块状态：查询中…"
-            android:textColor="@color/text_secondary"
-            android:textSize="12sp" />
 
         <TextView
             android:id="@+id/textCurrent"
