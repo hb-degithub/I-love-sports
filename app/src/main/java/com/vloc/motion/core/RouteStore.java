@@ -44,6 +44,7 @@ public final class RouteStore {
     private static final String KEY_CAMERA_INDEX = "camera_index";
     private static final String KEY_CAMERA_PLAYING = "camera_playing";
     private static final String KEY_CAMERA_IMU_UPRIGHT = "camera_imu_upright";
+    private static final String KEY_SYSTEM_INJECT = "system_inject";
     private static final String KEY_CAMERA_OVERLAY_X = "camera_overlay_x";
     private static final String KEY_CAMERA_OVERLAY_Y = "camera_overlay_y";
     private static final String KEY_CAMERA_OVERLAY_HIDDEN = "camera_overlay_hidden";
@@ -390,6 +391,20 @@ public final class RouteStore {
 
     public static void saveCameraPlaying(Context context, boolean playing) {
         prefs(context).edit().putBoolean(KEY_CAMERA_PLAYING, playing).apply();
+    }
+
+    /**
+     * 系统级注入（默认关）：定位与 GNSS 由 LSPosed 模块在 system_server 内改写，
+     * 对所有 App 生效、不带模拟位置标记，且不需要 appops / 测试 Provider。
+     *
+     * <p>需要把「系统框架（android）」加入 LSPosed 作用域并重启系统。
+     */
+    public static boolean loadSystemInject(Context context) {
+        return prefs(context).getBoolean(KEY_SYSTEM_INJECT, false);
+    }
+
+    public static void saveSystemInject(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_SYSTEM_INJECT, enabled).apply();
     }
 
     /**

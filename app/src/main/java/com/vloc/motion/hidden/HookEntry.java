@@ -159,13 +159,30 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
             if (SYSTEM_SERVER_PACKAGE.equals(packageName)) {
-                log("skip system_server (" + packageName + ")");
+                // 系统框架进程：安装系统级注入（定位 / GNSS 全 App 生效、无 mock 标记）。
+                // 模块必须被手动加入「系统框架」作用域才会走到这里。
+                installSystemHooks(lpparam.classLoader);
                 return;
             }
             installHooks(lpparam.classLoader, packageName);
         } catch (Throwable t) {
             // 顶层兜底：模块绝不能因为自身异常影响目标 App 启动
             logError("handleLoadPackage failed", t);
+        }
+    }
+
+    /**
+     * system_server 内的系统级注入（v0.33.0）。
+     *
+     * <p>只做定位与 GNSS：传感器由 native SensorService 分发、相机在 HAL/相机服务层，
+     * Java 层无法覆盖，仍由目标进程内 Hook 处理。
+     */
+    private void installSystemHooks(ClassLoader classLoader) {
+        try {
+            final int hooks = SystemHooks.install(classLoader);
+            log("system-level hooks installed in system_server: " + hooks);
+        } catch (Throwable t) {
+            logError("installSystemHooks failed", t);
         }
     }
 

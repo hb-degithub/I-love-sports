@@ -35,6 +35,9 @@ public final class EnvProvider extends ContentProvider {
             Uri.parse("content://" + AUTHORITY + "/" + PATH_CAMERA_VIDEO);
     /** 虚拟摄像头运行时状态（模块上报 → 控制页展示）。 */
     public static final String PATH_CAMERA_STATUS = "camera_status";
+    /** 定位快照（供模块在 system_server 做系统级注入）。 */
+    public static final String PATH_LOCATION = "location";
+    public static final Uri LOCATION_URI = Uri.parse("content://" + AUTHORITY + "/" + PATH_LOCATION);
     public static final Uri CAMERA_STATUS_URI =
             Uri.parse("content://" + AUTHORITY + "/" + PATH_CAMERA_STATUS);
 
@@ -49,6 +52,14 @@ public final class EnvProvider extends ContentProvider {
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
         MatrixCursor cursor = new MatrixCursor(COLUMNS);
+        if (isLocationUri(uri)) {
+            LocationSession location = LocationSession.INSTANCE;
+            if (!location.active) {
+                return cursor;   // 未在模拟：模块透传真实定位
+            }
+            cursor.addRow(new Object[]{"replay", location.toJson(), location.updatedAt});
+            return cursor;
+        }
         if (isGnssUri(uri)) {
             GnssSession gnss = GnssSession.INSTANCE;
             if (gnss.json == null) {
@@ -112,6 +123,11 @@ public final class EnvProvider extends ContentProvider {
     private static boolean isCameraVideoUri(Uri uri) {
         return uri != null && AUTHORITY.equals(uri.getAuthority())
                 && PATH_CAMERA_VIDEO.equals(uri.getLastPathSegment());
+    }
+
+    private static boolean isLocationUri(Uri uri) {
+        return uri != null && AUTHORITY.equals(uri.getAuthority())
+                && PATH_LOCATION.equals(uri.getLastPathSegment());
     }
 
     private static boolean isGnssUri(Uri uri) {

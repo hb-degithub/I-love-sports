@@ -1947,6 +1947,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         SwitchMaterial switchAttitude = content.findViewById(R.id.switchAttitude);
         SwitchMaterial switchRandomStart = content.findViewById(R.id.switchRandomStart);
         SwitchMaterial switchAutoStop = content.findViewById(R.id.switchAutoStop);
+        SwitchMaterial switchSystemInject = content.findViewById(R.id.switchSystemInject);
 
         editAltitude.setText(String.format(Locale.US, "%.0f", RouteStore.loadAltitude(this)));
         List<String> providers = RouteStore.loadProviders(this);
@@ -1957,6 +1958,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         switchAttitude.setChecked(RouteStore.loadAttitudeReplay(this));
         switchRandomStart.setChecked(RouteStore.loadRandomStart(this));
         switchAutoStop.setChecked(RouteStore.loadAutoStopOnFinish(this));
+        switchSystemInject.setChecked(RouteStore.loadSystemInject(this));
 
         new AlertDialog.Builder(this)
                 .setTitle("设置")
@@ -1989,6 +1991,10 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                     RouteStore.saveAttitudeReplay(this, switchAttitude.isChecked());
                     RouteStore.saveRandomStart(this, switchRandomStart.isChecked());
                     RouteStore.saveAutoStopOnFinish(this, switchAutoStop.isChecked());
+                    RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
+                    if (switchSystemInject.isChecked()) {
+                        toast("系统级注入已开启（下次开始生效）\n请确认 LSPosed 已勾选「系统框架」并重启系统");
+                    }
                     toast("设置已保存（Provider / 拟真模式下次开始时生效）");
                 })
                 .setNegativeButton("取消", null)

@@ -293,14 +293,27 @@ adb install -r dist/virtual-motion-0.17.0.apk
 3. 返回，点「悬浮窗设置」→ 打开「显示在其他应用上层」
 4. 回到 App，悬浮窗自动开启（App 会检测权限状态）
 
-## 6.10 Root 检测
+## 6.10 系统级注入（v0.33.0+，可选）
+
+默认关。开启后定位与 GNSS 由隐藏模块在 **system_server** 里改写：
+
+- **所有 App 都生效**（不用逐个勾作用域）
+- Location 由模块新建，**没有 `isMock` / `isFromMockProvider` 标记**，也就不需要 appops
+- 不再创建测试 Provider
+
+启用：LSPosed 模块 → 作用域勾选 **「系统框架」** → **重启系统** → App 设置里打开「系统级注入」。
+
+> 计步 / IMU / 摄像头**不在**系统级（受限于 native SensorService 与相机 HAL），
+> 仍按目标进程内注入，需要逐个勾选作用域。详见 `docs/system-injection.md`。
+
+## 6.11 Root 检测
 
 - 主界面顶部有 `Root：…` 状态行，**点一下可重新检测/申请授权**（会弹出 Magisk/KernelSU/APatch 授权框）
 - 开工向导顶部也有「检测 / 申请 Root 授权」按钮与状态
 - 未获得授权时点「开始」会提示先授权；授权后重新检测即可
 - 若一直失败：确认 root 管理器里本应用未被拒绝/加入拒绝名单，再点一次检测
 
-## 6.11 GNSS 卫星状态回放（v0.19.0+）
+## 6.12 GNSS 卫星状态回放（v0.19.0+）
 
 目标 App 里查卫星状态（`LocationManager.registerGnssStatusCallback` / `GnssStatus`）时，
 看到的是**你这个位置、这个时刻真实可见的那批卫星**，不再是随机一套：

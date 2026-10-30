@@ -398,6 +398,14 @@ public class LocationService extends Service {
         Session session = Session.INSTANCE;
         String pkg = getPackageName();
 
+        // 系统级注入：定位由模块在 system_server 改写，本进程不接管测试 Provider，
+        // 也就不需要 appops / 测试 Provider（但模块本身依赖 root + LSPosed 已安装）
+        if (RouteStore.loadSystemInject(this)) {
+            releaseInjector();
+            session.rootOk = RootShell.isRooted();
+            return true;
+        }
+
         if (!RootShell.isRooted()) {
             session.rootOk = false;
             session.error = "未获得 root 权限，请确认设备已 root 并在 root 管理器中授权本应用";
@@ -518,15 +526,17 @@ public class LocationService extends Service {
     }
 
     private void pushSpotLocation() {
-        if (injector == null) {
-            return;
-        }
         Fix fix = realism.apply(spotLat, spotLon, baseAltitude, 0.0, 0.0, accuracyMeters);
-        try {
-            injector.push(fix, System.currentTimeMillis());
-        } catch (RuntimeException e) {
-            failInjection(e);
-            return;
+        // 系统级注入：本进程不写测试 Provider，但要发布快照给模块
+        LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
+                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
+        if (injector != null) {
+            try {
+                injector.push(fix, System.currentTimeMillis());
+            } catch (RuntimeException e) {
+                failInjection(e);
+                return;
+            }
         }
         Session session = Session.INSTANCE;
         session.lat = fix.lat;
@@ -551,8 +561,11 @@ public class LocationService extends Service {
     }
 
     private void injectFix(Fix fix) {
+        // 无论哪种注入方式，都先把最新快照发布给模块（系统级注入在 system_server 读取它）
+        LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
+                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
         if (injector == null) {
-            return;
+            return;   // 系统级注入：本进程不写测试 Provider
         }
         try {
             injector.push(fix, System.currentTimeMillis());
@@ -592,8 +605,8 @@ public class LocationService extends Service {
 
     /** 暂停/到达终点时按 1Hz 持续上报同一坐标（含噪声与卫星数据），模拟真实静止定位。 */
     private void holdPosition(long nowMs, Route.Sample sample) {
-        if (sample == null || injector == null) {
-            return;
+        if (sample == null) {
+            return;   // injectFix 内部已处理"系统级模式没有 injector"的情况
         }
         if (nowMs - lastHoldPushMs < 1000L) {
             return;
@@ -720,6 +733,7 @@ public class LocationService extends Service {
         lastHoldPushMs = 0L;
         EnvSession.INSTANCE.clear();
         StepSession.INSTANCE.clear();
+        LocationSession.INSTANCE.clear();
         GnssSession.INSTANCE.clear();
         session.mode = Session.Mode.IDLE;
         session.paused = false;

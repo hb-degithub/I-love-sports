@@ -78,6 +78,22 @@
         android:textSize="12sp" />
 
     <com.google.android.material.switchmaterial.SwitchMaterial
+        android:id="@+id/switchSystemInject"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="系统级注入（所有 App 生效，无模拟标记）"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="开启后定位与 GNSS 由隐藏模块在系统框架（system_server）内改写：所有 App 都拿到虚拟定位、且不带 mock 标记，也不再需要 appops 授权。前提：已在 LSPosed 里把「系统框架」加入作用域并重启系统。计步/IMU/摄像头仍为进程内注入。"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp" />
+
+    <com.google.android.material.switchmaterial.SwitchMaterial
         android:id="@+id/switchAutoStop"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
