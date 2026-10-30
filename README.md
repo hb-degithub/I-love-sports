@@ -81,6 +81,9 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
 - 🛰️ **系统级注入（v0.33.0，可选）**：定位与 GNSS 由隐藏模块在 **system_server** 内改写，
   对所有 App 生效、**不带模拟位置标记**、无需 appops / 测试 Provider；需在 LSPosed 勾选「系统框架」并重启。
   详见 [`docs/system-injection.md`](docs/system-injection.md)（计步/IMU/相机仍为进程内注入，原因见该文档 §6）
+- 🧩 **传感器系统级注入（v0.34.0，可选）**：配套的 **Zygisk 模块**会注入每个 App 进程，
+  改写计步/加速度/陀螺仪/姿态等传感器事件 —— 无需 LSPosed 作用域，对所有 App 生效。
+  见 [`docs/zygisk-sensors.md`](docs/zygisk-sensors.md)（相机仍需 HAL 层方案，见该文档 §6）
 - 🧩 单 APK 双身份：同一安装包既是主 App，也是 LSPosed 模块（`assets/xposed_init` + `xposedmodule` 元数据）
 - 📍 首页定位按钮：一键读取设备**真实位置**，地图居中显示；可直接「添加为路径点 / 临时定位到这里」
 - 🗺️ 地图源可切换：默认高德（国内可用），另备高德卫星 / OSM / Carto；地图空白时可「手动输入坐标」选点
@@ -137,6 +140,7 @@ docs/
 ├── usage.md                      # 使用手册
 ├── virtual-camera.md             # 虚拟摄像头架构与实施计划
 ├── system-injection.md           # 系统级注入（system_server 改写定位/GNSS）
+├── zygisk-sensors.md             # 传感器系统级注入（Zygisk 原生模块）
 ├── phase2-hidden.md              # 隐藏模块安装手册
 ├── root-injection.md             # root 注入方案调研（AOSP 源码级）
 └── mock-detection.md             # 模拟位置检测手段与绕过矩阵
@@ -247,6 +251,7 @@ gradle :app:testDebugUnitTest      # 核心算法单元测试
 - [x] 预置视频机制（assets/camera_presets：跳绳 / 开合跳）+ 时长 60–120 秒校验 + 页面要求提示（v0.30.0）
 - [x] 摄像头悬浮窗细化：折叠单行 + 细进度条；展开显示「0:12/1:30 · 接管状态」；新增 ◀ ▶ 切换视频（v0.30.0）
 - [x] 系统级注入：定位 + GNSS 改由模块在 system_server 改写（所有 App 生效、无 mock 标记）（v0.33.0）
+- [x] 传感器系统级注入：Zygisk 原生模块 + JNI hook，所有 App 进程自动接管计步/IMU/姿态（v0.34.0）
 - [x] 把「跑步运动模拟」与「相机接管」的 IMU 逻辑显式分开：新增开关「接管时 IMU 固定竖直」，默认开；关掉则按跑步姿态回放（v0.31.0）
 - [x] 跑步悬浮窗去掉摄像头/视频行（避免与视频悬浮窗混淆）；注入频率 5Hz → 10Hz（点间距减半）；拟真漂移再收紧（σ 0.28→0.20、τ 6→8s）（v0.32.0）
 - [x] 虚拟摄像头独立悬浮窗：启用即显示、点击切视频、长按开关、✕ 收起、独立位置记忆、与定位悬浮窗互斥、定位会话结束后自动交还（v0.22.0）

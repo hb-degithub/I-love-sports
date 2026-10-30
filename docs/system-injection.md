@@ -72,8 +72,8 @@ App 内：设置里开关已开；运行时「关于 → 版本」为 0.33.0+。
 | IMU / 姿态 | ❌ 同上 | 同上 |
 | 摄像头 | ❌ Java 不可行 | 相机数据在 **camera HAL / cameraserver**（native），Java 层只能逐 App 接管 Camera2/Camera1 |
 
-结论：**"所有模拟都系统级"在当前技术路线（LSPosed Java Hook）下做不到**。
-定位与卫星做到了系统级；传感器与相机仍是"目标进程内注入"，需要逐个勾选作用域。
+结论（v0.34.0 更新）：**传感器已通过 Zygisk 原生模块实现"全 App 自动接管"**，
+见 [`zygisk-sensors.md`](zygisk-sensors.md)；**相机仍是进程内接管**（HAL/cameraserver 无法注入）。
 
 如果要连传感器/相机也系统级，需要改成 **Magisk + Zygisk native 模块**（C/C++ hook
 `SensorService`、替换 camera provider），工作量和风险都显著更高，且必须真机调试。

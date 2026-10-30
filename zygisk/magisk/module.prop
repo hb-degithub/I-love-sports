@@ -1,0 +1,6 @@
+id=vloc_zygisk
+name=虚拟运动 · 传感器系统级注入 (Zygisk)
+version=v1.0.0
+versionCode=1
+author=hb-degithub
+description=给「虚拟运动」App 提供系统级传感器注入：所有 App 的计步/加速度/陀螺仪/姿态都会被接管，无需逐个勾选 LSPosed 作用域。仅供学习研究，禁止任何商业用途。

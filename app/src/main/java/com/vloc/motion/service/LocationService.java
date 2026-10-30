@@ -23,7 +23,9 @@ import androidx.core.app.ServiceCompat;
 import com.vloc.motion.core.Fix;
 import com.vloc.motion.core.PacePlan;
 import com.vloc.motion.core.StepEngine;
+import com.vloc.motion.core.GaitAttitude;
 import com.vloc.motion.core.GnssTle;
+import com.vloc.motion.core.ImuWaveform;
 import com.vloc.motion.core.RealismEngine;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RoutePlayer;
@@ -99,6 +101,14 @@ public class LocationService extends Service {
     private boolean arrived;
     private long lastHoldPushMs;
     private float baseAltitude = 50.0f;
+    /** 系统级（Zygisk）传感器状态：相位与噪声种子。 */
+    private double nativeImuPhase;
+    private long nativeImuTick;
+    private final float[] nativeAccel = new float[3];
+    private final float[] nativeGyro = new float[3];
+    private final float[] nativeGravity = new float[3];
+    private final float[] nativeRotation = new float[4];
+    private final float[] nativeMagnetic = new float[3];
     private FloatingWindow floatingWindow;
 
     @Override
@@ -106,6 +116,7 @@ public class LocationService extends Service {
         super.onCreate();
         ensureNotificationChannel();
         loadGnssCatalog();
+        VlocStateFile.init(this);
     }
 
     /**
@@ -642,6 +653,46 @@ public class LocationService extends Service {
         StepSession.INSTANCE.update(
                 stepEngine.toJson(true, RouteStore.loadAttitudeReplay(this),
                         lastSatellites, lastCn0Mean, lastCn0Max, realism.gnssJson()), true);
+        publishNativeSensorState(dt, speed, bearing);
+    }
+
+    /**
+     * 发布给 Zygisk 模块的传感器状态（系统级传感器注入用）。
+     *
+     * <p>只在「系统级注入」开关打开时写；否则写一帧 active=false 让模块透传真实传感器。
+     */
+    private void publishNativeSensorState(double dt, double speed, double bearing) {
+        try {
+            if (!RouteStore.loadSystemInject(this)) {
+                if (nativeImuTick != -1L) {
+                    nativeImuTick = -1L;
+                    VlocStateFile.clear();
+                }
+                return;
+            }
+            nativeImuTick++;
+            final double cadence = stepEngine.getCadenceSpm();
+            final double phaseStep = ImuWaveform.phase(cadence, Math.max(0.0, dt));
+            nativeImuPhase += phaseStep;
+            if (nativeImuPhase > Math.PI * 2) {
+                nativeImuPhase %= Math.PI * 2;
+            }
+            final double heading = Double.isNaN(bearing) ? 0.0 : bearing;
+            final boolean attitude = RouteStore.loadAttitudeReplay(this);
+            ImuWaveform.accelerometerWithAttitude(heading, cadence, nativeImuPhase, speed,
+                    nativeImuTick, nativeAccel);
+            ImuWaveform.gravityWithAttitude(heading, cadence, nativeImuPhase, speed,
+                    nativeImuTick, nativeGravity);
+            ImuWaveform.gyroscope(ImuWaveform.accelAmplitude(speed), nativeImuPhase, 0.0,
+                    nativeImuTick, nativeGyro);
+            GaitAttitude.rotationVector(heading, cadence, nativeImuPhase, speed, nativeRotation);
+            GaitAttitude.magneticField(heading, cadence, nativeImuPhase, speed, nativeMagnetic);
+            VlocStateFile.write(true, stepEngine.getSteps(), (float) cadence, (float) speed,
+                    (float) heading, nativeAccel, nativeGyro, nativeGravity,
+                    nativeRotation, nativeMagnetic, attitude);
+        } catch (Throwable ignored) {
+            // 发布失败不影响主流程
+        }
     }
 
     /** 从悬浮窗打开主界面（查看自检/启用步骤）。 */
@@ -734,6 +785,7 @@ public class LocationService extends Service {
         EnvSession.INSTANCE.clear();
         StepSession.INSTANCE.clear();
         LocationSession.INSTANCE.clear();
+        VlocStateFile.clear();
         GnssSession.INSTANCE.clear();
         session.mode = Session.Mode.IDLE;
         session.paused = false;
