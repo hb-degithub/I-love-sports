@@ -58,7 +58,7 @@ public final class CameraOverlay {
     private final TextView collapseView;
     private final android.widget.ProgressBar progressBar;
     private boolean playing;
-    private boolean collapsed = true;
+    private boolean collapsed;
 
     private boolean shown;
 
@@ -171,6 +171,9 @@ public final class CameraOverlay {
         root.addView(statusView);
 
         root.setOnTouchListener(new DragTouchListener());
+
+        // 恢复上次的折叠状态（默认折叠成单行）
+        setCollapsed(RouteStore.loadCameraOverlayCollapsed(this.context));
     }
 
     /**
@@ -238,6 +241,7 @@ public final class CameraOverlay {
     /** 展开 / 折叠：折叠时只保留一行胶囊，展开时显示接管状态。 */
     public void setCollapsed(boolean value) {
         this.collapsed = value;
+        RouteStore.saveCameraOverlayCollapsed(context, value);
         if (statusView != null) {
             statusView.setVisibility(value ? View.GONE : View.VISIBLE);
         }

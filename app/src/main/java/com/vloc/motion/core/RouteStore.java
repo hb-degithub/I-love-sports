@@ -44,6 +44,7 @@ public final class RouteStore {
     private static final String KEY_CAMERA_INDEX = "camera_index";
     private static final String KEY_CAMERA_PLAYING = "camera_playing";
     private static final String KEY_CAMERA_IMU_UPRIGHT = "camera_imu_upright";
+    private static final String KEY_CAMERA_OVERLAY_COLLAPSED = "camera_overlay_collapsed";
     private static final String KEY_SYSTEM_INJECT = "system_inject";
     private static final String KEY_CAMERA_OVERLAY_X = "camera_overlay_x";
     private static final String KEY_CAMERA_OVERLAY_Y = "camera_overlay_y";
@@ -419,6 +420,15 @@ public final class RouteStore {
 
     public static void saveCameraImuUpright(Context context, boolean upright) {
         prefs(context).edit().putBoolean(KEY_CAMERA_IMU_UPRIGHT, upright).apply();
+    }
+
+    /** 摄像头悬浮窗的折叠状态（默认折叠成单行）。 */
+    public static boolean loadCameraOverlayCollapsed(Context context) {
+        return prefs(context).getBoolean(KEY_CAMERA_OVERLAY_COLLAPSED, true);
+    }
+
+    public static void saveCameraOverlayCollapsed(Context context, boolean collapsed) {
+        prefs(context).edit().putBoolean(KEY_CAMERA_OVERLAY_COLLAPSED, collapsed).apply();
     }
 
     /** 基础海拔（米），路径点没写海拔时使用。 */

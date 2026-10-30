@@ -85,31 +85,50 @@ public final class VlocStateFile {
                 return;
             }
             try {
-                sBuffer.clear();
-                sBuffer.putInt(MAGIC);
-                sBuffer.putInt(VERSION);
-                sBuffer.putInt(active ? 1 : 0);
-                sBuffer.putInt(0);                       // 对齐填充
-                sBuffer.putLong(steps);
-                sBuffer.putFloat(cadence);
-                sBuffer.putFloat(speed);
-                sBuffer.putFloat(heading);
-                sBuffer.putInt(attitude ? 1 : 0);
-                putVec3(sBuffer, accel);
-                putVec3(sBuffer, gyro);
-                putVec3(sBuffer, gravity);
-                putVec4(sBuffer, rotation);
-                putVec3(sBuffer, magnetic);
-                sBuffer.putLong(System.currentTimeMillis());
-
+                final byte[] payload = encode(active, steps, cadence, speed, heading,
+                        accel, gyro, gravity, rotation, magnetic, attitude,
+                        System.currentTimeMillis());
                 try (FileOutputStream out = new FileOutputStream(sFile, false)) {
-                    out.write(sBuffer.array(), 0, SIZE);
+                    out.write(payload, 0, SIZE);
                 }
                 sLastWriteMs = System.currentTimeMillis();
             } catch (IOException e) {
                 Log.w(TAG, "write failed", e);
             }
         }
+    }
+
+    /**
+     * 按 C++ 侧 {@code VlocState} 布局编码 112 字节（小端）。
+     *
+     * <p>抽成独立方法是为了能对字节偏移做单元测试 —— 布局一旦错位，
+     * Zygisk 模块读到的就是垃圾数据，且**不会有任何报错**，只能靠测试守住。
+     *
+     * <p>偏移：magic@0 version@4 active@8 pad@12 steps@16 cadence@24 speed@28
+     * heading@32 attitude@36 accel@40 gyro@52 gravity@64 rotation@76 magnetic@92
+     * updatedAt@104
+     */
+    static byte[] encode(boolean active, long steps, float cadence, float speed,
+                         float heading, float[] accel, float[] gyro, float[] gravity,
+                         float[] rotation, float[] magnetic, boolean attitude,
+                         long updatedAtMs) {
+        ByteBuffer buffer = ByteBuffer.allocate(SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(MAGIC);
+        buffer.putInt(VERSION);
+        buffer.putInt(active ? 1 : 0);
+        buffer.putInt(0);                       // 对齐填充
+        buffer.putLong(steps);
+        buffer.putFloat(cadence);
+        buffer.putFloat(speed);
+        buffer.putFloat(heading);
+        buffer.putInt(attitude ? 1 : 0);
+        putVec3(buffer, accel);
+        putVec3(buffer, gyro);
+        putVec3(buffer, gravity);
+        putVec4(buffer, rotation);
+        putVec3(buffer, magnetic);
+        buffer.putLong(updatedAtMs);
+        return buffer.array();
     }
 
     /** 停止模拟：写一帧 active=0，模块据此透传真实传感器。 */

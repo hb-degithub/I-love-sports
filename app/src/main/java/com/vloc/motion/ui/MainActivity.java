@@ -1840,6 +1840,12 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         cameraSwitch.setChecked(enabled);
         cameraImuSwitch.setChecked(RouteStore.loadCameraImuUpright(this));
         cameraPlayPause.setText(playing ? "暂停" : "播放");
+        // 没有视频时，播放/切换/删除都没有意义，直接禁用，避免点了没反应
+        final boolean hasClips = !clips.isEmpty();
+        cameraPlayPause.setEnabled(hasClips);
+        findViewById(R.id.btnPrev).setEnabled(hasClips);
+        findViewById(R.id.btnNext).setEnabled(hasClips);
+        findViewById(R.id.btnDelete).setEnabled(hasClips);
         com.vloc.motion.core.CameraClips.Clip current =
                 com.vloc.motion.core.CameraClips.current(clips, index);
         cameraCurrent.setText(current == null ? "未选择视频"
