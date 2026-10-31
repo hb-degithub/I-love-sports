@@ -56,6 +56,9 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
   需在 LSPosed 勾选「系统框架」并重启系统。见 [`docs/system-injection.md`](docs/system-injection.md)
 - 🧩 **传感器系统级注入（v0.34.0，可选）**：配套 **Zygisk 模块**（Magisk 刷入）注入每个 App 进程，
   改写计步 / 加速度 / 陀螺仪 / 姿态事件，无需 LSPosed 作用域。见 [`docs/zygisk-sensors.md`](docs/zygisk-sensors.md)
+- ⚙️ **设置重构（v0.39.0）**：设置按「注入方式 / 拟真与反检测 / 定位参数 / 行为」四组分类，
+  补齐此前只能读不能改的**水平定位精度**，去掉「目标配速」里重复的速度混淆开关；
+  设置项清单由 `core/SettingsSchema` 描述并由单测守护
 - 🛡️ **反检测补强（v0.38.0）**：provider 列表规范化（隐藏自定义测试 Provider 指纹）、
   `elapsedRealtimeNanos`/`time` 一致性校正、`accuracy` 抖动兜底、NMEA 回放（`$GPGGA`/`$GPRMC`）
 - 🔐 root 注入：自动 `su` 授权 → `appops set <pkg> android:mock_location allow` → 接管 `gps`/`network`/`fused` Provider
@@ -271,6 +274,7 @@ LSPosed 模块（已内置在同一 APK）在目标 App 进程内做这些遮蔽
 - v0.34：**Zygisk 传感器模块**（计步 / IMU / 姿态全 App 自动接管）
 - v0.35 – v0.36：交互重构（菜单分组 + 底部卡片状态驱动）、显示规则抽成可测单元
 - v0.37：移除相机 / 虚拟摄像头功能，回归单一虚拟定位与跑步模拟
+- v0.39：设置分组重构 + 补齐精度设置 + 去掉重复入口
 - v0.38：**反检测补强** —— provider 列表指纹、时间戳一致性、精度抖动、NMEA 回放
 
 待办：

@@ -64,13 +64,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
-        <com.google.android.material.switchmaterial.SwitchMaterial
-            android:id="@+id/switchSpeedVariance"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:text="速度混淆（时快时慢，随机化每段速度）" />
-
         <TextView
             android:id="@+id/goalPreview"
             android:layout_width="match_parent"

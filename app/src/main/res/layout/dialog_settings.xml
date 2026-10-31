@@ -1,135 +1,230 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  设置弹窗（v0.39.0 重构）：按「注入 / 拟真与反检测 / 定位参数 / 行为」四组分类，
+  每组一个小标题 + 说明，避免十来个开关平铺在一起分不清哪项属于哪块。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:padding="20dp">
+    android:layout_height="wrap_content">
 
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="基础海拔（米）"
-        android:textStyle="bold" />
+        android:orientation="vertical"
+        android:padding="16dp">
 
-    <EditText
-        android:id="@+id/editAltitude"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:digits="0123456789.-"
-        android:hint="50"
-        android:inputType="numberDecimal"
-        android:textSize="16sp" />
+        <!-- ==================== 1. 注入方式 ==================== -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="注入方式"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:textColor="@color/brand" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="接管的定位 Provider"
-        android:textStyle="bold" />
+        <TextView
+            android:id="@+id/textInjectMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="当前：测试 Provider 注入"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
 
-    <CheckBox
-        android:id="@+id/cbGps"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="gps（GPS 定位，多数应用读取）" />
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchSystemInject"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="系统级注入（所有 App 生效、无模拟标记）" />
 
-    <CheckBox
-        android:id="@+id/cbNetwork"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="network（网络定位，兜底）" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="开启后定位与 GNSS 由模块在 system_server 改写，不再需要 appops 与测试 Provider。前提：LSPosed 已把「系统框架」加入作用域并重启系统。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
 
-    <CheckBox
-        android:id="@+id/cbFused"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="fused（融合定位，部分机型/GMS 无效）" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="接管的定位 Provider（仅测试 Provider 模式生效）"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
 
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchRealism"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="拟真模式（推荐）"
-        android:textStyle="bold" />
+        <CheckBox
+            android:id="@+id/cbGps"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="gps（多数应用读取）" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="开启后：位置 1–2 m 随机游走漂移、速度/精度/朝向噪声、GNSS 卫星数与载噪比、起步 2 秒缓动。轨迹不再“完美”，更难被判定为合成定位；关闭则坐标严格贴合路径。"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        <CheckBox
+            android:id="@+id/cbNetwork"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="network（兜底）" />
 
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchAttitude"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="伪造姿态传感器（指南针/AR 可能异常）"
-        android:textStyle="bold" />
+        <CheckBox
+            android:id="@+id/cbFused"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="fused（部分机型 / GMS 无效）" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="开启后按跑步摆动伪造旋转矢量与磁力计，使 App 用 IMU 反推的朝向与虚拟路线一致；关闭则透传真实值。"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        <!-- ==================== 2. 拟真与反检测 ==================== -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="拟真与反检测"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:textColor="@color/brand" />
 
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchSystemInject"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="系统级注入（所有 App 生效，无模拟标记）"
-        android:textStyle="bold" />
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchRealism"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="拟真模式（推荐）" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="开启后定位与 GNSS 由隐藏模块在系统框架（system_server）内改写：所有 App 都拿到虚拟定位、且不带 mock 标记，也不再需要 appops 授权。前提：已在 LSPosed 里把「系统框架」加入作用域并重启系统。计步/IMU/摄像头仍为进程内注入。"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="位置 1–2 m 随机漂移、速度/精度/朝向噪声、卫星数与载噪比、起步 2 秒缓动。关闭后坐标严格贴合路径。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
 
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchAutoStop"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="到达终点后自动停止（恢复真实定位）"
-        android:textStyle="bold" />
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchSpeedVariance"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="速度混淆（时快时慢，非完美匀速）" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="开启后：跑到目标距离（或配速计划跑完）时，先显示「已到达」，2.5 秒后自动彻底停止并恢复手机真实定位。关闭则定位冻结在终点，需手动点「彻底停止」。"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="叠加秒级抖动、分钟级慢变、公里级地形与偶发冲刺，让配速曲线更接近真人；配速模式下自动启用。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
 
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchRandomStart"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="每次开始随机更换起点"
-        android:textStyle="bold" />
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchAttitude"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="伪造姿态传感器（指南针 / AR 可能异常）" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="开启后每次开始模拟会在当前路线上随机选一个起点（轨迹更自然，避免每次都从同一点出发）。"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="按跑步摆动伪造旋转矢量与磁力计，使 App 用 IMU 反推的朝向与虚拟路线一致。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:text="修改 Provider 与拟真模式在下次开始时生效"
-        android:textColor="@color/text_secondary"
-        android:textSize="11sp" />
-</LinearLayout>
+        <!-- ==================== 3. 定位参数 ==================== -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="定位参数"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:textColor="@color/brand" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="基础海拔（米）"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <EditText
+            android:id="@+id/editAltitude"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:digits="0123456789.-"
+            android:hint="50"
+            android:inputType="numberDecimal|numberSigned"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="水平定位精度（米）"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <EditText
+            android:id="@+id/editAccuracy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:digits="0123456789."
+            android:hint="5"
+            android:inputType="numberDecimal"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="写入 Location 的 accuracy。真机 GPS 常见 3–5 m，过小反而不自然；拟真模式会在此基础上抖动。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <!-- ==================== 4. 行为 ==================== -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="行为"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:textColor="@color/brand" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchAutoStop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="到达终点后自动停止（恢复真实定位）" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="跑到目标距离时先显示「已到达」，2.5 秒后自动彻底停止。关闭则定位冻结在终点，需手动「彻底停止」。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchRandomStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="每次开始随机更换起点" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="在路线全程随机取一点作为起点，避免每次轨迹完全相同。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="注：注入方式与拟真相关选项在下次「开始」时生效。"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+    </LinearLayout>
+</ScrollView>

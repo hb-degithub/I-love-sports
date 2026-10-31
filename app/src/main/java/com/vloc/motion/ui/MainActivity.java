@@ -1225,7 +1225,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private void showGoalDialog() {
         View content = getLayoutInflater().inflate(R.layout.dialog_goal, null, false);
         SwitchMaterial enabled = content.findViewById(R.id.switchGoalEnabled);
-        SwitchMaterial variance = content.findViewById(R.id.switchSpeedVariance);
         Spinner lapSpinner = content.findViewById(R.id.spinnerLap);
         Spinner distSpinner = content.findViewById(R.id.spinnerDistance);
         Spinner paceSpinner = content.findViewById(R.id.spinnerPace);
@@ -1242,7 +1241,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 nearestIndex(MAX_SPEED_OPTIONS, Math.round(RouteStore.loadGoalMaxKmh(this))));
 
         enabled.setChecked(RouteStore.loadGoalEnabled(this));
-        variance.setChecked(RouteStore.loadSpeedVariance(this));
 
         final Runnable refresh = () -> updateGoalPreview(preview,
                 LAP_OPTIONS[lapSpinner.getSelectedItemPosition()],
@@ -1290,7 +1288,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                                 formatDuration(estimate.minPossibleSeconds)))
                         .setPositiveButton("仍要启用", (d, w) -> {
                             saveGoalSettings(lap, distance, pace, maxKmh,
-                                    enabled.isChecked(), variance.isChecked());
+                                    enabled.isChecked(), RouteStore.loadSpeedVariance(this));
                             dialog.dismiss();
                         })
                         .setNegativeButton("返回修改", null)
@@ -1298,7 +1296,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 return;
             }
             saveGoalSettings(lap, distance, pace, maxKmh,
-                    enabled.isChecked(), variance.isChecked());
+                    enabled.isChecked(), RouteStore.loadSpeedVariance(this));
             dialog.dismiss();
         });
     }
@@ -1310,6 +1308,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         RouteStore.saveGoalPaceSeconds(this, pace);
         RouteStore.saveGoalMaxKmh(this, maxKmh);
         RouteStore.saveGoalEnabled(this, enabled);
+        // 速度混淆统一由「设置」管理；配速模式下播放器会自动启用，这里不再覆盖用户选择
         RouteStore.saveSpeedVariance(this, variance);
         // 时间由配速自动推导，这里只保存一个参考值，播放时按路线实际长度重算
         GoalPlanner.Estimate estimate = GoalPlanner.estimate(lap, distance,
@@ -1627,65 +1626,125 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private void showSettingsDialog() {
         View content = getLayoutInflater().inflate(R.layout.dialog_settings, null, false);
         EditText editAltitude = content.findViewById(R.id.editAltitude);
+        EditText editAccuracy = content.findViewById(R.id.editAccuracy);
         CheckBox cbGps = content.findViewById(R.id.cbGps);
         CheckBox cbNetwork = content.findViewById(R.id.cbNetwork);
         CheckBox cbFused = content.findViewById(R.id.cbFused);
         SwitchMaterial switchRealism = content.findViewById(R.id.switchRealism);
+        SwitchMaterial switchSpeedVariance = content.findViewById(R.id.switchSpeedVariance);
         SwitchMaterial switchAttitude = content.findViewById(R.id.switchAttitude);
         SwitchMaterial switchRandomStart = content.findViewById(R.id.switchRandomStart);
         SwitchMaterial switchAutoStop = content.findViewById(R.id.switchAutoStop);
         SwitchMaterial switchSystemInject = content.findViewById(R.id.switchSystemInject);
+        TextView textInjectMode = content.findViewById(R.id.textInjectMode);
 
+        // ---- 回填当前值 ----
         editAltitude.setText(String.format(Locale.US, "%.0f", RouteStore.loadAltitude(this)));
+        editAccuracy.setText(String.format(Locale.US, "%.1f", RouteStore.loadAccuracy(this)));
         List<String> providers = RouteStore.loadProviders(this);
         cbGps.setChecked(providers.contains("gps"));
         cbNetwork.setChecked(providers.contains("network"));
         cbFused.setChecked(providers.contains("fused"));
         switchRealism.setChecked(RouteStore.loadRealism(this));
+        switchSpeedVariance.setChecked(RouteStore.loadSpeedVariance(this));
         switchAttitude.setChecked(RouteStore.loadAttitudeReplay(this));
         switchRandomStart.setChecked(RouteStore.loadRandomStart(this));
         switchAutoStop.setChecked(RouteStore.loadAutoStopOnFinish(this));
         switchSystemInject.setChecked(RouteStore.loadSystemInject(this));
+        updateInjectModeHint(textInjectMode, switchSystemInject.isChecked());
+        // 系统级注入时 Provider 勾选无意义，直接禁用避免误解
+        switchSystemInject.setOnCheckedChangeListener((v, checked) -> {
+            updateInjectModeHint(textInjectMode, checked);
+            setProvidersEnabled(cbGps, cbNetwork, cbFused, !checked);
+        });
+        setProvidersEnabled(cbGps, cbNetwork, cbFused, !switchSystemInject.isChecked());
 
         new AlertDialog.Builder(this)
                 .setTitle("设置")
                 .setView(content)
                 .setPositiveButton("保存", (dialog, which) -> {
-                    float altitude = RouteStore.loadAltitude(this);
-                    try {
-                        altitude = Float.parseFloat(editAltitude.getText().toString().trim());
-                    } catch (NumberFormatException ignored) {
-                        // 保持原值
-                    }
-                    altitude = Math.max(-500f, Math.min(9000f, altitude));
-                    RouteStore.saveAltitude(this, altitude);
-
-                    List<String> selected = new ArrayList<>();
-                    if (cbGps.isChecked()) {
-                        selected.add("gps");
-                    }
-                    if (cbNetwork.isChecked()) {
-                        selected.add("network");
-                    }
-                    if (cbFused.isChecked()) {
-                        selected.add("fused");
-                    }
-                    if (selected.isEmpty()) {
-                        selected.add("gps");
-                    }
-                    RouteStore.saveProviders(this, selected);
-                    RouteStore.saveRealism(this, switchRealism.isChecked());
-                    RouteStore.saveAttitudeReplay(this, switchAttitude.isChecked());
-                    RouteStore.saveRandomStart(this, switchRandomStart.isChecked());
-                    RouteStore.saveAutoStopOnFinish(this, switchAutoStop.isChecked());
-                    RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
-                    if (switchSystemInject.isChecked()) {
-                        toast("系统级注入已开启（下次开始生效）\n请确认 LSPosed 已勾选「系统框架」并重启系统");
-                    }
-                    toast("设置已保存（Provider / 拟真模式下次开始时生效）");
+                    saveSettings(editAltitude, editAccuracy, cbGps, cbNetwork, cbFused,
+                            switchRealism, switchSpeedVariance, switchAttitude,
+                            switchRandomStart, switchAutoStop, switchSystemInject);
                 })
                 .setNegativeButton("取消", null)
                 .show();
+    }
+
+    /** 系统级注入 / 测试 Provider 两种模式互斥，界面上把当前模式说清楚。 */
+    private void updateInjectModeHint(TextView view, boolean systemInject) {
+        if (view == null) {
+            return;
+        }
+        view.setText(systemInject
+                ? "当前：系统级注入（system_server 改写，所有 App 生效、无 mock 标记）"
+                : "当前：测试 Provider 注入（需 root + appops，靠模块擦除 mock 标记）");
+    }
+
+    private void setProvidersEnabled(CheckBox gps, CheckBox network, CheckBox fused, boolean enabled) {
+        for (CheckBox box : new CheckBox[]{gps, network, fused}) {
+            if (box != null) {
+                box.setEnabled(enabled);
+                box.setAlpha(enabled ? 1f : 0.5f);
+            }
+        }
+    }
+
+    /** 保存设置：所有字段各自校验、各自写回，某一项非法不影响其它项。 */
+    private void saveSettings(EditText editAltitude, EditText editAccuracy,
+                              CheckBox cbGps, CheckBox cbNetwork, CheckBox cbFused,
+                              SwitchMaterial switchRealism, SwitchMaterial switchSpeedVariance,
+                              SwitchMaterial switchAttitude, SwitchMaterial switchRandomStart,
+                              SwitchMaterial switchAutoStop, SwitchMaterial switchSystemInject) {
+        // 海拔：-500 ~ 9000 m 之外的输入夹紧
+        float altitude = RouteStore.loadAltitude(this);
+        try {
+            altitude = Float.parseFloat(editAltitude.getText().toString().trim());
+        } catch (NumberFormatException ignored) {
+            // 保持原值
+        }
+        altitude = com.vloc.motion.core.SettingsSchema.clamp(
+                com.vloc.motion.core.SettingsSchema.find("base_altitude"), altitude);
+        RouteStore.saveAltitude(this, altitude);
+
+        // 精度：0.5 ~ 100 m，避免 0（除零/异常）与过大（明显假）
+        float accuracy = RouteStore.loadAccuracy(this);
+        try {
+            accuracy = Float.parseFloat(editAccuracy.getText().toString().trim());
+        } catch (NumberFormatException ignored) {
+            // 保持原值
+        }
+        accuracy = com.vloc.motion.core.SettingsSchema.clamp(
+                com.vloc.motion.core.SettingsSchema.find("accuracy"), accuracy);
+        RouteStore.saveAccuracy(this, accuracy);
+
+        List<String> selected = new ArrayList<>();
+        if (cbGps.isChecked()) {
+            selected.add("gps");
+        }
+        if (cbNetwork.isChecked()) {
+            selected.add("network");
+        }
+        if (cbFused.isChecked()) {
+            selected.add("fused");
+        }
+        if (selected.isEmpty()) {
+            selected.add("gps");
+        }
+        RouteStore.saveProviders(this, selected);
+
+        RouteStore.saveRealism(this, switchRealism.isChecked());
+        RouteStore.saveSpeedVariance(this, switchSpeedVariance.isChecked());
+        RouteStore.saveAttitudeReplay(this, switchAttitude.isChecked());
+        RouteStore.saveRandomStart(this, switchRandomStart.isChecked());
+        RouteStore.saveAutoStopOnFinish(this, switchAutoStop.isChecked());
+        RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
+
+        if (switchSystemInject.isChecked()) {
+            toast("系统级注入已开启（下次开始生效）\n请确认 LSPosed 已勾选「系统框架」并重启系统");
+        } else {
+            toast("设置已保存（注入方式与拟真相关选项下次开始时生效）");
+        }
     }
 
     /** 悬浮窗开关：未授权时先去系统设置授权。 */
