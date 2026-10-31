@@ -1,0 +1,3 @@
+# 允许各 App 进程读取传感器状态文件（位于 /data/local/tmp，属 shell_data_file）
+# 没有这条规则时，App 进程会因 SELinux 拒绝而读不到状态文件（模块会自动透传真实传感器）。
+allow appdomain shell_data_file file { open read getattr map };
