@@ -1,7 +1,9 @@
 # 虚拟运动（root 版）
 
-> **专注虚拟定位与运动模拟**：root 注入定位、路径播放、拟真轨迹、GNSS 卫星回放、
-> 计步/IMU 回放、LSPosed 隐藏模块。**相机 / 虚拟摄像头相关功能已移除**（v0.37.0）。
+> **专注虚拟定位与跑步模拟**：root 注入定位、路径播放、拟真轨迹、GNSS 卫星回放、
+> 计步 / IMU / 姿态回放、LSPosed 隐藏模块、system_server 系统级注入、Zygisk 传感器模块。
+>
+> 当前版本 **v0.37.1** · 相机 / 虚拟摄像头相关功能已于 v0.37.0 **完全移除**。
 
 <p>
   <a href="https://github.com/hb-degithub/I-love-sports/actions/workflows/android.yml">
@@ -15,8 +17,6 @@
 
 最新构建（CI 自动产出）：**[Releases](https://github.com/hb-degithub/I-love-sports/releases/latest)** ——
 `virtual-motion-<版本>.apk` + `.sha256`；每次打 `v*` tag 会自动构建并发布。
-
- 
 
 > ## 🚫 免责声明（必读）
 >
@@ -40,15 +40,29 @@
 
 Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在地图上规划路径，按设定速度沿路径移动。
 
-> 阶段一（已交付）：root + 系统测试 Provider 注入，地图规划路径、按速度播放。
-> 阶段二（已交付）：LSPosed 模块隐藏"模拟位置"标记，对抗 isMock 类检测。
+本项目分两条注入路线（可在设置里切换）：
+
+| 路线 | 位置 | 生效范围 | 模拟标记 | 依赖 |
+|---|---|---|---|---|
+| **测试 Provider 注入**（默认） | 主 App 进程 | 全设备（同名 gps/network/fused Provider） | 有，靠 LSPosed 模块擦除 | root + appops |
+| **系统级注入**（可选） | system_server | 全设备，**所有 App 自动生效** | **无**（Location 由模块新建） | root + LSPosed 勾选「系统框架」 |
 
 ## 功能
 
+### 注入与反检测
+
+- 🛰️ **系统级注入（v0.33.0，可选）**：定位与 GNSS 由隐藏模块在 **system_server** 内改写，
+  对所有 App 生效、**不带 `isMock`/`isFromMockProvider` 标记**，无需 appops 与测试 Provider。
+  需在 LSPosed 勾选「系统框架」并重启系统。见 [`docs/system-injection.md`](docs/system-injection.md)
+- 🧩 **传感器系统级注入（v0.34.0，可选）**：配套 **Zygisk 模块**（Magisk 刷入）注入每个 App 进程，
+  改写计步 / 加速度 / 陀螺仪 / 姿态事件，无需 LSPosed 作用域。见 [`docs/zygisk-sensors.md`](docs/zygisk-sensors.md)
+- 🔐 root 注入：自动 `su` 授权 → `appops set <pkg> android:mock_location allow` → 接管 `gps`/`network`/`fused` Provider
+- 🛑 还原：停止后移除测试 Provider，恢复系统真实定位
+- 🔐 Root 检测显式化：主界面与开工向导都显示 Root 状态，可一键重新检测/申请授权（兼容 Magisk / KernelSU / APatch）
+
+### 定位与轨迹
+
 - 🛰️ GNSS 卫星回放（v0.19.0）：内置 CelesTrak 真实 TLE 星表（GPS / GLONASS / Galileo / 北斗共 143 颗），按**目标位置 + 当前 UTC 时间**用轨道传播算出此刻真实可见的卫星（仰角/方位角/载噪比，通常 30–70 颗），模块在目标 App 进程里 hook `GnssStatus` 读取方法与 `registerGnssStatusCallback` 按 1 Hz 回放 —— 不同城市看到的星座不同、卫星会随时间升落，不再是凭空一套固定星
-- 🧭 **交互重构（v0.35.0）**：菜单从 15 个平铺项收敛为「4 个一级动作 + 3 个分组子菜单」；
-  主界面底部控件按状态显示 —— 运行中自动隐藏选点/速度/循环控件避免误触，只留主操作与「彻底停止」；
-  显示规则抽到 `core/MotionUiState`，由单元测试固定（运行中永不暴露可编辑控件等 9 条规则）
 - 🗺️ 地图选点：轻点地图落图钉 → 弹窗确认「添加为路径点 / 临时定位 / 取消」，不会误触
 - ✋ 点位编辑：点击图钉可删除或临时定位，长按拖动可微调位置，折线实时跟随
 - 🛣️ 路径播放：按 1–120 km/h 沿路径插值移动，支持循环；地图上实时显示当前位置
@@ -74,11 +88,14 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
 - 🧩 单 APK 双身份：同一安装包既是主 App，也是 LSPosed 模块（`assets/xposed_init` + `xposedmodule` 元数据）
 - 📍 首页定位按钮：一键读取设备**真实位置**，地图居中显示；可直接「添加为路径点 / 临时定位到这里」
 - 🗺️ 地图源可切换：默认高德（国内可用），另备高德卫星 / OSM / Carto；地图空白时可「手动输入坐标」选点
-- 🔐 Root 检测显式化：主界面与开工向导都显示 Root 状态，可一键重新检测/申请授权（兼容 Magisk / KernelSU / APatch 的 su 路径）
-- 🔐 root 注入：自动 `su` 授权 → `appops set <pkg> android:mock_location allow` → 接管 `gps`/`network`/`fused` Provider
-- 🛑 还原：停止后移除测试 Provider，恢复系统真实定位
 - 📥📤 GPX：导入/导出路径轨迹
 - 🔔 前台服务 + 通知栏暂停/停止
+
+### 界面与交互
+
+- 🧭 **交互重构（v0.35.0）**：菜单从 15 个平铺项收敛为「4 个一级动作 + 3 个分组子菜单」；
+  主界面底部控件按状态显示 —— 运行中自动隐藏选点/速度/循环控件避免误触，只留主操作与「彻底停止」；
+  显示规则抽到 `core/MotionUiState`，由单元测试固定（运行中永不暴露可编辑控件等 9 条规则）
 
 ## 交付物
 
@@ -87,10 +104,11 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
 
 | 文件 | 说明 |
 |---|---|
-| `dist/virtual-motion-0.32.0.apk` | 主 App + 内置隐藏模块（root 注入 / 路径播放 / 开工向导 / 环境指纹 / LSPosed 反检测） |
+| `virtual-motion-0.37.1.apk` | 主 App + 内置隐藏模块（`Releases` 里下载） |
+| `vloc-zygisk-v0.37.1.zip` | Zygisk 传感器模块（可选，Magisk 刷入） |
 
 ```bash
-adb install -r dist/virtual-motion-0.32.0.apk
+adb install -r virtual-motion-0.37.1.apk
 ```
 
 > 升级提示：如果之前装过独立的隐藏模块，先 `adb uninstall com.vloc.motion.hidden`，
@@ -100,42 +118,50 @@ adb install -r dist/virtual-motion-0.32.0.apk
 
 ```
 app/src/main/java/com/vloc/motion/
-├── App.java                      # osmdroid 初始化
-├── core/                         # 纯 Java，可单元测试
-│   ├── GeoMath.java              # 距离/方位角/球面插值
-│   ├── Route.java                # 路径点、按里程采样
-│   ├── RoutePlayer.java          # 播放状态机
-│   ├── GpxCodec.java             # GPX 读写
-│   └── RouteStore.java           # SharedPreferences 持久化
+├── App.java                       # osmdroid 初始化
+├── core/                          # 纯 Java，可单元测试（22 个）
+│   ├── GeoMath / Route / RoutePlayer      # 距离、路径、播放状态机
+│   ├── RealismEngine / PacePlan           # 拟真漂移、目标配速
+│   ├── StepEngine / ImuWaveform / GaitAttitude  # 步态与 IMU/姿态波形
+│   ├── GnssTle / GnssOrbit / GnssSky      # 真实 TLE → 轨道传播 → 可见卫星
+│   ├── GpxCodec / RouteStore / BuiltinRoutes / PresetRoutes
+│   ├── ChinaCoord / TileSources / EnvSnapshot / Fix / GoalPlanner
+│   └── MotionUiState                      # 界面显示规则（可测）
 ├── location/
-│   ├── RootShell.java            # su 命令执行、appops 授权
-│   └── TestProviderInjector.java # addTestProvider / setTestProviderLocation
+│   ├── RootShell                          # su 执行、appops 授权
+│   ├── TestProviderInjector               # addTestProvider / setTestProviderLocation
+│   ├── RealLocationProvider / GnssCollector / EnvCollector / ModuleCheck
 ├── service/
-│   ├── LocationService.java      # 前台服务，200ms 推进 + 注入
-│   └── Session.java              # 进程内共享状态
-└── ui/MainActivity.java          # 地图 + 控制面板
+│   ├── LocationService                    # 前台服务：10Hz 推进 + 注入（可切系统级）
+│   ├── LocationSession / StepSession / GnssSession / EnvSession  # 下发通道（ContentProvider）
+│   ├── EnvProvider                        # content://com.vloc.motion.env/{location,steps,gnss,snapshot}
+│   ├── VlocStateFile                      # 传感器状态（供 Zygisk 模块 mmap）
+│   └── Session                            # 进程内共享状态
+├── hidden/                        # 内置 LSPosed 模块（同 APK）
+│   ├── HookEntry                          # 入口：isMock/Settings/AppOps/Provider/Parcel
+│   ├── SystemHooks                        # system_server 系统级定位/GNSS 注入
+│   ├── GnssReplay / StepReplay / ImuReplay / EnvReplay / EnvSnapshot
+└── ui/
+    ├── MainActivity / SetupActivity       # 地图主界面 / 开工向导
+    ├── FloatingWindow                     # 前台悬浮窗
+    └── Diagnostics / TileProviderTuner
 
-app/src/main/assets/xposed_init   # 内置 LSPosed 模块入口声明
-app/src/main/assets/gnss_tle.txt  # GNSS 真实星表（CelesTrak TLE，GPS/GLONASS/Galileo/北斗）
-app/src/main/java/com/vloc/motion/hidden/
-├── HookEntry.java                # Location / Settings / AppOps / ContentProvider / Parcel hook
-├── EnvReplay.java                # 基站 / Wi-Fi 环境回放
-└── EnvSnapshot.java              # 通过主 App Provider 读取快照（缓存 + 超时）
-hidden/                           # v0.4.0 独立模块源码（历史参考，不再构建）
+app/src/main/assets/
+├── xposed_init                    # LSPosed 模块入口声明
+└── gnss_tle.txt                   # GNSS 真实星表（GPS/GLONASS/Galileo/北斗，143 颗）
 
 docs/
-├── usage.md                      # 使用手册
-├── system-injection.md           # 系统级注入（system_server 改写定位/GNSS）
-├── phase2-hidden.md              # 隐藏模块安装手册
-├── root-injection.md             # root 注入方案调研（AOSP 源码级）
-└── mock-detection.md             # 模拟位置检测手段与绕过矩阵
+├── usage.md                       # 使用手册
+├── system-injection.md            # system_server 系统级注入（定位/GNSS）
+├── zygisk-sensors.md              # Zygisk 传感器模块
+├── phase2-hidden.md               # 隐藏模块安装手册
+├── root-injection.md              # root 注入方案调研（AOSP 源码级）
+├── mock-detection.md              # 模拟位置检测手段与绕过矩阵
+└── cell-wifi-spoofing.md          # 基站 / Wi-Fi 环境伪装
 
-zygisk/                         # Zygisk 传感器模块（C++，Magisk 刷入）
-
-scripts/
-├── update_gnss_tle.py            # 刷新内置 GNSS 星表（TLE 会过期，发版前跑一次）
-├── root_grant_mock.sh            # appops 授权/回读/回滚
-└── install_system_app.sh         # Magisk 模块方式安装为 priv-app（进阶）
+zygisk/                            # Zygisk 传感器模块（C++ + Magisk 打包）
+scripts/                           # update_gnss_tle.py / root_grant_mock.sh / install_system_app.sh
+hidden/                            # v0.4.0 独立模块源码（历史参考，不再构建）
 ```
 
 ## 构建
@@ -143,90 +169,109 @@ scripts/
 工具链放在 `.toolchain/`（JDK 17 + Android SDK 35 + Gradle 8.9，已gitignore）：
 
 ```bash
-source .toolchain/env.sh
-gradle :app:assembleDebug          # 产物：app/build/outputs/apk/debug/app-debug.apk
-gradle :app:testDebugUnitTest      # 核心算法单元测试
+# 有 wrapper，任意机器可直接构建（CI 用同一套命令）
+./gradlew :app:testDebugUnitTest   # 134 个单元测试
+./gradlew :app:assembleDebug       # 产物：app/build/outputs/apk/debug/app-debug.apk
+
+# 本仓库开发机还可用 .toolchain/ 里的固定工具链（JDK 17 + SDK 35 + Gradle 8.9）
+source .toolchain/env.sh && gradle :app:assembleDebug
+
+# Zygisk 传感器模块（需要 NDK）
+export ANDROID_NDK_ROOT=/path/to/ndk && bash zygisk/build.sh   # → zygisk/out/vloc-zygisk.zip
 ```
+
+CI：`.github/workflows/android.yml`（push/PR 跑测试+构建 APK）、`release.yml`（打 `v*` tag 自动发 Release，
+含 APK + SHA256 + Zygisk zip）、`zygisk.yml`（原生模块编译）。
 
 ## 使用
 
 1. 安装 APK，首次启动授予**定位**权限（Android 13+ 还有通知权限）
-2. 启动时 Magisk / KernelSU / APatch 会弹 root 授权，点允许
+2. 启动时 Magisk / KernelSU / APatch 会弹 root 授权 → 允许
 3. 状态栏显示 `Root：已授权 ✓`
-4. 轻点地图加路径点（≥2 个），拖动"速度"滑块，可选循环
-5. 点「开始」→ 前台服务接管定位并沿路径移动
-6. 「停止」恢复真实定位；长按地图或点「临时定位」可跳到某个坐标
+4. 轻点地图加路径点（≥2 个）→ 拖「速度」滑块（或用菜单「目标配速…」）→ 可选循环
+5. 点「开始」→ 前台服务接管定位，把位置定到起点并保持
+6. 到其它 App 上，在**悬浮窗**点「开始」→ 开始沿路径移动（暂停/停止移动只冻结路线，定位保持原地）
+7. 回主界面点「彻底停止」→ 移除模拟定位、恢复真实定位
 
-## 原理（阶段一）
+**想开系统级注入**：设置里打开「系统级注入」→ LSPosed 把「系统框架」加入作用域 → 重启手机。
+之后所有 App 直接拿到虚拟定位，且没有 mock 标记。
+
+## 原理
+
+### 路线 A：测试 Provider 注入（默认）
 
 ```
-用户 root 授权
-   └─ su -c "appops set com.vloc.motion android:mock_location allow"
-        └─ LocationManager.addTestProvider("gps"/"network")
-             └─ setTestProviderLocation(每 200ms 一个点)
+root 授权
+  └─ su -c "appops set com.vloc.motion android:mock_location allow"
+       └─ LocationManager.addTestProvider("gps"/"network"/"fused")
+            └─ setTestProviderLocation(每 100ms 一个点，随速度插值)
 ```
 
-- 普通 App 默认拿不到 `ACCESS_MOCK_LOCATION`，root 下用 `appops` 直接开 `android:mock_location` 操作权限，**无需打开开发者选项**
-- 接管的是同名系统 Provider，所以直接查询 GPS 的 App 会拿到伪造坐标
-- 测试 Provider 写入的点在系统层会被标记为模拟位置（`isFromMockProvider`/`isMock`），严格检测的 App 仍能识别 → 阶段二用 LSPosed Hook 处理
+- 普通 App 拿不到 `ACCESS_MOCK_LOCATION`，root 下用 `appops` 直接开，**无需开发者选项**
+- 接管的是同名系统 Provider，查询 GPS 的 App 直接拿到伪造坐标
+- 系统会把这些点标记为模拟位置（`isFromMockProvider`/`isMock`）→ 由 LSPosed 模块擦除
+
+### 路线 B：系统级注入（可选）
+
+```
+主 App 每帧写 content://com.vloc.motion.env/location（JSON 快照）
+  └─ 隐藏模块在 system_server 内 hook
+       ├─ LocationListenerTransport#onLocationChanged(Location|LocationResult)
+       ├─ getLastLocation / getCurrentLocation
+       └─ GnssStatusListenerTransport#onSatelliteStatusChanged(GnssStatus)
+```
+
+- Location 由模块 **新建**，天然没有 mock 标记，也不需要 appops / 测试 Provider
+- **所有 App 自动生效**，不用逐个勾选作用域
+- GNSS 卫星：内置 CelesTrak 真实 TLE（143 颗），按目标经纬度 + UTC 时间做轨道传播，
+  只上报仰角 > 3° 的卫星，因此不同城市星座不同、卫星会随时间升落
+
+### 传感器（计步 / IMU / 姿态）
+
+- 默认：LSPosed 模块在目标 App 进程内合成传感器事件（按步态波形）
+- 可选：**Zygisk 模块**注入每个 App 进程，在 `SystemSensorManager` 的 JNI 分发点改写，
+  无需作用域（见 `docs/zygisk-sensors.md`）
 
 ## 已知限制
 
-- 需要 root；未 root 设备无法使用（不走开发者选项模拟路径）
-- 地图瓦片来自 OpenStreetMap，需要联网
-- 部分应用（尤其游戏、打卡类）会检测模拟位置并拒绝
+- **需要 root**；未 root 设备无法使用
+- 地图瓦片依赖网络（高德 / OSM / Carto）
+- 部分应用会检测模拟位置并拒绝（GMS 融合定位、native 读取、行为检测）；
+  系统级注入能消除标记，但行为一致性仍需拟真参数配合
+- 传感器事件由 native 分发，Java 层接管对部分 NDK 直读无效 → 需要可选的 Zygisk 模块
 - 仅供学习与测试使用
 
-## 阶段二：隐藏"模拟位置"痕迹
+## 隐藏「模拟位置」痕迹
 
-安装 `hidden` 模块后，在 **LSPosed** 中启用并把目标 App 勾进作用域，目标 App 进程里
-`Location.isMock()` / `isFromMockProvider()` 一律返回 `false`，`getExtras()` 里的 mock 残留也会被清掉。
-详见 [`docs/phase2-hidden.md`](docs/phase2-hidden.md)。
+LSPosed 模块（已内置在同一 APK）在目标 App 进程内做这些遮蔽：
+
+- `Location.isMock()` / `isFromMockProvider()` → 恒 `false`，`setMock`/`setIsFromMockProvider` 空操作
+- `Settings.Secure/System/Global` 里 `mock_location` 相关读取 → 等价于"该设置不存在"
+- `AppOpsManager` 自查 / 枚举 / `noteOp` / `startOp` → 对 mock op 表现为"无权限"
+- `ContentResolver.query/call` 直查 settings provider → 返回空结果
+- `Location.writeToParcel` → 序列化前临时清 mock 位
+- `getExtras()` → 清掉 mock 类残留 key
+
+安装后在 **LSPosed** 启用「虚拟运动」，并把目标 App 勾进作用域（用系统级注入则勾「系统框架」）。
 
 > 说明：模块只"擦标记"，不改变检测能力上限——GMS 融合定位、native 读取、行为检测仍可能识破，
-> 完整能力矩阵见 `docs/mock-detection.md` §4。
+> 完整能力矩阵见 [`docs/mock-detection.md`](docs/mock-detection.md)。
 
 ## Roadmap
 
-- [x] 地图选点（图钉确认）/ 路径播放 / 速度 / 循环 / 临时定位
-- [x] 点位编辑：点选删除 / 临时定位，长按拖动微调
-- [x] root appops 自动授权 + 多 Provider 注入 + 注入前二次校验
-- [x] GPX 导入导出
-- [x] 阶段二：LSPosed 隐藏模块（清除 isMock / isFromMockProvider / extras）
-- [x] 拟真反检测（漂移/噪声/卫星数据/起步缓动）+ 海拔链路 + 前台悬浮窗
-- [x] 隐藏模块增强：Settings / AppOps 自查 hook（A11/A12）
-- [x] 隐藏模块增强：ContentProvider 直查 / AppOps 枚举 / Parcel 序列化旁路（v0.3.0）
-- [x] 开工向导（位置 → 路线 → 环境）+ 路线库 + 基站/Wi-Fi 环境快照回放（v0.4.0）
-- [x] 主 App 与隐藏模块合并为单 APK（v0.6.0）
-- [x] 地图源切换 + 手动坐标选点 + Root 检测/申请按钮（v0.7.0）
-- [x] 地图瓦片可达性自动探测/自动换源 + 内置地图诊断、Root 诊断（v0.7.3）
-- [x] 修复地图网格：osmdroid XYTileSource 不替换 {x}/{y}/{z} 占位符导致高德/OSM 瓦片全部 404，改用自实现 PlaceholderTileSource（v0.8.0）
-- [x] 模拟器（Android 9 x86_64，TCG）实测：地图渲染 / Root 检测 / 临时定位注入 / 开工向导地图 全部通过
-- [x] 首页「定位」按钮读取真实位置，支持用当前位置选点（v0.8.1）
-- [x] 速度混淆 + 目标配速（圈数取整、目标时间 ±10s、最大速度与分段速度限制）（v0.9.1）
-- [x] 预设路线组 + 目标时间改分:秒输入 + 预设自动同步单圈距离（v0.9.4）
-- [x] 目标配速改选择器 + 自动推导时间 + 隐藏手动速度 + 不可达/异常数据提示（v0.10.0）
-- [x] GCJ-02/WGS-84 双向转换 + 内置路线闭环 + 悬浮窗受限权限引导（v0.11.1）
-- [x] 坐标口径修正：内置路线改用 glat/glon（GCJ-02）为权威输入，卫星图核对对准操场（v0.11.2）
-- [x] 悬浮窗交互重构：开始/暂停/停止移动 + 只有主界面能彻底停止（v0.12.1）
-- [x] 步数/步频/步幅推算 + 计步传感器回放（v0.13.0）
-- [x] 时变步态（步频/步幅在一次模拟内波动）+ IMU（加速度计/陀螺仪）伪造（v0.14.0）
-- [x] 姿态回放（ROTATION_VECTOR / MAGNETIC_FIELD 按跑步摆动）+ 重力按姿态自洽 + 姿态开关（v0.15.1）
-- [x] GAME_ROTATION_VECTOR + ORIENTATION 伪造（v0.15.2）
-- [x] 步频/速度模型收敛 + 模块自检 + 默认速度改 6 km/h（v0.15.3）
-- [x] 两段式启动（主界面只定位到起点）+ 悬浮窗自检信息 + 可折叠（v0.16.2）
-- [x] 步数/步频/模块注入自检（未注入 / 已注入未读传感器 / 读取中）+ 悬浮窗状态三态（v0.16.3）
-- [x] 步骤快照 JSON 增加 `satellites` / `cn0Mean` / `cn0Max`，为隐藏模块回放 GNSS 附属数据预留字段（v0.17.0）
-- [x] GNSS 卫星回放：逐颗卫星模型 + 模块侧 GnssStatus hook + 1Hz 回放（v0.18.0）
-- [x] GNSS 改为真实星历驱动：内置 TLE 星表 + 轨道传播，按位置/UTC 时间计算真实可见卫星（v0.19.0）
-- [x] 拟真漂移改为时间连续 OU（√dt 缩放）：高刷新注入下轨迹不再"跳"，反推瞬时速度波动减半（v0.19.1）
-- [x] 配速自然度：多时间尺度速度模型（慢变/地形/疲劳/冲刺事件），每公里分段标准差从 ±3s 提到 ±20s 量级（v0.19.2）
-- [x] 到达目标自动停止并恢复真实定位（可在设置关闭）+ 修复历史版本 SharedPreferences 类型不一致导致的启动崩溃（v0.19.3）
-- [x] 修复「关于」里版本号写死导致升级后仍显示旧版本，改为读取安装包实际版本（v0.27.1）
-- [x] 系统级注入：定位 + GNSS 改由模块在 system_server 改写（所有 App 生效、无 mock 标记）（v0.33.0）
-- [x] **移除虚拟摄像头全部功能**（相机接管、视频库、摄像头悬浮窗），项目回归单一虚拟定位/跑步模拟（v0.37.0）
-- [x] 交互重构：菜单分组、底部卡片状态驱动（运行中隐藏选点/设置控件）（v0.35.0）
-- [x] 完善：交互状态抽成可测单元、GPX/路线边界测试、空列表禁用（v0.36.0）
+已完成（按版本）：
+
+- v0.1 – v0.16：地图选点 / 路径播放 / root appops 注入 / GPX / LSPosed 隐藏模块 /
+  拟真反检测 / 海拔 / 前台悬浮窗 / 步数·IMU·姿态回放 / 两段式启动
+- v0.17 – v0.19：GNSS 卫星回放（真实 TLE + 轨道传播）/ 拟真漂移改时间连续 OU /
+  配速自然度（多时间尺度）/ 到达自动停止
+- v0.33：**系统级注入**（system_server 改写定位与 GNSS，无 mock 标记）
+- v0.34：**Zygisk 传感器模块**（计步 / IMU / 姿态全 App 自动接管）
+- v0.35 – v0.36：交互重构（菜单分组 + 底部卡片状态驱动）、显示规则抽成可测单元
+- v0.37：移除相机 / 虚拟摄像头功能，回归单一虚拟定位与跑步模拟
+
+待办：
+
 - [ ] 路线收藏与多路径管理
 - [ ] 摇杆手动控制 / 路线图钉拖拽编辑
 
