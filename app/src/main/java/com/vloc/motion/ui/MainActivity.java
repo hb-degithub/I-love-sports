@@ -45,7 +45,6 @@ import com.vloc.motion.core.GpxCodec;
 import com.vloc.motion.core.PacePlan;
 import com.vloc.motion.core.PresetRoutes;
 import com.vloc.motion.core.TileSources;
-import com.vloc.motion.core.CameraPreset;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.location.RealLocationProvider;
@@ -54,7 +53,6 @@ import com.vloc.motion.location.RootShell;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.service.EnvSession;
 import com.vloc.motion.service.StepSession;
-import com.vloc.motion.service.CameraOverlayService;
 import com.vloc.motion.service.LocationService;
 import com.vloc.motion.service.Session;
 
@@ -109,25 +107,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
     private ActivityResultLauncher<String[]> importLauncher;
     private ActivityResultLauncher<String> exportLauncher;
-    private ActivityResultLauncher<String[]> cameraPicker;
-
-    // ---- 虚拟摄像头页签 ----
-    private TextView tabMotion;
-    private TextView tabCamera;
-    private View motionPage;
-    private View cameraPage;
-    private SwitchMaterial cameraSwitch;
-    private VideoView cameraPreview;
-    private TextView cameraCurrent;
-    private TextView cameraStatusText;
-    private TextView cameraEmpty;
-    private LinearLayout cameraList;
-    private Button cameraPlayPause;
-    private SwitchMaterial cameraImuSwitch;
-    private int currentTab;
-    private final android.os.Handler cameraStatusHandler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
-
     private String lastErrorShown;
     /** null=检测中，TRUE=已授权，FALSE=未授权 */
     private Boolean rootGranted;
@@ -148,7 +127,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             "15 km/h（慢跑）", "16 km/h", "18 km/h", "20 km/h（较快）"};
     /** 用户点了悬浮窗开关但还没授权时，回到前台后自动补上 */
     private boolean pendingOverlayEnable;
-    private boolean pendingCameraOverlay;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -160,9 +138,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
         initMap();
         initViews();
-        initCameraPage();
-        // 内置预置视频（assets/camera_presets）：首次启动复制进视频列表
-        com.vloc.motion.service.PresetVideos.sync(this);
         registerLaunchers();
         restoreState();
         refreshRouteOverlays();
@@ -181,11 +156,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         super.onResume();
         Session.INSTANCE.addListener(this);
         refreshUi();
-        if (currentTab == 1) {
-            updateCameraPage();
-            cameraStatusHandler.removeCallbacks(cameraStatusTicker);
-            cameraStatusHandler.post(cameraStatusTicker);
-        }
         updateCurrentMarker();
         if (pendingOverlayEnable && Settings.canDrawOverlays(this)) {
             pendingOverlayEnable = false;
@@ -194,23 +164,11 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             invalidateOptionsMenu();
             toast("悬浮窗已开启");
         }
-        if (pendingCameraOverlay) {
-            if (Settings.canDrawOverlays(this)) {
-                pendingCameraOverlay = false;
-                RouteStore.saveCameraOverlayHidden(this, false);
-                syncCameraOverlay(true);
-                toast("虚拟摄像头悬浮窗已开启");
-            }
-        }
-        // 注意：不再在回到前台时自动拉起摄像头悬浮窗 —— 只有用户主动点「播放」/
-        // 打开开关时才显示，避免"一打开应用就弹一个悬浮窗"
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        cameraStatusHandler.removeCallbacks(cameraStatusTicker);
-        stopCameraPreview();
         Session.INSTANCE.removeListener(this);
         saveMapView();
     }
@@ -219,8 +177,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
     private void initMap() {
         android.widget.FrameLayout container = findViewById(R.id.mapContainer);
-        mapView = new MapView(this, new org.osmdroid.tileprovider.MapTileProviderBasic(
-                this, TileSources.load(this)));
         container.addView(mapView, new android.widget.FrameLayout.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
@@ -340,13 +296,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     }
 
     private void registerLaunchers() {
-        cameraPicker = registerForActivityResult(
-                new ActivityResultContracts.OpenMultipleDocuments(), uris -> {
-                    if (uris == null || uris.isEmpty()) {
-                        return;
-                    }
-                    addCameraClips(uris);
-                });
         importLauncher = registerForActivityResult(
                 new ActivityResultContracts.OpenDocument(), uri -> {
                     if (uri == null) {
@@ -1594,9 +1543,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         } else if (id == R.id.action_float) {
             toggleOverlay();
             return true;
-        } else if (id == R.id.action_camera) {
-            selectTab(1);
-            return true;
         } else if (id == R.id.action_settings) {
             showSettingsDialog();
             return true;
@@ -1677,291 +1623,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 .setNegativeButton("取消", null)
                 .show();
     }
-
-    // ---------------------------------------------------------------- 虚拟摄像头
-
-    /** 把选中的相册视频加入虚拟摄像头列表（SAF 持久化授权，模块通过 provider 读取 FD）。 */
-    private void addCameraClips(java.util.List<Uri> uris) {
-        java.util.List<com.vloc.motion.core.CameraClips.Clip> clips =
-                RouteStore.loadCameraClips(this);
-        int added = 0;
-        for (Uri uri : uris) {
-            try {
-                getContentResolver().takePersistableUriPermission(uri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (Exception ignored) {
-                // 个别来源不支持持久化授权，仍尝试使用（重启后可能失效）
-            }
-            String name = queryClipName(uri);
-            long durationMs = com.vloc.motion.service.PresetVideos.durationMs(this, uri);
-            String displayName = name;
-            if (durationMs > 0) {
-                displayName = name + "（" + CameraPreset.formatDuration(durationMs) + "）";
-                if (!CameraPreset.durationOk(durationMs)) {
-                    toast("「" + name + "」时长 " + CameraPreset.formatDuration(durationMs)
-                            + "，不在要求的 60–120 秒内");
-                }
-            }
-            clips.add(new com.vloc.motion.core.CameraClips.Clip(
-                    displayName, uri.toString(), System.currentTimeMillis()));
-            added++;
-        }
-        RouteStore.saveCameraClips(this, clips);
-        if (clips.size() == added) {
-            RouteStore.saveCameraIndex(this, 0);
-        }
-        toast("已添加 " + added + " 个视频（共 " + clips.size() + " 个）");
-        updateCameraPage();
-    }
-
-    private String queryClipName(Uri uri) {
-        try (android.database.Cursor cursor = getContentResolver().query(uri,
-                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
-            if (cursor != null && cursor.moveToFirst()) {
-                String name = cursor.getString(0);
-                if (name != null && !name.isEmpty()) {
-                    return name;
-                }
-            }
-        } catch (Exception ignored) {
-            // 查询失败用默认名
-        }
-        return "视频";
-    }
-
-    /** 虚拟摄像头管理：开关、视频列表（选当前 / 删除）、添加视频。 */
-    // ---------------------------------------------------------------- 虚拟摄像头页签
-
-    private void initCameraPage() {
-        tabMotion = findViewById(R.id.tabMotion);
-        tabCamera = findViewById(R.id.tabCamera);
-        motionPage = findViewById(R.id.motionPage);
-        cameraPage = findViewById(R.id.cameraPage);
-        cameraSwitch = findViewById(R.id.switchCamera);
-        cameraPreview = findViewById(R.id.videoPreview);
-        cameraCurrent = findViewById(R.id.textCurrent);
-        cameraStatusText = findViewById(R.id.textModuleStatus);
-        cameraEmpty = findViewById(R.id.textEmpty);
-        cameraList = findViewById(R.id.listClips);
-        cameraPlayPause = findViewById(R.id.btnPlayPause);
-        cameraImuSwitch = findViewById(R.id.switchCameraImu);
-
-        tabMotion.setOnClickListener(v -> selectTab(0));
-        tabCamera.setOnClickListener(v -> selectTab(1));
-        cameraSwitch.setOnCheckedChangeListener((buttonView, checked) -> {
-            RouteStore.saveCameraEnabled(this, checked);
-            if (checked) {
-                // 用户重新打开开关：清掉上次 ✕ 收起的标记，让悬浮窗能回来
-                RouteStore.saveCameraOverlayHidden(this, false);
-            }
-            syncCameraOverlay(checked);
-            updateCameraPage();
-        });
-        cameraPlayPause.setOnClickListener(v -> {
-            boolean playing = !RouteStore.loadCameraPlaying(this);
-            RouteStore.saveCameraPlaying(this, playing);
-            // 点「播放」时把摄像头悬浮窗拉起来（定位会话在跑时由定位悬浮窗统一显示）
-            if (playing && RouteStore.loadCameraEnabled(this)) {
-                // 主动点播放：即使上次 ✕ 收起过，也把摄像头悬浮窗拉起来
-                RouteStore.saveCameraOverlayHidden(this, false);
-                syncCameraOverlay(true);
-            }
-            updateCameraPage();
-        });
-        findViewById(R.id.btnPrev).setOnClickListener(v -> stepCameraClip(-1));
-        findViewById(R.id.btnNext).setOnClickListener(v -> stepCameraClip(1));
-        findViewById(R.id.btnAdd).setOnClickListener(
-                v -> cameraPicker.launch(new String[]{"video/*"}));
-        findViewById(R.id.btnDelete).setOnClickListener(v -> deleteCameraClip());
-        // VideoView 播不了时不要弹系统对话框
-        cameraImuSwitch.setOnCheckedChangeListener((buttonView, checked) -> {
-            RouteStore.saveCameraImuUpright(this, checked);
-            toast(checked ? "接管期间 IMU：竖直静止" : "接管期间 IMU：跟随运动模拟");
-        });
-        cameraPreview.setOnErrorListener((mp, what, extra) -> true);
-        selectTab(0);
-    }
-
-    /** 切页签：0 = 虚拟运动，1 = 虚拟摄像头。 */
-    private void selectTab(int tab) {
-        currentTab = tab;
-        boolean motion = tab == 0;
-        motionPage.setVisibility(motion ? View.VISIBLE : View.GONE);
-        cameraPage.setVisibility(motion ? View.GONE : View.VISIBLE);
-        int brand = androidx.core.content.ContextCompat.getColor(this, R.color.brand);
-        int secondary = androidx.core.content.ContextCompat.getColor(this, R.color.text_secondary);
-        tabMotion.setBackgroundColor(motion ? brand : 0x00000000);
-        tabCamera.setBackgroundColor(motion ? 0x00000000 : brand);
-        tabMotion.setTextColor(motion ? 0xFFFFFFFF : secondary);
-        tabCamera.setTextColor(motion ? secondary : 0xFFFFFFFF);
-        if (!motion) {
-            updateCameraPage();
-            cameraStatusHandler.removeCallbacks(cameraStatusTicker);
-            cameraStatusHandler.post(cameraStatusTicker);
-        } else {
-            cameraStatusHandler.removeCallbacks(cameraStatusTicker);
-            stopCameraPreview();
-        }
-    }
-
-    private void stepCameraClip(int delta) {
-        java.util.List<com.vloc.motion.core.CameraClips.Clip> clips =
-                RouteStore.loadCameraClips(this);
-        if (clips.isEmpty()) {
-            return;
-        }
-        int index = com.vloc.motion.core.CameraClips.clampIndex(clips,
-                RouteStore.loadCameraIndex(this) + delta);
-        RouteStore.saveCameraIndex(this, index);
-        updateCameraPage();
-    }
-
-    private void deleteCameraClip() {
-        java.util.List<com.vloc.motion.core.CameraClips.Clip> clips =
-                RouteStore.loadCameraClips(this);
-        int index = RouteStore.loadCameraIndex(this);
-        if (!com.vloc.motion.core.CameraClips.isValidIndex(clips, index)) {
-            return;
-        }
-        clips.remove(index);
-        RouteStore.saveCameraClips(this, clips);
-        RouteStore.saveCameraIndex(this, 0);
-        updateCameraPage();
-    }
-
-    /** 刷新摄像头页：开关、当前视频、列表、预览。 */
-    private void updateCameraPage() {
-        java.util.List<com.vloc.motion.core.CameraClips.Clip> clips =
-                RouteStore.loadCameraClips(this);
-        int index = RouteStore.loadCameraIndex(this);
-        boolean enabled = RouteStore.loadCameraEnabled(this);
-        boolean playing = RouteStore.loadCameraPlaying(this);
-
-        cameraSwitch.setChecked(enabled);
-        cameraImuSwitch.setChecked(RouteStore.loadCameraImuUpright(this));
-        cameraPlayPause.setText(playing ? "暂停" : "播放");
-        // 没有视频时，播放/切换/删除都没有意义，直接禁用，避免点了没反应
-        final boolean hasClips = !clips.isEmpty();
-        cameraPlayPause.setEnabled(hasClips);
-        findViewById(R.id.btnPrev).setEnabled(hasClips);
-        findViewById(R.id.btnNext).setEnabled(hasClips);
-        findViewById(R.id.btnDelete).setEnabled(hasClips);
-        com.vloc.motion.core.CameraClips.Clip current =
-                com.vloc.motion.core.CameraClips.current(clips, index);
-        cameraCurrent.setText(current == null ? "未选择视频"
-                : String.format(Locale.US, "当前：%d/%d · %s", index + 1, clips.size(), current.name));
-        cameraEmpty.setVisibility(clips.isEmpty() ? View.VISIBLE : View.GONE);
-
-        cameraList.removeAllViews();
-        for (int i = 0; i < clips.size(); i++) {
-            final int position = i;
-            com.vloc.motion.core.CameraClips.Clip clip = clips.get(i);
-            TextView row = new TextView(this);
-            row.setText(String.format(Locale.US, "%s %d. %s",
-                    i == index ? "▶" : "　", i + 1, clip.name));
-            row.setTextSize(14f);
-            row.setPadding(0, 14, 0, 14);
-            row.setOnClickListener(v -> {
-                RouteStore.saveCameraIndex(this, position);
-                updateCameraPage();
-            });
-            cameraList.addView(row);
-        }
-
-        if (current != null && enabled && playing) {
-            startCameraPreview(current);
-        } else {
-            stopCameraPreview();
-        }
-    }
-
-    private void startCameraPreview(com.vloc.motion.core.CameraClips.Clip clip) {
-        try {
-            Uri uri = Uri.parse(clip.uri);
-            if (!uri.equals(cameraPreview.getTag(R.id.videoPreview))) {
-                cameraPreview.setTag(R.id.videoPreview, uri);
-                cameraPreview.setVideoURI(uri);
-            }
-            if (!cameraPreview.isPlaying()) {
-                cameraPreview.start();
-            }
-        } catch (Exception ignored) {
-            // 预览失败不影响配置下发
-        }
-    }
-
-    private void stopCameraPreview() {
-        try {
-            if (cameraPreview != null && cameraPreview.isPlaying()) {
-                cameraPreview.pause();
-            }
-        } catch (Exception ignored) {
-            // ignore
-        }
-    }
-
-    /** 模块上报的接管状态（1.5s 轮询）。 */
-    private final Runnable cameraStatusTicker = new Runnable() {
-        @Override
-        public void run() {
-            refreshCameraStatus();
-            cameraStatusHandler.postDelayed(this, 1500L);
-        }
-    };
-
-    private void refreshCameraStatus() {
-        String text;
-        try (android.database.Cursor cursor = getContentResolver().query(
-                Uri.parse("content://com.vloc.motion.env/camera_status"),
-                new String[]{"json"}, null, null, null)) {
-            if (cursor == null || !cursor.moveToFirst()) {
-                text = "模块状态：未上报\n（目标 App 还没打开相机，或模块未注入 / 不在 LSPosed 作用域）";
-            } else {
-                int column = cursor.getColumnIndex("json");
-                if (column < 0) {
-                    column = 1;
-                }
-                org.json.JSONObject json = new org.json.JSONObject(cursor.getString(column));
-                long reportAt = json.optLong("reportAt", 0L);
-                if (reportAt == 0L) {
-                    text = "模块状态：未上报\n（把目标 App 勾进 LSPosed 作用域 → 强制停止 → 重新打开相机）";
-                } else {
-                    long now = System.currentTimeMillis();
-                    String pkg = json.optString("pkg", "");
-                    int hooks = json.optInt("hooks", 0);
-                    long sessionAt = json.optLong("sessionAt", 0L);
-                    long renderAt = json.optLong("renderAt", 0L);
-                    String error = json.optString("error", "");
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("模块已注入：").append(pkg.isEmpty() ? "目标 App" : pkg)
-                            .append("（camera hooks=").append(hooks).append("/9）\n");
-                    sb.append("相机会话接管：")
-                            .append(sessionAt == 0 ? "还没发生" : ago(sessionAt, now) + "前").append("\n");
-                    sb.append("视频渲染：")
-                            .append(renderAt == 0 ? "还没开始" : ago(renderAt, now) + "前");
-                    if (!error.isEmpty()) {
-                        sb.append("\n最近错误：").append(error);
-                    }
-                    if (sessionAt == 0 && now - reportAt > 10_000L) {
-                        sb.append("\n提示：模块在跑但没拦到相机会话——目标 App 可能走 Camera1/NDK，或相机在别的进程");
-                    }
-                    text = sb.toString();
-                }
-            }
-        } catch (Exception e) {
-            text = "模块状态：查询失败（" + e.getClass().getSimpleName() + "）";
-        }
-        cameraStatusText.setText(text);
-    }
-
-    private static String ago(long at, long now) {
-        long seconds = Math.max(0L, (now - at) / 1000L);
-        if (seconds < 60) {
-            return seconds + "s";
-        }
-        return (seconds / 60) + "m" + (seconds % 60) + "s";
-    }
-
 
     private void showSettingsDialog() {
         View content = getLayoutInflater().inflate(R.layout.dialog_settings, null, false);
@@ -2073,31 +1734,6 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         } catch (RuntimeException e) {
             toast("无法打开悬浮窗权限设置");
         }
-    }
-
-    /** 虚拟摄像头悬浮窗与开关状态联动（定位会话运行期间由定位悬浮窗统一显示，不重复）。 */
-    private void syncCameraOverlay(boolean enable) {
-        if (!enable) {
-            CameraOverlayService.stop(this);
-            return;
-        }
-        if (Session.INSTANCE.mode != Session.Mode.IDLE) {
-            // 定位会话在跑：定位悬浮窗已经显示相机状态，避免两个胶囊
-            CameraOverlayService.stop(this);
-            return;
-        }
-        if (RouteStore.loadCameraOverlayHidden(this)) {
-            // 用户手动 ✕ 收起了，不主动弹回（下次启用会重置）
-            return;
-        }
-        if (!Settings.canDrawOverlays(this)) {
-            if (!pendingCameraOverlay) {
-                pendingCameraOverlay = true;
-                showOverlayPermissionDialog();
-            }
-            return;
-        }
-        CameraOverlayService.start(this);
     }
 
     private void syncOverlayToService(boolean enable) {

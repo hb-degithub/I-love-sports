@@ -5,7 +5,7 @@ import java.util.Locale;
 /**
  * 定位数据通道（供 LSPosed 模块在 <b>system_server</b> 里读取，实现系统级注入）。
  *
- * <p>与 {@link StepSession}（步数）、{@link GnssSession}（卫星）、{@link CameraSession}（相机）并列：
+ * <p>与 {@link StepSession}（步数）、{@link GnssSession}（卫星）并列：
  * 主 App 每推一次定位就写一份最新快照，模块在系统框架进程里按此改写所有 App 收到的 Location，
  * 因此<b>不需要</b>测试 Provider、也<b>不会</b>带模拟位置标记。
  */

@@ -13,49 +13,7 @@
         android:background="@color/brand"
         app:title="@string/app_name"
         app:titleTextColor="#FFFFFF" />
-    <LinearLayout
-        android:id="@+id/tabRow"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:background="@color/panel_bg"
-        android:padding="6dp">
 
-        <TextView
-            android:id="@+id/tabMotion"
-            android:layout_width="0dp"
-            android:layout_height="44dp"
-            android:layout_weight="1"
-            android:gravity="center"
-            android:text="运动"
-            android:textColor="#FFFFFF"
-            android:textSize="15sp"
-            android:textStyle="bold"
-            android:background="@color/brand" />
-
-        <TextView
-            android:id="@+id/tabCamera"
-            android:layout_width="0dp"
-            android:layout_height="44dp"
-            android:layout_weight="1"
-            android:gravity="center"
-            android:text="摄像头"
-            android:textColor="@color/text_secondary"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-    </LinearLayout>
-
-    <FrameLayout
-        android:id="@+id/pageContainer"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
-
-        <LinearLayout
-            android:id="@+id/motionPage"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:orientation="vertical">
 
         <FrameLayout
             android:id="@+id/mapContainer"
@@ -231,17 +189,4 @@
                 </LinearLayout>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
-
-        </LinearLayout>
-
-        <ScrollView
-            android:id="@+id/cameraPage"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:fillViewport="true"
-            android:visibility="gone">
-
-            <include layout="@layout/page_camera_content" />
-        </ScrollView>
-    </FrameLayout>
 </LinearLayout>

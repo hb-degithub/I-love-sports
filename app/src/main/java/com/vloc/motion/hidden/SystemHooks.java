@@ -478,22 +478,9 @@ final class SystemHooks {
 
     /** 把"系统级已生效"回报给主 App（复用相机状态通道的通用字段）。 */
     private static void report(int hooks) {
-        try {
-            final Context context = systemContext();
-            if (context == null) {
-                return;
-            }
-            final android.os.Bundle bundle = new android.os.Bundle();
-            bundle.putInt("hooks", hooks);
-            bundle.putBoolean("session", true);
-            bundle.putBoolean("render", false);
-            bundle.putString("pkg", "system_server");
-            bundle.putString("event", "system-level location/gnss hooks active");
-            context.getContentResolver().call(
-                    Uri.parse("content://com.vloc.motion.env/camera"), "camera_report", null, bundle);
-        } catch (Throwable ignored) {
-            // ignore
-        }
+        // 仅记日志：系统级 hook 的状态通过 LSPosed 日志排查，
+        // 主 App 不再需要相机/系统状态的独立上报通道（相机功能已移除）。
+        log("system-level hooks active: " + hooks);
     }
 
     private static void log(String message) {

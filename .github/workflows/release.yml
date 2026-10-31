@@ -58,21 +58,6 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US" > /dev/null
 
-      - name: Locate Android NDK
-        run: |
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
-          if [ -z "$NDK" ]; then
-            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -1)"
-          fi
-          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-
-      - name: Build Zygisk sensor module
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build zip > /dev/null
-          bash zygisk/build.sh
-          cp zygisk/out/vloc-zygisk.zip "vloc-zygisk-${TAG:-${GITHUB_REF_NAME}}.zip" 2>/dev/null ||             cp zygisk/out/vloc-zygisk.zip "vloc-zygisk.zip"
-          ls -la vloc-zygisk*.zip
-
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
 
@@ -106,8 +91,7 @@ jobs:
             > ⛔ **许可：PolyForm Noncommercial 1.0.0 —— 禁止任何商业用途**（见 LICENSE / LICENSE-ZH.md）
             > 🚫 **仅供学习、研究与自有设备技术验证；严禁打卡作弊、位置欺诈、绕过风控等违规违法用途**（见 DISCLAIMER.md）
 
-            ⚠️ **本项目虚拟摄像头功能尚未完成**（相机接管仍为实验性，未通过真机验证），详见 `docs/virtual-camera.md`。
-            定位 / 运动模拟部分可用。
+            本项目专注于**虚拟定位与运动模拟**（相机/摄像头相关功能已移除）。
 
             ### 安装
             ```bash
@@ -116,15 +100,9 @@ jobs:
             - 需要 root（Magisk / KernelSU / APatch）；隐藏模块需 LSPosed 并勾选作用域
             - 这是 **debug 签名** 的构建产物，仅供测试
 
-            ### 传感器系统级注入（可选）
-            附件里的 `vloc-zygisk-*.zip` 是 **Magisk 模块**：刷入后在「虚拟运动」App 里开启「系统级注入」，
-            所有 App 的计步/加速度/陀螺仪/姿态都会被接管（无需 LSPosed 作用域）。
-            详见 `docs/zygisk-sensors.md`。刷入有风险，请先确认能用 Magisk 卸载模块恢复。
-
             ### 校验
             见附带的 `.sha256` 文件。
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
-            vloc-zygisk*.zip
           fail_on_unmatched_files: true

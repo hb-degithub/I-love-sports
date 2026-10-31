@@ -39,16 +39,7 @@ public final class RouteStore {
     private static final String KEY_SPEED_VARIANCE = "speed_variance";
     private static final String KEY_ATTITUDE = "attitude_replay";
     private static final String KEY_AUTO_STOP_ON_FINISH = "auto_stop_on_finish";
-    private static final String KEY_CAMERA_ENABLED = "camera_enabled";
-    private static final String KEY_CAMERA_CLIPS = "camera_clips";
-    private static final String KEY_CAMERA_INDEX = "camera_index";
-    private static final String KEY_CAMERA_PLAYING = "camera_playing";
-    private static final String KEY_CAMERA_IMU_UPRIGHT = "camera_imu_upright";
-    private static final String KEY_CAMERA_OVERLAY_COLLAPSED = "camera_overlay_collapsed";
     private static final String KEY_SYSTEM_INJECT = "system_inject";
-    private static final String KEY_CAMERA_OVERLAY_X = "camera_overlay_x";
-    private static final String KEY_CAMERA_OVERLAY_Y = "camera_overlay_y";
-    private static final String KEY_CAMERA_OVERLAY_HIDDEN = "camera_overlay_hidden";
     private static final String KEY_OVERLAY_COLLAPSED = "overlay_collapsed";
     private static final String KEY_GNSS_SNAPSHOT = "gnss_snapshot";
     private static final String KEY_RANDOM_START = "random_start";
@@ -355,44 +346,25 @@ public final class RouteStore {
         prefs(context).edit().putBoolean(KEY_AUTO_STOP_ON_FINISH, enabled).apply();
     }
 
-    // ---------------------------------------------------------------- 虚拟摄像头
-
     /** 虚拟摄像头总开关（默认关闭）。 */
-    public static boolean loadCameraEnabled(Context context) {
-        return prefs(context).getBoolean(KEY_CAMERA_ENABLED, false);
-    }
+    
 
-    public static void saveCameraEnabled(Context context, boolean enabled) {
-        prefs(context).edit().putBoolean(KEY_CAMERA_ENABLED, enabled).apply();
-    }
+    
 
     /** 视频列表（相册里选的若干个视频，SAF 持久化授权）。 */
-    public static java.util.List<CameraClips.Clip> loadCameraClips(Context context) {
-        return CameraClips.fromJson(prefs(context).getString(KEY_CAMERA_CLIPS, ""));
-    }
+    
 
-    public static void saveCameraClips(Context context, java.util.List<CameraClips.Clip> clips) {
-        prefs(context).edit().putString(KEY_CAMERA_CLIPS, CameraClips.toJson(clips)).apply();
-    }
+    
 
     /** 当前播放第几个视频（悬浮窗可切换）。 */
-    public static int loadCameraIndex(Context context) {
-        return CameraClips.clampIndex(loadCameraClips(context),
-                readIntCompat(prefs(context), KEY_CAMERA_INDEX, 0));
-    }
+    
 
-    public static void saveCameraIndex(Context context, int index) {
-        prefs(context).edit().putInt(KEY_CAMERA_INDEX, index).apply();
-    }
+    
 
     /** 虚拟摄像头视频是否正在播放（暂停时目标 App 的相机画面冻结在最后一帧）。 */
-    public static boolean loadCameraPlaying(Context context) {
-        return prefs(context).getBoolean(KEY_CAMERA_PLAYING, false);
-    }
+    
 
-    public static void saveCameraPlaying(Context context, boolean playing) {
-        prefs(context).edit().putBoolean(KEY_CAMERA_PLAYING, playing).apply();
-    }
+    
 
     /**
      * 系统级注入（默认关）：定位与 GNSS 由 LSPosed 模块在 system_server 内改写，
@@ -414,22 +386,14 @@ public final class RouteStore {
      * <p>这是和「运动模拟（跑步姿态）」互斥的另一套逻辑：运动检测类 App 靠陀螺仪/加速度
      * 判断手机是否立好，竖直模式让它通过；关掉则继续按跑步姿态回放。
      */
-    public static boolean loadCameraImuUpright(Context context) {
-        return prefs(context).getBoolean(KEY_CAMERA_IMU_UPRIGHT, true);
-    }
+    
 
-    public static void saveCameraImuUpright(Context context, boolean upright) {
-        prefs(context).edit().putBoolean(KEY_CAMERA_IMU_UPRIGHT, upright).apply();
-    }
+    
 
     /** 摄像头悬浮窗的折叠状态（默认折叠成单行）。 */
-    public static boolean loadCameraOverlayCollapsed(Context context) {
-        return prefs(context).getBoolean(KEY_CAMERA_OVERLAY_COLLAPSED, true);
-    }
+    
 
-    public static void saveCameraOverlayCollapsed(Context context, boolean collapsed) {
-        prefs(context).edit().putBoolean(KEY_CAMERA_OVERLAY_COLLAPSED, collapsed).apply();
-    }
+    
 
     /** 基础海拔（米），路径点没写海拔时使用。 */
     public static float loadAltitude(Context context) {
@@ -467,29 +431,14 @@ public final class RouteStore {
     }
 
     /** 虚拟摄像头独立悬浮窗的位置（与定位悬浮窗分开记）。 */
-    public static int[] loadCameraOverlayPosition(Context context) {
-        SharedPreferences p = prefs(context);
-        if (!p.contains(KEY_CAMERA_OVERLAY_X) || !p.contains(KEY_CAMERA_OVERLAY_Y)) {
-            return null;
-        }
-        return new int[]{p.getInt(KEY_CAMERA_OVERLAY_X, 0), p.getInt(KEY_CAMERA_OVERLAY_Y, 260)};
-    }
+    
 
-    public static void saveCameraOverlayPosition(Context context, int x, int y) {
-        prefs(context).edit()
-                .putInt(KEY_CAMERA_OVERLAY_X, x)
-                .putInt(KEY_CAMERA_OVERLAY_Y, y)
-                .apply();
-    }
+    
 
     /** 用户手动关掉悬浮窗（摄像头仍启用）时不自动弹回。 */
-    public static boolean loadCameraOverlayHidden(Context context) {
-        return prefs(context).getBoolean(KEY_CAMERA_OVERLAY_HIDDEN, false);
-    }
+    
 
-    public static void saveCameraOverlayHidden(Context context, boolean hidden) {
-        prefs(context).edit().putBoolean(KEY_CAMERA_OVERLAY_HIDDEN, hidden).apply();
-    }
+    
 
     public static void saveOverlayPosition(Context context, int x, int y) {
         prefs(context).edit().putInt(KEY_OVERLAY_X, x).putInt(KEY_OVERLAY_Y, y).apply();

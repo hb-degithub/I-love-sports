@@ -10,11 +10,6 @@
         app:showAsAction="never" />
 
     <item
-        android:id="@+id/action_camera"
-        android:title="虚拟摄像头…"
-        app:showAsAction="never" />
-
-    <item
         android:id="@+id/action_float"
         android:checkable="true"
         android:title="悬浮窗"

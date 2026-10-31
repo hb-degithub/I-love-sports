@@ -203,7 +203,6 @@ public class LocationService extends Service {
         releaseInjector();
         hideOverlay();
         releaseWakeLock();
-        // 定位会话结束后不主动弹摄像头悬浮窗：交给用户在主界面「摄像头」页点播放时再拉起
         super.onDestroy();
     }
 
@@ -942,21 +941,6 @@ public class LocationService extends Service {
                 public void onHold() {
                     holdMovement();
                 }
-
-                @Override
-                public void onCameraSwitch() {
-                    switchCameraClip();
-                }
-
-                @Override
-                public void onCameraToggle() {
-                    toggleCameraEnabled();
-                }
-
-                @Override
-                public void onCameraPlayPause() {
-                    toggleCameraPlaying();
-                }
             });
         }
         floatingWindow.restoreCollapsed();
@@ -1005,41 +989,16 @@ public class LocationService extends Service {
             status = "模块未注入（检查 LSPosed 作用域）";
         }
         floatingWindow.update(line1, line2, status, moving);
-        // 跑步悬浮窗不再显示摄像头/视频那一行（视频控制只在「虚拟摄像头」悬浮窗里）
     }
 
     /** 悬浮窗：切换到下一个虚拟摄像头视频。 */
-    private void switchCameraClip() {
-        java.util.List<com.vloc.motion.core.CameraClips.Clip> clips =
-                RouteStore.loadCameraClips(this);
-        if (clips.isEmpty()) {
-            toast("还没有添加视频：主界面菜单 →「虚拟摄像头」");
-            return;
-        }
-        int next = com.vloc.motion.core.CameraClips.nextIndex(
-                clips, RouteStore.loadCameraIndex(this));
-        RouteStore.saveCameraIndex(this, next);
-        com.vloc.motion.core.CameraClips.Clip clip = clips.get(next);
-        toast(String.format(java.util.Locale.US, "虚拟摄像头 %d/%d%s",
-                next + 1, clips.size(), clip.name.isEmpty() ? "" : "：" + clip.name));
-        updateOverlay();
-    }
+    
 
     /** 悬浮窗：播放 / 暂停虚拟摄像头视频。 */
-    private void toggleCameraPlaying() {
-        boolean playing = !RouteStore.loadCameraPlaying(this);
-        RouteStore.saveCameraPlaying(this, playing);
-        toast(playing ? "虚拟摄像头：播放" : "虚拟摄像头：已暂停（画面冻结）");
-        updateOverlay();
-    }
+    
 
     /** 悬浮窗：开 / 关虚拟摄像头。 */
-    private void toggleCameraEnabled() {
-        boolean enabled = !RouteStore.loadCameraEnabled(this);
-        RouteStore.saveCameraEnabled(this, enabled);
-        toast(enabled ? "虚拟摄像头：已开启" : "虚拟摄像头：已关闭");
-        updateOverlay();
-    }
+    
 
     private void startForegroundSafe(Notification notification) {
         try {

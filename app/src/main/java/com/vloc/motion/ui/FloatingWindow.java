@@ -36,15 +36,6 @@ public final class FloatingWindow {
 
         /** 停止移动（定位保持在当前位置，不恢复真实定位）。 */
         void onHold();
-
-        /** 切换虚拟摄像头播放的下一个视频。 */
-        void onCameraSwitch();
-
-        /** 开 / 关虚拟摄像头。 */
-        void onCameraToggle();
-
-        /** 播放 / 暂停虚拟摄像头视频。 */
-        void onCameraPlayPause();
     }
 
     private final Context context;
@@ -55,9 +46,6 @@ public final class FloatingWindow {
 
     private final TextView titleView;
     private final TextView detailView;
-    private final TextView cameraView;
-    private final TextView cameraPlayView;
-    private final LinearLayout cameraRow;
     private final TextView statusView;
     private final TextView collapseView;
     private final LinearLayout buttonRow;
@@ -77,7 +65,6 @@ public final class FloatingWindow {
         this.root = new LinearLayout(this.context);
         this.root.setOrientation(LinearLayout.VERTICAL);
         this.root.setPadding(dp(14), dp(9), dp(14), dp(9));
-        // 折叠状态要同时放下"视频名 + 播放/暂停"按钮，给一个最小宽度，避免按钮被挤成一条缝
         this.root.setMinimumWidth(dp(260));
 
         GradientDrawable background = new GradientDrawable();
@@ -95,9 +82,8 @@ public final class FloatingWindow {
         titleView.setTextColor(Color.WHITE);
         titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
         titleView.setIncludeFontPadding(false);
-        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        titleView.setLayoutParams(titleParams);
+        titleView.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         this.collapseView = new TextView(this.context);
         collapseView.setTextColor(0xFFB0BEC5);
@@ -106,7 +92,6 @@ public final class FloatingWindow {
         collapseView.setText("▾");
         collapseView.setClickable(true);
         collapseView.setOnClickListener(v -> setCollapsed(!collapsed));
-        // 整个标题行都可点击折叠，命中面积更大
         titleView.setClickable(true);
         titleView.setPadding(0, dp(6), 0, dp(6));
         titleView.setOnClickListener(v -> setCollapsed(!collapsed));
@@ -127,40 +112,6 @@ public final class FloatingWindow {
         detailView.setIncludeFontPadding(false);
         detailView.setPadding(0, dp(2), 0, dp(6));
 
-        this.cameraRow = new LinearLayout(this.context);
-        cameraRow.setOrientation(LinearLayout.HORIZONTAL);
-        cameraRow.setGravity(Gravity.CENTER_VERTICAL);
-        cameraRow.setVisibility(View.GONE);
-
-        this.cameraView = new TextView(this.context);
-        cameraView.setTextColor(0xFFFFD180);
-        cameraView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
-        cameraView.setIncludeFontPadding(false);
-        cameraView.setPadding(0, dp(3), 0, dp(3));
-        cameraView.setClickable(true);
-        cameraView.setSingleLine(true);
-        cameraView.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        cameraView.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        cameraView.setOnClickListener(v -> actions.onCameraSwitch());
-        cameraView.setOnLongClickListener(v -> {
-            actions.onCameraToggle();
-            return true;
-        });
-
-        this.cameraPlayView = new TextView(this.context);
-        cameraPlayView.setTextColor(0xFFFFD180);
-        cameraPlayView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
-        cameraPlayView.setIncludeFontPadding(false);
-        cameraPlayView.setPadding(dp(12), dp(3), 0, dp(3));
-        cameraPlayView.setSingleLine(true);
-        cameraPlayView.setClickable(true);
-        cameraPlayView.setOnClickListener(v -> actions.onCameraPlayPause());
-        cameraPlayView.setText("暂停");
-
-        cameraRow.addView(cameraView);
-        cameraRow.addView(cameraPlayView);
-
         this.buttonRow = new LinearLayout(this.context);
         buttonRow.setOrientation(LinearLayout.HORIZONTAL);
         buttonRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -174,7 +125,6 @@ public final class FloatingWindow {
         buttonRow.addView(holdView);
         root.addView(headerRow);
         root.addView(statusView);
-        root.addView(cameraRow);
         root.addView(detailView);
         root.addView(buttonRow);
 
@@ -208,20 +158,7 @@ public final class FloatingWindow {
      * @param count   视频总数
      * @param name    当前视频名（可为空）
      */
-    public void updateCamera(boolean enabled, int index, int count, String name, boolean playing) {
-        if (count <= 0) {
-            cameraRow.setVisibility(View.GONE);
-            return;
-        }
-        cameraRow.setVisibility(View.VISIBLE);
-        cameraPlayView.setText(playing ? "暂停" : "播放");
-        String status = enabled ? "开" : "关";
-        String title = name == null || name.isEmpty() ? "视频 " + (index + 1) : name;
-        cameraView.setText(String.format(java.util.Locale.US,
-                "📹 %d/%d %s", index + 1, count, title));
-        cameraView.setAlpha(enabled ? 1f : 0.6f);
-        cameraPlayView.setAlpha(enabled ? 1f : 0.4f);
-    }
+    
 
     /** 折叠只保留标题行（状态/详情/按钮都收起），展开恢复全部。 */
     public void setCollapsed(boolean value) {
@@ -229,7 +166,6 @@ public final class FloatingWindow {
         RouteStore.saveOverlayCollapsed(context, value);
         applyCollapsedState();
     }
-
 
     private void applyCollapsedState() {
         int visibility = collapsed ? View.GONE : View.VISIBLE;

@@ -68,15 +68,6 @@
             android:exported="false"
             android:foregroundServiceType="location" />
 
-        <!-- 虚拟摄像头启用时的独立悬浮窗（切换视频 / 关闭），不注入定位 -->
-        <service
-            android:name=".service.CameraOverlayService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="virtual camera status overlay" />
-        </service>
 
         <activity
             android:name=".ui.SetupActivity"
