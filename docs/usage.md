@@ -324,6 +324,23 @@ adb install -r dist/virtual-motion-0.17.0.apk
 
 > 仍按目标进程内注入，需要逐个勾选作用域。详见 `docs/system-injection.md`。
 
+## 6.10.1 反检测补强（v0.38.0+）
+
+LSPosed 模块在目标 App 内额外做四件事，减少"这是模拟定位"的旁证：
+
+| 项 | 做法 |
+|---|---|
+| **provider 列表指纹** | `getAllProviders`/`getProviders` 只返回 `passive/gps/network/fused`，过滤掉任何自定义名 |
+| **时间戳一致性** | `elapsedRealtimeNanos` 与 `time` 差值漂移 >300ms 时自动校正 |
+| **精度恒定** | `getAccuracy()` 读数加 ±12% 抖动（防某条注入路径漏了拟真） |
+| **NMEA 缺失** | App 注册 `addNmeaListener` 时，按虚拟坐标每秒投递一条 `$GPGGA` + `$GPRMC`（校验和正确） |
+
+日志自检：`logcat -s LSPosed-Bridge | grep VLocHidden` 应出现
+`anti-detect hooks=4/4`、`provider list normalized`、`NMEA feeder started`。
+
+> 仍未覆盖：`GnssMeasurements`（原始测量）、`GnssNavigationMessage`、native 层直读、
+> root/LSPosed 痕迹检测。完整矩阵见 `docs/mock-detection.md`。
+
 ## 6.11 Root 检测
 
 - 主界面顶部有 `Root：…` 状态行，**点一下可重新检测/申请授权**（会弹出 Magisk/KernelSU/APatch 授权框）

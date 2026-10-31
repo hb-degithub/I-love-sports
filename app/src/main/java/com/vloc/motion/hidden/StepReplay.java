@@ -709,6 +709,12 @@ final class StepReplay {
     }
 
     /** 供 {@link ImuReplay} 复用同一份 steps / accelAmp 快照（1 秒缓存，避免重复查询 provider）。 */
+    /** 当前是否在模拟（供其它旁路模块判断要不要改写返回值）。 */
+    static boolean snapshotActive() {
+        final StepsSnapshot snapshot = currentSnapshot();
+        return snapshot != null && snapshot.active;
+    }
+
     static StepsSnapshot currentSnapshot() {
         return getSnapshot();
     }

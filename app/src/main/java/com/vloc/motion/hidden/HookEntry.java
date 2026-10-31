@@ -231,6 +231,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final int imuHooks = ImuReplay.install(classLoader);
         // 旁路 9：GNSS 卫星状态回放（GnssStatus / 1Hz 回调，v0.18.x）
         final int gnssHooks = GnssReplay.install(classLoader);
+        // 旁路 10：反检测补强（provider 列表 / 时间戳一致性 / 精度抖动 / NMEA，v0.38）
+        final int antiDetectHooks = AntiDetect.install(classLoader);
 
         // 安装条数随 Android 版本自然变化（如 Android 11 上没有 isMock/setMock，4/5 属正常）
         log("hooks installed in " + packageName + " (sdk=" + Build.VERSION.SDK_INT
@@ -238,7 +240,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 + ", appops_check=" + appOpsHooks + "/8, appops_extra=" + appOpsExtraHooks
                 + ", resolver=" + resolverHooks + "/2, parcel=" + parcelHooks + "/1"
                 + ", env=" + envHooks + "/5, step=" + stepHooks + "/2"
-                + ", imu=" + imuHooks + "/2, gnss=" + gnssHooks + "/15)");
+                + ", imu=" + imuHooks + "/2, gnss=" + gnssHooks + "/15"
+                + ", anti_detect=" + antiDetectHooks + "/4)");
 
         // 注入成功：回报一次心跳，供主 App 区分“模块未注入 / 已注入但目标 App 不读传感器 / 正在读取”
         StepReplay.sendHeartbeatOnce();

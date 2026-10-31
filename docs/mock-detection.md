@@ -108,7 +108,12 @@ android.provider.Settings$NameValueCache
 
 `FakeLoc` 进一步补上 `com.android.providers.settings.SettingsProvider.call("GET_secure")` 与 `SettingsProvider.query`，因为直接走 `ContentResolver` 的检测方不会经过 `Settings` 的 Java 封装。【已验证-源码-第三方】
 
-### 2.5 provider 列表异常
+### 2.5 provider 列表异常（✅ v0.38 已覆盖）
+
+`LocationManager.getAllProviders()` / `getProviders(true)` 会列出全部 provider 名，自定义测试
+Provider 名会形成指纹。**v0.38 起模块会规范化返回值**：只保留 `passive/gps/network/fused`
+并按真机顺序排列，非标准名一律过滤（`core/DetectionAvoidance.normalizeProviders`）。
+
 
 `LocationManager.getAllProviders()` / `getProviders(true)` 会列出全部 provider 名。如果阶段一额外 `addTestProvider("vloc", ...)`，这个名字会出现在列表里，**是一个天然的指纹**。
 
@@ -124,11 +129,11 @@ Android 会把"当前 mock 应用"显示在开发者选项里，部分 ROM 在�
 
 | 信号 | 原理 | 我们的现状 |
 |---|---|---|
-| GNSS 卫星状态 | mock 时 `GnssStatus` 无卫星/信号异常，但 `Location` 声称来自 `gps` | v0.18.0 起由模块在目标进程回放假 `GnssStatus`（逐颗卫星、1Hz）；`GnssMeasurements`/NMEA 仍未覆盖 |
-| `accuracy` 恒定 | mock 常写死 3~5 m，真实 GPS 会抖动 | 建议在注入端加 ±抖动（阶段一就能做）|
+| GNSS 卫星状态 | mock 时 `GnssStatus` 无卫星/信号异常，但 `Location` 声称来自 `gps` | ✅ v0.18 起回放假 `GnssStatus`（逐颗卫星、1Hz）；✅ v0.38 起回放 NMEA（`$GPGGA`/`$GPRMC`，含正确校验和）；`GnssMeasurements` 仍未覆盖 |
+| `accuracy` 恒定 | mock 常写死 3~5 m，真实 GPS 会抖动 | ✅ 注入端拟真抖动 + v0.38 模块侧兜底 ±12% |
 | `speed`/`bearing` 与坐标位移不符 | 检测方对连续两点做微分 | 阶段一的路径插值必须自洽（本项目已按大圆弧插值，OK）|
 | wifi/cell 与坐标不符 | 扫描周围 AP/基站，反查地理位置 | 无法伪造，只能靠 hook `WifiManager`/`TelephonyManager`（`FakeLoc` 的 `SourceLockHooks` 做了）|
-| `elapsedRealtimeNanos` 与 `time` 的偏差 | 两者应同步推进 | 注入时两个都要写 |
+| `elapsedRealtimeNanos` 与 `time` 的偏差 | 两者应同步推进 | ✅ 注入时同步写入 + v0.38 读取时校正 >300ms 漂移 |
 | 运动学不可信（瞬移、超速） | 相邻点的距离/时间比 | 阶段一路径播放要限速（本项目 1–120 km/h 已覆盖）|
 
 ### 2.8 root / 框架检测
