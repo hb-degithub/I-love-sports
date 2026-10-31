@@ -64,16 +64,14 @@ App 内：设置里开关已开；运行时「关于 → 版本」为 0.33.0+。
 - 不同 ROM / Android 版本的系统类名不同，模块会尝试多个候选类；
   若日志里没有 `system hooks=`，说明该版本的系统类名都未命中，可反馈 ROM 与 Android 版本。
 
-## 6. 为什么计步 / IMU / 摄像头没做成系统级
+## 6. 计步 / IMU 为什么当初没做成 Java 系统级（已由 Zygisk 解决）
 
 | 模拟项 | 系统级可行性 | 原因 |
 |---|---|---|
 | 计步（STEP_COUNTER/DETECTOR） | ❌ Java 不可行 | 传感器事件由 **native `SensorService`** 直接分发给 App，不经过 system_server 的 Java 层；要做必须 Zygisk/native Hook 或替换 sensor HAL |
 | IMU / 姿态 | ❌ 同上 | 同上 |
-| 摄像头 | ❌ Java 不可行 | 相机数据在 **camera HAL / cameraserver**（native），Java 层只能逐 App 接管 Camera2/Camera1 |
 
-结论（v0.34.0 更新）：**传感器已通过 Zygisk 原生模块实现"全 App 自动接管"**，
-见 [`zygisk-sensors.md`](zygisk-sensors.md)；**相机仍是进程内接管**（HAL/cameraserver 无法注入）。
+结论：**定位与卫星已系统级**，**传感器已通过 Zygisk 原生模块实现"全 App 自动接管"**
+（见 [`zygisk-sensors.md`](zygisk-sensors.md)）。相机/摄像头相关功能已于 v0.37.0 从本项目移除。
 
-如果要连传感器/相机也系统级，需要改成 **Magisk + Zygisk native 模块**（C/C++ hook
-`SensorService`、替换 camera provider），工作量和风险都显著更高，且必须真机调试。
+传感器的系统级方案已落地为 **Magisk + Zygisk 原生模块**（见 `zygisk-sensors.md`）。
