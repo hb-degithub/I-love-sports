@@ -34,10 +34,6 @@ public final class GnssCollector {
 
     /** 采集一次（最多 3 秒）；采不到就用上次保存的快照；都没有回调 null。 */
     public static void collect(Context context, Callback callback) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            callback.onSnapshot(loadSaved(context));
-            return;
-        }
         final LocationManager lm =
                 (LocationManager) context.getApplicationContext()
                         .getSystemService(Context.LOCATION_SERVICE);

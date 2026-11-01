@@ -46,6 +46,13 @@ final class SystemHooks {
     private static final long LOCATION_CACHE_MS = 120L;
     private static final long GNSS_CACHE_MS = 900L;
 
+    /**
+     * system_server 的系统 Context。
+     *
+     * <p>不是内存泄漏：它是系统级 Context，与 system_server 进程同生命周期，
+     * 不存在"持有 Activity 导致泄漏"的问题（lint 的 StaticFieldLeak 属误报，此处保留说明）。
+     */
+    @android.annotation.SuppressLint("StaticFieldLeak")
     private static volatile Context sContext;
     private static volatile long sLocationAt;
     private static volatile Snapshot sLocation;

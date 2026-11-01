@@ -5,6 +5,7 @@ import android.util.Log;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Locale;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
@@ -151,7 +152,8 @@ public final class RootShell {
 
     /** 判断 appop 输出是否已经是 allow。 */
     public static boolean isMockAppopAllowed(Result r) {
-        return r != null && r.ok() && r.combined().toLowerCase().contains("allow");
+        return r != null && r.ok()
+                && r.combined().toLowerCase(Locale.US).contains("allow");
     }
 
     private static final class StreamGobbler extends Thread {

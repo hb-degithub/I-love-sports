@@ -118,11 +118,10 @@ public final class TestProviderInjector {
             location.setAltitude(fix.altitudeMeters);
             location.setSpeed(fix.speedMps);
             location.setBearing(fix.bearingDeg);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                location.setVerticalAccuracyMeters(fix.verticalAccuracyMeters);
-                location.setSpeedAccuracyMetersPerSecond(Math.max(0.2f, fix.speedMps * 0.05f));
-                location.setBearingAccuracyDegrees(3f);
-            }
+            // minSdk 26：精度相关 setter 一定存在
+            location.setVerticalAccuracyMeters(fix.verticalAccuracyMeters);
+            location.setSpeedAccuracyMetersPerSecond(Math.max(0.2f, fix.speedMps * 0.05f));
+            location.setBearingAccuracyDegrees(3f);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 // Android 14+：写入平均海平面高度，部分应用会读 MSL 而不是椭球高
                 location.setMslAltitudeMeters(fix.altitudeMeters);

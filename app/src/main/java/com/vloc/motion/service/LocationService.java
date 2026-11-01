@@ -830,9 +830,7 @@ public class LocationService extends Service {
     // ---------------------------------------------------------------- 通知
 
     private void ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return;
-        }
+        // minSdk 26：通知通道一定可用
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm == null) {
             return;

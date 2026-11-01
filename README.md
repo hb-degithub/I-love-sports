@@ -3,7 +3,7 @@
 > **专注虚拟定位与跑步模拟**：root 注入定位、路径播放、拟真轨迹、GNSS 卫星回放、
 > 计步 / IMU / 姿态回放、LSPosed 隐藏模块、system_server 系统级注入、Zygisk 传感器模块。
 >
-> 当前版本 **v0.37.1** · 相机 / 虚拟摄像头相关功能已于 v0.37.0 **完全移除**。
+> 当前版本 **v0.41.0** · 相机 / 虚拟摄像头相关功能已于 v0.37.0 **完全移除**。
 
 <p>
   <a href="https://github.com/hb-degithub/I-love-sports/actions/workflows/android.yml">
@@ -112,11 +112,11 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
 
 | 文件 | 说明 |
 |---|---|
-| `virtual-motion-0.37.1.apk` | 主 App + 内置隐藏模块（`Releases` 里下载） |
-| `vloc-zygisk-v0.37.1.zip` | Zygisk 传感器模块（可选，Magisk 刷入） |
+| `virtual-motion-0.41.0.apk` | 主 App + 内置隐藏模块（`Releases` 里下载） |
+| `vloc-zygisk-v0.41.0.zip` | Zygisk 传感器模块（可选，Magisk 刷入） |
 
 ```bash
-adb install -r virtual-motion-0.37.1.apk
+adb install -r virtual-motion-0.41.0.apk
 ```
 
 > 升级提示：如果之前装过独立的隐藏模块，先 `adb uninstall com.vloc.motion.hidden`，
@@ -277,6 +277,7 @@ LSPosed 模块（已内置在同一 APK）在目标 App 进程内做这些遮蔽
 - v0.34：**Zygisk 传感器模块**（计步 / IMU / 姿态全 App 自动接管）
 - v0.35 – v0.36：交互重构（菜单分组 + 底部卡片状态驱动）、显示规则抽成可测单元
 - v0.37：移除相机 / 虚拟摄像头功能，回归单一虚拟定位与跑步模拟
+- v0.41：代码健康 —— Lint 0 Error、字符串资源全量资源化、清理死分支、修权限/本地化缺陷
 - v0.40：到达终点后默认保持定位继续上报（不再立刻结束模拟）
 - v0.39：设置分组重构 + 补齐精度设置 + 去掉重复入口
 - v0.38：**反检测补强** —— provider 列表指纹、时间戳一致性、精度抖动、NMEA 回放

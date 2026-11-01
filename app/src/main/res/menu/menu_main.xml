@@ -6,17 +6,17 @@
     <!-- 一级动作：最常用 -->
     <item
         android:id="@+id/action_setup"
-        android:title="开工向导"
+        android:title="@string/menu_setup"
         app:showAsAction="never" />
 
     <item
         android:id="@+id/action_float"
         android:checkable="true"
-        android:title="悬浮窗"
+        android:title="@string/action_float"
         app:showAsAction="never" />
 
     <!-- 分组 1：路线 -->
-    <item android:title="路线">
+    <item android:title="@string/menu_group_route">
         <menu>
             <item
                 android:id="@+id/action_save_route"
@@ -28,11 +28,11 @@
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_presets"
-                android:title="预设路线…"
+                android:title="@string/menu_presets"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_goal"
-                android:title="目标配速…"
+                android:title="@string/menu_goal"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_import"
@@ -46,48 +46,48 @@
     </item>
 
     <!-- 分组 2：定位与选点 -->
-    <item android:title="定位与选点">
+    <item android:title="@string/menu_group_locate">
         <menu>
             <item
                 android:id="@+id/action_locate"
-                android:title="定位到当前位置"
+                android:title="@string/menu_locate"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_add_coord"
-                android:title="输入坐标添加点"
+                android:title="@string/menu_add_coord"
                 app:showAsAction="never" />
         </menu>
     </item>
 
     <!-- 分组 3：诊断与外观 -->
-    <item android:title="诊断与外观">
+    <item android:title="@string/menu_group_diag">
         <menu>
             <item
                 android:id="@+id/action_module_status"
-                android:title="模块状态与启用步骤"
+                android:title="@string/menu_module_status"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_tile_source"
-                android:title="地图源"
+                android:title="@string/menu_tile_source"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_map_diag"
-                android:title="地图诊断"
+                android:title="@string/menu_map_diag"
                 app:showAsAction="never" />
             <item
                 android:id="@+id/action_root_diag"
-                android:title="Root 诊断"
+                android:title="@string/menu_root_diag"
                 app:showAsAction="never" />
         </menu>
     </item>
 
     <item
         android:id="@+id/action_settings"
-        android:title="设置"
+        android:title="@string/menu_settings"
         app:showAsAction="never" />
 
     <item
         android:id="@+id/action_about"
-        android:title="关于"
+        android:title="@string/menu_about"
         app:showAsAction="never" />
 </menu>

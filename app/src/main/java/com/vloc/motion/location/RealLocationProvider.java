@@ -130,6 +130,14 @@ public final class RealLocationProvider {
         }
     }
 
+    /**
+     * 取各 provider 的 last known location（取最新的一个）。
+     *
+     * <p>调用方已确认定位权限（{@link #hasPermission}），这里仍显式捕获
+     * {@link SecurityException}：权限可能在检查后被用户撤销，或某些 ROM 对
+     * passive provider 有额外限制 —— 抛异常时跳过该 provider 即可，不能让诊断/定位流程崩溃。
+     */
+    @android.annotation.SuppressLint("MissingPermission")
     private static Location bestLastKnown(LocationManager locationManager) {
         Location best = null;
         for (String provider : new String[]{"gps", "network", "fused", "passive"}) {
@@ -138,8 +146,10 @@ public final class RealLocationProvider {
                 if (location != null && (best == null || location.getTime() > best.getTime())) {
                     best = location;
                 }
+            } catch (SecurityException ignored) {
+                // 权限被撤销 / 该 provider 受限：跳过
             } catch (RuntimeException ignored) {
-                // 忽略不可用 provider
+                // provider 不可用：跳过
             }
         }
         return best;

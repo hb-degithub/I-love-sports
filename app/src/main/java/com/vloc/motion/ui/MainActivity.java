@@ -1096,22 +1096,25 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 .setNegativeButton("关闭", null)
                 .create();
         dialog.show();
-        android.widget.TextView messageView = dialog.findViewById(android.R.id.message);
-        if (messageView != null) {
-            messageView.setTextIsSelectable(true);
-        }
+        makeMessageSelectable(dialog);
         new Thread(() -> {
             String report = root ? Diagnostics.rootReport(this) : Diagnostics.mapReport(this);
             runOnUiThread(() -> {
                 if (dialog.isShowing()) {
                     dialog.setMessage(report);
-                    android.widget.TextView view = dialog.findViewById(android.R.id.message);
-                    if (view != null) {
-                        view.setTextIsSelectable(true);
-                    }
+                    // setMessage 会重建 TextView，所以要再设置一次可选中
+                    makeMessageSelectable(dialog);
                 }
             });
         }, "vloc-diag").start();
+    }
+
+    /** 让 AlertDialog 的诊断文本可以长按复制（便于把日志发给开发者）。 */
+    private static void makeMessageSelectable(AlertDialog dialog) {
+        android.widget.TextView messageView = dialog.findViewById(android.R.id.message);
+        if (messageView != null) {
+            messageView.setTextIsSelectable(true);
+        }
     }
 
     // ------------------------------------------------------------ 真实定位

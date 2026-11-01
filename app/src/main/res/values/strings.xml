@@ -20,4 +20,15 @@
     <string name="menu_setup">开工向导</string>
     <string name="menu_save_route">保存当前路线</string>
     <string name="menu_route_library">路线库</string>
+    <string name="menu_group_route">路线</string>
+    <string name="menu_group_locate">定位与选点</string>
+    <string name="menu_group_diag">诊断与外观</string>
+    <string name="menu_presets">预设路线…</string>
+    <string name="menu_goal">目标配速…</string>
+    <string name="menu_locate">定位到当前位置</string>
+    <string name="menu_add_coord">输入坐标添加点</string>
+    <string name="menu_module_status">模块状态与启用步骤</string>
+    <string name="menu_tile_source">地图源</string>
+    <string name="menu_map_diag">地图诊断</string>
+    <string name="menu_root_diag">Root 诊断</string>
 </resources>
