@@ -793,7 +793,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             if (session.arrived) {
                 hintText.setText(RouteStore.loadAutoStopOnFinish(this)
                         ? "已到达目标，正在自动停止并恢复真实定位"
-                        : "已到达终点，定位保持中 · 点「彻底停止」恢复真实定位");
+                        : com.vloc.motion.core.ArrivalBehavior.overlayLabel(false)
+                                + " · 点「彻底停止」才恢复真实定位");
             } else if (session.held && session.traveledMeters <= 0.5) {
                 hintText.setText("已定位到起点（定位保持中）· 在悬浮窗点「开始」开始路线模拟");
             } else if (session.held) {

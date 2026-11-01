@@ -334,12 +334,15 @@ public final class RouteStore {
     }
 
     /**
-     * 到达终点后是否自动停止模拟并恢复真实定位（默认开启）。
+     * 到达终点后是否自动彻底停止并恢复真实定位（**默认关闭**）。
      *
-     * <p>关闭后保持旧行为：定位冻结在终点、持续 1Hz 上报，需要手动「彻底停止」才恢复真实定位。
+     * <p>默认行为：跑到终点后**不结束模拟**，定位冻结在终点、按 1Hz 持续上报，
+     * 需要用户手动「彻底停止」才恢复真实定位（避免刚跑完就被拉回真实位置）。
+     *
+     * <p>打开后：先显示「已到达」，2.5 秒后自动停止并恢复真实定位。
      */
     public static boolean loadAutoStopOnFinish(Context context) {
-        return prefs(context).getBoolean(KEY_AUTO_STOP_ON_FINISH, true);
+        return prefs(context).getBoolean(KEY_AUTO_STOP_ON_FINISH, false);
     }
 
     public static void saveAutoStopOnFinish(Context context, boolean enabled) {

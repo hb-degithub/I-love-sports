@@ -493,12 +493,13 @@ public class LocationService extends Service {
                         Session.INSTANCE.arrived = true;
                         Session.INSTANCE.paused = true;
                         Session.INSTANCE.notifyChanged();
-                        if (RouteStore.loadAutoStopOnFinish(LocationService.this)) {
-                            // 到达目标：先展示「已到达」，2.5 秒后自动彻底停止并恢复真实定位
-                            toast("已到达目标，正在自动停止…");
-                            handler.postDelayed(autoStopRunnable, AUTO_STOP_DELAY_MS);
-                        } else {
-                            toast("已到达终点，定位保持在终点（点「停止」恢复真实定位）");
+                        final boolean autoStop =
+                                RouteStore.loadAutoStopOnFinish(LocationService.this);
+                        toast(com.vloc.motion.core.ArrivalBehavior.toastText(autoStop));
+                        if (autoStop) {
+                            // 只有明确开启时才自动结束；默认保持定位继续上报
+                            handler.postDelayed(autoStopRunnable,
+                                    com.vloc.motion.core.ArrivalBehavior.AUTO_STOP_DELAY_MS);
                         }
                     }
                     holdPosition(now, sample);
@@ -514,9 +515,6 @@ public class LocationService extends Service {
         };
         handler.post(ticker);
     }
-
-    /** 到达目标后自动停止的延迟：留出时间让用户看到「已到达」状态。 */
-    private static final long AUTO_STOP_DELAY_MS = 2500L;
 
     private final Runnable autoStopRunnable = new Runnable() {
         @Override
@@ -887,9 +885,18 @@ public class LocationService extends Service {
         if (session.mode == Session.Mode.SPOT) {
             text = String.format(java.util.Locale.US, "%.6f, %.6f", session.lat, session.lon);
         } else {
+            final String phase;
+            if (session.arrived) {
+                phase = com.vloc.motion.core.ArrivalBehavior.notificationLabel(
+                        RouteStore.loadAutoStopOnFinish(this));
+            } else if (session.paused) {
+                phase = "已暂停";
+            } else {
+                phase = "运行中";
+            }
             text = String.format(java.util.Locale.US, "%s%s · %.0f km/h · %s / %s",
                     session.goalMode ? "配速 " : "",
-                    session.paused ? "已暂停" : "运行中",
+                    phase,
                     session.speedKmh,
                     formatDistance(session.traveledMeters),
                     formatDistance(session.totalMeters));
@@ -969,7 +976,8 @@ public class LocationService extends Service {
         } else if (session.held) {
             line1 = String.format(java.util.Locale.US, "已停止移动 · 定位保持 · %.0f m", session.altitude);
         } else if (session.arrived) {
-            line1 = "已到达终点 · 定位保持";
+            line1 = com.vloc.motion.core.ArrivalBehavior.overlayLabel(
+                    RouteStore.loadAutoStopOnFinish(this));
         } else {
             line1 = String.format(java.util.Locale.US, "%s · %.1f km/h",
                     session.paused ? "已暂停" : "运行中", session.speedKmh);
