@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.location.Location;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -31,6 +32,8 @@ import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RoutePlayer;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.location.GnssCollector;
+import com.vloc.motion.location.LocationSwitch;
+import com.vloc.motion.location.RealLocationProvider;
 import com.vloc.motion.location.RootShell;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.ui.FloatingWindow;
@@ -76,12 +79,64 @@ public class LocationService extends Service {
 
     private static final String CHANNEL_ID = "vloc_playback";
     private static final int NOTIFICATION_ID = 1001;
+    /** 系统级注入失效告警用独立 id：复用前台通知 id 会把常驻通知顶掉。 */
+    private static final int ALERT_NOTIFICATION_ID = 1002;
     private static final long TICK_MS = 100L;
+
+    // ---------------------------------------------------------------- 系统级注入存活判定
+    /**
+     * "模块正在接管"的新鲜度窗口（毫秒）。
+     *
+     * <p>依据：system_server 里的模块每拦截一次定位/卫星投递就会回读本应用的快照，
+     * {@code hidden/SystemHooks.java} 的定位缓存 {@code LOCATION_CACHE_MS = 120ms}
+     * 意味着目标 App 正常定位时约每 120ms 就有一次 provider 读取；真实定位回调通常 1Hz。
+     * 取 5 秒 ≈ 40 个读取周期：足够吸收系统调度 / 息屏抖动，又不会把"模块早就没在接管"
+     * 误判成在线（更长的窗口会让假成功继续存在）。
+     */
+    private static final long SYSTEM_MODULE_FRESH_MS = 5_000L;
+    /** 没有既有读取痕迹时，等待模块首次读取快照的上限（毫秒）。 */
+    private static final long SYSTEM_MODULE_PROBE_WAIT_MS = 3_000L;
+    /** 轮询间隔（毫秒）。 */
+    private static final long SYSTEM_MODULE_PROBE_POLL_MS = 100L;
+    /**
+     * 运行期"模块完全没动静"的告警门槛（毫秒），比启动时的 5 秒宽松得多。
+     *
+     * <p>原因：启动阶段用严格窗口 {@link #SYSTEM_MODULE_FRESH_MS} 卡住假成功就够了；
+     * 运行中目标 App 可能暂时不请求定位（被切到后台 / 暂停），模块自然没有回读，
+     * 用 5 秒会在正常环境里误报。30 秒（≈300 次注入 tick）足以把"短暂空闲"和
+     * "模块已经不在接管"区分开，同时最早也能在 30 秒内暴露静默空转。
+     */
+    private static final long SYSTEM_MODULE_SILENCE_WARN_MS = 30_000L;
+    /** 系统级注入但模块不在线时的统一错误文案（UI 直接展示）。 */
+    private static final String SYSTEM_MODULE_MISSING_MSG =
+            "系统级注入已开启，但未检测到 LSPosed 模块活动：请确认模块已启用并在 LSPosed 作用域中勾选"
+                    + "「系统框架」后重启手机；或关闭「系统级注入」改用 root 注入";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final RoutePlayer player = new RoutePlayer();
 
     private TestProviderInjector injector;
+    /**
+     * 串行化 appop 的"授权留痕"与"停止回收"：停止的回收线程在 su 执行期间，
+     * 用户可能立刻重新开始模拟，必须避免把新会话刚拿到的权限回收掉。
+     */
+    private static final Object MOCK_APPOP_LOCK = new Object();
+    /** 每次真正进入 root 注入准备时自增；异步回收据此判断是否已被新会话取代。 */
+    private static final java.util.concurrent.atomic.AtomicLong mockSessionEpoch =
+            new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * 会话代次：每次「开始 / 彻底停止」在主线程自增。
+     *
+     * <p>后台准备线程把结果 post 回主线程时必须带回自己的代次，主线程据此判断
+     * "这个准备结果还属不属于当前会话"。{@link #mockSessionEpoch} 只覆盖 root 注入
+     * 路径（system_inject 模式不增它），单靠 mode 判定又分不清"停止后重新开始"，
+     * 所以用这个只在主线程读写的代次做权威判定。
+     */
+    private int sessionSeq;
+    /** 停止时触发一次真实定位上报（用于覆盖 passive 的系统缓存），每个 Service 实例一次。 */
+    private boolean passiveRefreshStarted;
+    /** 系统级注入下"模块不在线"只提示一次，避免 10Hz 刷屏。 */
+    private boolean systemModuleWarned;
     private PowerManager.WakeLock wakeLock;
     private Runnable ticker;
     private float accuracyMeters = 5.0f;
@@ -110,6 +165,29 @@ public class LocationService extends Service {
     private final float[] nativeRotation = new float[4];
     private final float[] nativeMagnetic = new float[3];
     private FloatingWindow floatingWindow;
+
+    /**
+     * 准备结果：把 injector 从后台准备线程**通过返回值**传回主线程。
+     *
+     * <p>旧实现让后台线程直接读写 {@code injector} 字段：主线程 stop 把它置 null 之后，
+     * 后台线程的 {@code injector.getFailedProviders()} 就会 NPE；而且停止之后到达的结果
+     * 仍会被当成当前会话继续 {@code prepared=true / startTicker() / showOverlay()}，
+     * 出现"已停止却弹悬浮窗"。现在字段只在主线程写，跨线程只传这个不可变对象。
+     */
+    private static final class PrepareResult {
+        final boolean ok;
+        /** 仅 root 注入路径非 null；system_inject 模式恒为 null（由模块负责注入）。 */
+        final TestProviderInjector injector;
+
+        PrepareResult(boolean ok, TestProviderInjector injector) {
+            this.ok = ok;
+            this.injector = injector;
+        }
+
+        static PrepareResult failed() {
+            return new PrepareResult(false, null);
+        }
+    }
 
     @Override
     public void onCreate() {
@@ -210,6 +288,8 @@ public class LocationService extends Service {
 
     private void startRoute(Intent intent) {
         Session session = Session.INSTANCE;
+        // 新会话代次：仍在后台准备的旧会话 post 回主线程时会发现自己已经过期
+        final int seq = ++sessionSeq;
         if (session.isActive()) {
             // 重新开始（例如到达终点后点「重新开始」）：只重置运行态，不要 stopSelf 把服务拆掉
             resetForRestart();
@@ -297,12 +377,20 @@ public class LocationService extends Service {
         collectGnssSnapshot();
 
         new Thread(() -> {
-            boolean ok = ensureMockPermissionAndPrepare(providers);
+            // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
+            PrepareResult result = ensureMockPermissionAndPrepare(providers);
             handler.post(() -> {
-                if (!ok) {
+                // 先判会话代次：停止（或已重新开始）之后到达的结果一律丢弃，
+                // 旧会话的失败也不能再 stopInternal 掉新会话。
+                if (isStalePrepare(seq)) {
+                    discardStalePrepare(result);
+                    return;
+                }
+                if (!result.ok) {
                     stopInternal(Session.INSTANCE.error);
                     return;
                 }
+                injector = result.injector;
                 Session.INSTANCE.prepared = true;
                 Session.INSTANCE.notifyChanged();
                 startTicker();
@@ -321,6 +409,8 @@ public class LocationService extends Service {
 
     private void startSpot(Intent intent) {
         Session session = Session.INSTANCE;
+        // 新会话代次：仍在后台准备的旧会话 post 回主线程时会发现自己已经过期
+        final int seq = ++sessionSeq;
         if (session.isActive()) {
             resetForRestart();
         }
@@ -352,12 +442,20 @@ public class LocationService extends Service {
         collectGnssSnapshot();
 
         new Thread(() -> {
-            boolean ok = ensureMockPermissionAndPrepare(providers);
+            // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
+            PrepareResult result = ensureMockPermissionAndPrepare(providers);
             handler.post(() -> {
-                if (!ok) {
+                // 先判会话代次：停止（或已重新开始）之后到达的结果一律丢弃，
+                // 旧会话的失败也不能再 stopInternal 掉新会话。
+                if (isStalePrepare(seq)) {
+                    discardStalePrepare(result);
+                    return;
+                }
+                if (!result.ok) {
                     stopInternal(Session.INSTANCE.error);
                     return;
                 }
+                injector = result.injector;
                 Session.INSTANCE.prepared = true;
                 Session.INSTANCE.notifyChanged();
                 startTicker();
@@ -404,52 +502,197 @@ public class LocationService extends Service {
     }
 
     /** 拿 root → 授权 appops → 接管测试 Provider。 */
-    private boolean ensureMockPermissionAndPrepare(List<String> providers) {
+    private PrepareResult ensureMockPermissionAndPrepare(List<String> providers) {
         Session session = Session.INSTANCE;
         String pkg = getPackageName();
 
         // 系统级注入：定位由模块在 system_server 改写，本进程不接管测试 Provider，
         // 也就不需要 appops / 测试 Provider（但模块本身依赖 root + LSPosed 已安装）
         if (RouteStore.loadSystemInject(this)) {
-            releaseInjector();
-            session.rootOk = RootShell.isRooted();
-            return true;
+            // 不改既有判定（模块存活由 SystemInject 的读取痕迹证明），只留诊断线索：
+            // 定位总开关关着时目标 App 的定位请求可能根本到不了模块，日志会表现为
+            // "模块无活动"，排查时不要误以为 LSPosed 作用域没勾。
+            if (!LocationSwitch.isSystemLocationEnabled(this)) {
+                Log.w(TAG, "system inject: system location switch is off; "
+                        + "module reads may never arrive");
+            }
+            return prepareSystemInject(session);
         }
 
         if (!RootShell.isRooted()) {
             session.rootOk = false;
             session.error = "未获得 root 权限，请确认设备已 root 并在 root 管理器中授权本应用";
-            return false;
+            return PrepareResult.failed();
         }
         session.rootOk = true;
 
-        RootShell.Result current = RootShell.getMockAppop(pkg);
-        if (!RootShell.isMockAppopAllowed(current)) {
-            RootShell.Result grant = RootShell.grantMockAppop(pkg);
-            if (!grant.ok()) {
-                session.error = "授予模拟位置权限失败：" + grant.combined();
-                return false;
-            }
-            current = RootShell.getMockAppop(pkg);
+        // 前置检查（在任何 test provider 接管 / appop 修改之前）：定位总开关关闭时
+        // addTestProvider 仍可能返回成功（dumpsys 里已有 "gps provider [mock]"），但
+        // user0 enabled=false、last mock location=null，isProviderEnabled("gps") 恒为 false。
+        // 真实原因只是"没开定位"，不是 appop 被拒——这里直接给出可操作提示并停止，
+        // 不再走接管流程，避免用户看到误导性的"接管被拒绝"。
+        if (!LocationSwitch.isSystemLocationEnabled(this)) {
+            session.error = LocationSwitch.DISABLED_MSG;
+            Log.w(TAG, "system location switch is off, abort before test provider takeover");
+            return PrepareResult.failed();
+        }
+
+        // 新会话：让上一次停止尚未完成的 appop 回收让位（见 revokeMockAppopIfGranted）
+        final long myEpoch = mockSessionEpoch.incrementAndGet();
+
+        synchronized (MOCK_APPOP_LOCK) {
+            RootShell.Result current = RootShell.getMockAppop(pkg);
             if (!RootShell.isMockAppopAllowed(current)) {
-                session.error = "模拟位置权限未生效（appops：" + current.combined() + "）";
-                return false;
+                RootShell.Result grant = RootShell.grantMockAppop(pkg);
+                if (!grant.ok()) {
+                    session.error = "授予模拟位置权限失败：" + grant.combined();
+                    return PrepareResult.failed();
+                }
+                // 留痕：这条 allow 是本应用改的，停止时只回收它；用户/系统本来就允许的
+                // （走不到这个分支）没有标记，绝不能在停止时去动。
+                RouteStore.saveMockAppopGrantedByApp(this);
+                current = RootShell.getMockAppop(pkg);
+                if (!RootShell.isMockAppopAllowed(current)) {
+                    session.error = "模拟位置权限未生效（appops：" + current.combined() + "）";
+                    return PrepareResult.failed();
+                }
             }
         }
 
-        injector = new TestProviderInjector(this, providers);
+        // 拿 root / 授权 appop 期间用户可能已经点了「彻底停止」：这时不要再接管
+        // 测试 Provider，直接返回失败让上层 stopInternal 回收刚授出的 appop。
+        if (Session.INSTANCE.mode == Session.Mode.IDLE && mockSessionEpoch.get() == myEpoch) {
+            Log.i(TAG, "session stopped during prepare, abort provider takeover");
+            return PrepareResult.failed();
+        }
+
+        // 用局部变量持有 injector：后台线程不碰 injector 字段（主线程可能已在 stop 里
+        // 把它置 null），也就不会有 "injector.getFailedProviders()" 的 NPE。
+        TestProviderInjector newInjector = new TestProviderInjector(this, providers);
         try {
-            injector.prepare();
+            newInjector.prepare();
         } catch (SecurityException e) {
-            injector = null;
-            session.error = "接管定位 Provider 被拒绝：" + e.getMessage();
-            return false;
+            // 只有"所有 Provider 都失败"才会抛到这里；describe() 已列出逐个原因。
+            // prepare() 失败前可能已经注册了部分 test provider（例如 gps 已 add、启用被拒），
+            // 必须在这里 release，否则它们会作为常驻 mock provider 留到设备重启。
+            String detail = newInjector.describe();
+            releaseQuietly(newInjector);
+            if (!LocationSwitch.isSystemLocationEnabled(this)) {
+                Log.w(TAG, "take over aborted: system location switch was disabled | "
+                        + detail, e);
+                session.error = LocationSwitch.DISABLED_MSG;
+                return PrepareResult.failed();
+            }
+            Log.e(TAG, "take over location provider rejected: " + detail, e);
+            session.error = "接管定位 Provider 被拒绝：" + detail;
+            return PrepareResult.failed();
         } catch (RuntimeException e) {
-            injector = null;
-            session.error = "接管定位 Provider 失败：" + e;
+            String detail = newInjector.describe();
+            releaseQuietly(newInjector);
+            Log.e(TAG, "take over location provider failed: " + detail + " | " + e, e);
+            session.error = "接管定位 Provider 失败：" + detail + "（" + e + "）";
+            return PrepareResult.failed();
+        }
+        // 只要 ≥1 个 Provider 接管成功就继续：Android 12+ 上 network 常由系统融合定位
+        // 持有、第三方接管被拒是常态，gps 往往仍可用，不能因此停掉整场模拟。
+        if (!newInjector.getFailedProviders().isEmpty()) {
+            Log.w(TAG, "test provider partially prepared: " + newInjector.describe());
+        }
+        return new PrepareResult(true, newInjector);
+    }
+
+    /**
+     * 系统级注入的准备：必须证明 system_server 里的模块**真的在接管**才允许返回成功。
+     *
+     * <p>旧实现直接 {@code return true}，于是 LSPosed 作用域没勾「系统框架」时，
+     * 界面显示运行中、里程在涨，但 {@link #injectFix} 里 {@code injector == null}
+     * 静默返回，一个坐标都没注入。这里改为：有真实读取痕迹（新鲜度
+     * {@link #SYSTEM_MODULE_FRESH_MS}）才通过；否则主动探测一轮，仍无痕迹就按
+     * "与 root 失败相同"的失败路径返回 false（上层 {@link #stopInternal} 会提示并停止）。
+     *
+     * <p>本方法在后台准备线程执行，<b>不得</b>读写 {@code injector} 字段：主线程可能同时
+     * stop 并把它置 null。上一个会话的 injector 已由 startRoute/startSpot 的
+     * {@link #resetForRestart()} 在主线程释放。
+     *
+     * @return ok=模块确实在接管；失败时 {@code session.error} 已写明原因
+     */
+    private PrepareResult prepareSystemInject(Session session) {
+        session.rootOk = RootShell.isRooted();
+        if (isSystemModuleOnline()) {
+            Log.i(TAG, "system inject ready: module read our snapshot "
+                    + (System.currentTimeMillis() - StepSession.INSTANCE.moduleSystemReadAt) + "ms ago");
+            return new PrepareResult(true, null);
+        }
+        // 没有既有痕迹：主动触发一次定位读取，逼 system_server 里的模块回读快照
+        probeSystemModule();
+        final long deadline = SystemClock.elapsedRealtime() + SYSTEM_MODULE_PROBE_WAIT_MS;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (isSystemModuleOnline()) {
+                Log.i(TAG, "system inject ready after probe");
+                return new PrepareResult(true, null);
+            }
+            SystemClock.sleep(SYSTEM_MODULE_PROBE_POLL_MS);
+        }
+        // 仍无痕迹：绝不再"假成功"，走与 root 失败相同的失败路径
+        Log.w(TAG, "system inject enabled but no module activity within "
+                + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS + "ms)");
+        session.error = SYSTEM_MODULE_MISSING_MSG;
+        return PrepareResult.failed();
+    }
+
+    /**
+     * system_server 里的模块是否最近真的读过本应用的定位快照。
+     *
+     * <p>这是系统级注入唯一的直接存活证据：模块的定位/GNSS hook 一触发就会 query
+     * {@code content://com.vloc.motion.env/location|gnss}（{@code hidden/SystemHooks.java}），
+     * 该 query 由 system_server（uid 1000）发起，{@link EnvProvider} 会记录时间戳。
+     *
+     * <p>不使用 {@link StepSession#moduleHeartbeatAt}：那个心跳来自**目标 App 进程**里的模块
+     * （{@code hidden/StepReplay.java:731}），只能证明模块在某处注入成功，不能证明
+     * 系统框架作用域生效，用它放行仍会造成"假成功"。
+     *
+     * <p>也不使用 {@link VlocStateFile}：它只被 App 单向写给 Zygisk 原生模块
+     * （{@code zygisk/src/module.cpp} 用 PROT_READ mmap），模块不回写任何 ack，没有可读信号。
+     */
+    private boolean isSystemModuleOnline() {
+        final long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
+        if (seenAt <= 0L) {
             return false;
         }
-        return true;
+        final long age = System.currentTimeMillis() - seenAt;
+        return age >= 0L && age <= SYSTEM_MODULE_FRESH_MS;
+    }
+
+    /**
+     * 主动探测：本进程读一次"最后已知位置"。
+     *
+     * <p>system_server 里的模块挂了 {@code getLastLocation/getCurrentLocation} 的
+     * after-hook（{@code hidden/SystemHooks.java:203-219}），hook 里会调用
+     * {@code currentLocation()} → query 本应用的 /location 快照，从而留下真实读取痕迹。
+     * 权限不足 / ROM 差异导致失败时静默忽略，由调用方继续轮询到超时。
+     */
+    private void probeSystemModule() {
+        try {
+            android.location.LocationManager lm =
+                    (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
+            if (lm == null) {
+                return;
+            }
+            try {
+                if (lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
+                    lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER);
+                }
+            } catch (Throwable ignored) {
+                // 未授予定位权限 / provider 不可用：换下一个
+            }
+            try {
+                lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER);
+            } catch (Throwable ignored) {
+                // 同上
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "probe system module failed", t);
+        }
     }
 
     private List<String> readProviders(Intent intent) {
@@ -573,7 +816,38 @@ public class LocationService extends Service {
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
                 fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
         if (injector == null) {
-            return;   // 系统级注入：本进程不写测试 Provider
+            // 系统级注入：本进程不写测试 Provider，由 system_server 里的模块改写定位。
+            // 但只有"能证明模块正在接管"时才允许空转，否则界面会显示运行中、
+            // 里程在涨，却一个坐标都没注入（v0.40.0 之前的静默缺陷）。
+            final long silentMs = System.currentTimeMillis() - StepSession.INSTANCE.moduleSystemReadAt;
+            if (StepSession.INSTANCE.moduleSystemReadAt > 0
+                    && silentMs >= 0L && silentMs <= SYSTEM_MODULE_SILENCE_WARN_MS) {
+                if (systemModuleWarned) {
+                    systemModuleWarned = false;
+                    // 模块恢复读取：立刻清掉上一次的静默 error，否则一次误报会永久粘在界面上
+                    clearSystemModuleError();
+                }
+                return;
+            }
+            Session session = Session.INSTANCE;
+            // 只在真正"运行中"才判静默：held（含"已定位到起点（待开始）"）、暂停、已到达
+            // 时目标 App 本来就可能不请求定位，模块自然没有回读，这时报"请重启手机"是误报。
+            final boolean running = session.mode == Session.Mode.ROUTE
+                    && !session.paused && !session.held && !session.arrived;
+            if (!running || systemModuleWarned) {
+                return;
+            }
+            systemModuleWarned = true;
+            Log.e(TAG, "injectFix: system inject mode, but module silent for "
+                    + (StepSession.INSTANCE.moduleSystemReadAt > 0 ? silentMs + "ms" : "the whole session")
+                    + "; nothing is being injected");
+            session.error = SYSTEM_MODULE_MISSING_MSG;
+            session.notifyChanged();
+            // 用户此刻通常在目标 App 里，MainActivity.onPause 已 removeListener：
+            // 只写 session.error 永远看不到，必须直接提示（toast + 通知双保险）。
+            toast(SYSTEM_MODULE_MISSING_MSG);
+            postSystemModuleAlert();
+            return;
         }
         try {
             injector.push(fix, System.currentTimeMillis());
@@ -768,8 +1042,17 @@ public class LocationService extends Service {
     }
 
     private void stopInternal(String message) {
+        // 先让仍在后台准备的会话过期：它之后的 post 会被 isStalePrepare 丢弃并自行释放
+        ++sessionSeq;
         stopTicker();
         releaseInjector();
+        // 收尾顺序不能反：removeTestProvider 本身也受 mock_location appop 检查，
+        // 必须先移除测试 Provider（releaseInjector），再回收 appop。
+        // system_inject 模式不接管测试 Provider、不授 appop，也不碰这两个系统面。
+        if (!RouteStore.loadSystemInject(this)) {
+            revokeMockAppopIfGranted();
+            refreshRealFixForPassive();
+        }
         hideOverlay();
         releaseWakeLock();
         Session session = Session.INSTANCE;
@@ -784,6 +1067,7 @@ public class LocationService extends Service {
         LocationSession.INSTANCE.clear();
         VlocStateFile.clear();
         GnssSession.INSTANCE.clear();
+        cancelSystemModuleAlert();
         session.mode = Session.Mode.IDLE;
         session.paused = false;
         session.held = false;
@@ -805,6 +1089,142 @@ public class LocationService extends Service {
             }
             injector = null;
         }
+    }
+
+    /**
+     * 后台准备结果回到主线程时，是否已经不属于当前会话。
+     *
+     * <p>两种情况都算过期：①用户在这期间点了「彻底停止」——{@link #sessionSeq} 已自增、
+     * {@code mode} 已是 IDLE、{@code injector} 已被 {@link #releaseInjector()} 置 null；
+     * ②停止后又立刻重新开始——{@link #sessionSeq} 再次自增，旧结果同样作废。
+     * 过期时必须丢弃结果，绝不能再执行 {@code prepared=true / startTicker() / showOverlay()}。
+     */
+    private boolean isStalePrepare(int seq) {
+        return seq != sessionSeq || Session.INSTANCE.mode == Session.Mode.IDLE;
+    }
+
+    /** 丢弃一份已过期的准备结果：释放它自带的 injector，避免留下常驻 mock provider。 */
+    private void discardStalePrepare(PrepareResult result) {
+        Log.i(TAG, "discard prepare result: session is no longer current");
+        releaseQuietly(result == null ? null : result.injector);
+    }
+
+    /** 释放一个还没交给 {@code injector} 字段的实例（失败只记日志，不打断收尾流程）。 */
+    private void releaseQuietly(TestProviderInjector target) {
+        if (target == null) {
+            return;
+        }
+        try {
+            target.release();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "release discarded injector failed", e);
+        }
+    }
+
+    /**
+     * 停止时回收**本应用授出**的 {@code android:mock_location} appop。
+     *
+     * <p>只认 {@link RouteStore#loadMockAppopGrantedByApp} 的留痕（授权成功时写入）：
+     * 用户自己在开发者选项里选的"模拟位置应用"、或系统/上次运行留下的 allow 没有这个
+     * 标记，停止时**绝不触碰**，避免越权修改用户设置。
+     *
+     * <p>用 {@code appops set ... default} 而不是 {@code deny}：default 只是把这条 op
+     * 恢复成"未显式设置"（mock_location 的默认态就是不允许），不额外写一条 denial；
+     * 而 deny/ignore 本身就是一条用户可见的 AppOps 记录，反而会覆盖用户之后的手动授权。
+     *
+     * <p>root 调用可能阻塞 20s，必须离开主线程；失败只记日志并保留标记，下次停止可重试。
+     * 校验到 appop 仍为 allow 时同样保留标记（可能只是 su 超时），不误报成功。
+     *
+     * <p>与授权路径共用 {@link #MOCK_APPOP_LOCK}，并用 {@link #mockSessionEpoch} 判断
+     * 停止后是否已开始新会话：用户点了彻底停止又立刻点开始，回收线程绝不能把新会话
+     * 刚拿到的 appop 收走。
+     */
+    private void revokeMockAppopIfGranted() {
+        // 系统级注入不接管测试 Provider、不授 appop：这条路径不得触碰该 appop
+        if (RouteStore.loadSystemInject(this)) {
+            return;
+        }
+        if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
+            return;   // 不是本应用授予的：用户/系统的设置，原样保留
+        }
+        final long epoch = mockSessionEpoch.get();
+        final String pkg = getPackageName();
+        new Thread(() -> {
+            synchronized (MOCK_APPOP_LOCK) {
+                try {
+                    if (mockSessionEpoch.get() != epoch) {
+                        // 已经重新开始模拟：权限留给新会话，由新会话停止时回收
+                        Log.i(TAG, "skip appop revoke: a newer session has started");
+                        return;
+                    }
+                    if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
+                        return;   // 另一个并发停止已经回收
+                    }
+                    RootShell.Result current = RootShell.getMockAppop(pkg);
+                    if (!current.ok()) {
+                        // su / appops 不可用：无法判断当前状态，保留留痕下次再试，
+                        // 不能凭"查不到"就当作已回收。
+                        Log.w(TAG, "query mock_location appop failed, keep grant mark: " + current);
+                        return;
+                    }
+                    if (!RootShell.isMockAppopAllowed(current)) {
+                        // 用户/系统已经改回不允许：没有要回收的 allow，只清自己的留痕
+                        RouteStore.clearMockAppopGrantedByApp(this);
+                        Log.i(TAG, "mock_location appop already not allowed, grant mark cleared");
+                        return;
+                    }
+                    RootShell.Result revoke = RootShell.revokeMockAppop(pkg);
+                    if (!revoke.ok()) {
+                        Log.w(TAG, "revoke mock_location appop failed: " + revoke);
+                        return;   // 保留标记，下次彻底停止再试
+                    }
+                    RootShell.Result after = RootShell.getMockAppop(pkg);
+                    if (!after.ok() || RootShell.isMockAppopAllowed(after)) {
+                        Log.w(TAG, "mock_location appop still allowed after revoke: " + after);
+                        return;   // 保留标记，下次彻底停止再试
+                    }
+                    RouteStore.clearMockAppopGrantedByApp(this);
+                    Log.i(TAG, "revoked mock_location appop granted by this app");
+                } catch (Throwable t) {
+                    Log.w(TAG, "revoke mock_location appop failed", t);
+                }
+            }
+        }, "vloc-appop-revoke").start();
+    }
+
+    /**
+     * 停止后的被动 Provider 尽力清理。
+     *
+     * <p>passive 没有被本应用接管（{@code addTestProvider("passive")} 在 Android 8.0+
+     * 直接抛 {@code IllegalArgumentException}，见 docs/root-injection.md:324），它保留的
+     * 最后一条 mock 镜像来自 system_server 的系统级缓存，App 没有 API 能删除/清空。
+     * 唯一能做的：测试 Provider 全部移除后请求一次**真实**定位，让真实 provider 再上报
+     * 一次，覆盖 passive 的旧值；8 秒超时、只在主线程 Handler 上注册一次，不新增线程。
+     * 室内/无信号时可能始终拿不到真实 fix，passive 会一直保留旧值——这是系统层限制，
+     * 不是本应用能强制的（不要试图 add/removeTestProvider("passive") 假清理）。
+     */
+    private void refreshRealFixForPassive() {
+        if (passiveRefreshStarted) {
+            return;
+        }
+        passiveRefreshStarted = true;
+        if (!RealLocationProvider.hasPermission(this)) {
+            Log.i(TAG, "passive best-effort skipped: no location permission");
+            return;
+        }
+        RealLocationProvider.requestFresh(this, new RealLocationProvider.Callback() {
+            @Override
+            public void onLocation(Location location) {
+                Log.i(TAG, "passive best-effort: " + location.getProvider()
+                        + " fix received (mock=" + location.isFromMockProvider() + ")");
+            }
+
+            @Override
+            public void onError(String message) {
+                Log.i(TAG, "passive best-effort: no real fix (" + message
+                        + "); passive may keep the last mock location until next real fix");
+            }
+        });
     }
 
     private void acquireWakeLock() {
@@ -905,6 +1325,54 @@ public class LocationService extends Service {
         if (nm != null) {
             nm.notify(NOTIFICATION_ID, buildNotification(text));
         }
+    }
+
+    /**
+     * "系统级注入失效"的可见告警。
+     *
+     * <p>用户在目标 App 里时 {@code MainActivity.onPause} 已经
+     * {@code removeListener}，{@code onResume} 又不会补显示，所以只写
+     * {@code session.error} 是看不到的。这里绕过 Activity 直接发一条通知，
+     * 走已有通道（低优先级）、独立 id，不会顶掉前台服务通知。
+     */
+    private void postSystemModuleAlert() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm == null) {
+            return;
+        }
+        Intent openIntent = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+        PendingIntent openPending = PendingIntent.getActivity(this, 0, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification alert = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .setContentTitle("虚拟运动 · 系统级注入未生效")
+                .setContentText(SYSTEM_MODULE_MISSING_MSG)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(SYSTEM_MODULE_MISSING_MSG))
+                .setContentIntent(openPending)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build();
+        nm.notify(ALERT_NOTIFICATION_ID, alert);
+    }
+
+    /** 撤掉系统级注入告警通知（模块恢复读取 / 会话结束时）。 */
+    private void cancelSystemModuleAlert() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            nm.cancel(ALERT_NOTIFICATION_ID);
+        }
+    }
+
+    /** 模块恢复读取：清掉"系统级注入失效"的 error，避免一次误报永久粘住。 */
+    private void clearSystemModuleError() {
+        Session session = Session.INSTANCE;
+        if (SYSTEM_MODULE_MISSING_MSG.equals(session.error)) {
+            session.error = null;
+            session.notifyChanged();
+        }
+        cancelSystemModuleAlert();
     }
 
     // ---------------------------------------------------------------- 悬浮窗

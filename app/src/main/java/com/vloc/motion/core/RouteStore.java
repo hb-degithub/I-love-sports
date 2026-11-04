@@ -44,6 +44,13 @@ public final class RouteStore {
     private static final String KEY_GNSS_SNAPSHOT = "gnss_snapshot";
     private static final String KEY_RANDOM_START = "random_start";
     private static final String KEY_BUILTIN_SEEDED = "builtin_routes_v3";
+    /**
+     * 本应用通过 root 授予 {@code android:mock_location} 的时间戳（0/缺省=不是本应用授予的）。
+     *
+     * <p>用于"停止时只回收自己授出去的 appop"：用户/系统预先允许的场景（开发者选项里
+     * 手动选过模拟位置应用）没有这个标记，停止时绝不去改它。
+     */
+    private static final String KEY_MOCK_APPOP_GRANTED_BY_APP = "mock_appop_granted_by_app";
 
     private RouteStore() {
     }
@@ -381,6 +388,25 @@ public final class RouteStore {
 
     public static void saveSystemInject(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_SYSTEM_INJECT, enabled).apply();
+    }
+
+    /**
+     * 本应用授出 {@code android:mock_location} 的时间戳；0 表示没有"本应用授予"的记录。
+     *
+     * <p>只认这个标记：用户自己（开发者选项）或系统提前允许的情况不会被误回收。
+     */
+    public static long loadMockAppopGrantedByApp(Context context) {
+        return prefs(context).getLong(KEY_MOCK_APPOP_GRANTED_BY_APP, 0L);
+    }
+
+    public static void saveMockAppopGrantedByApp(Context context) {
+        prefs(context).edit()
+                .putLong(KEY_MOCK_APPOP_GRANTED_BY_APP, System.currentTimeMillis())
+                .apply();
+    }
+
+    public static void clearMockAppopGrantedByApp(Context context) {
+        prefs(context).edit().remove(KEY_MOCK_APPOP_GRANTED_BY_APP).apply();
     }
 
     /**

@@ -81,6 +81,16 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
     private static final int REQ_PERMISSIONS = 2001;
 
+    /**
+     * 系统级注入下判断"系统框架是否还在接管"的静默门槛（毫秒）。
+     *
+     * <p>必须与 {@code LocationService.SYSTEM_MODULE_SILENCE_WARN_MS} 保持一致（30 秒）：
+     * 那里是运行期"模块完全没动静"的告警门槛，UI 用同一个窗口才不会出现"服务已经告警、
+     * 界面还显示在线"（或相反）的矛盾。LocationService 里该常量是 private，无法直接引用，
+     * 改动其中一个必须同步另一个。
+     */
+    private static final long SYSTEM_MODULE_SILENCE_MS = 30_000L;
+
     private MapView mapView;
     private Polyline routePolyline;
     private final List<Marker> pointMarkers = new ArrayList<>();
@@ -177,6 +187,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
     private void initMap() {
         android.widget.FrameLayout container = findViewById(R.id.mapContainer);
+        mapView = new MapView(this, new org.osmdroid.tileprovider.MapTileProviderBasic(this, TileSources.load(this)));
         container.addView(mapView, new android.widget.FrameLayout.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
@@ -547,6 +558,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private void saveRoute() {
         RouteStore.saveRoute(this, route);
         updateInfoTexts();
+        // 添加/撤销/清空/删点/拖点/导入都走这里：落库后整屏刷新。
+        // 否则状态栏的点数/里程/按钮可用状态要等下一次 session 回调才更新。
+        refreshUi();
     }
 
     private void saveMapView() {
@@ -672,6 +686,22 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         }
     }
 
+    /**
+     * system_server 里的模块最近是否读过快照（系统级注入下"模块在接管"的直接证据）。
+     *
+     * <p>判定口径与 {@code LocationService#isSystemModuleOnline()} 不同：那里启动阶段用
+     * 严格的 5 秒窗口防止"假成功"，UI 这里用运行期告警门槛 {@link #SYSTEM_MODULE_SILENCE_MS}
+     * （30 秒），否则目标 App 暂时不请求定位时界面会闪"未接管"。
+     */
+    private boolean isSystemModuleFresh() {
+        long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
+        if (seenAt <= 0L) {
+            return false;
+        }
+        long age = System.currentTimeMillis() - seenAt;
+        return age >= 0L && age <= SYSTEM_MODULE_SILENCE_MS;
+    }
+
     private void refreshUi() {
         if (statusText == null) {
             return;
@@ -720,16 +750,33 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             stepTag = String.format(Locale.US, " · 步 %d（%d 步/分）",
                     session.sessionSteps, Math.round(session.cadenceSpm));
         }
+        // 注入模式决定"模块存活"的证据来源：root 注入看目标进程心跳，
+        // 系统级注入看 system_server 的读取痕迹（stepTag / 提示文案必须二选一）
+        final boolean systemInjectMode = RouteStore.loadSystemInject(this);
         if (session.mode != Session.Mode.IDLE) {
-            long lastRead = StepSession.INSTANCE.moduleLastReadAt;
-            long heartbeat = StepSession.INSTANCE.moduleHeartbeatAt;
-            if (lastRead > 0) {
-                long age = Math.max(0, (System.currentTimeMillis() - lastRead) / 1000);
-                stepTag += String.format(Locale.US, " · 模块读取中 %ds前", age);
-            } else if (heartbeat > 0) {
-                stepTag += " · 模块已注入（目标App未读传感器）";
+            if (systemInjectMode) {
+                // 系统级注入推荐把模块勾进「系统框架」作用域，那种配置下目标进程心跳
+                // 恒为 0；继续用心跳判定会长期显示"模块未注入"，还会把用户引向
+                // "去勾目标 App"这种与实际要求相反的配置。这里改看 moduleSystemReadAt
+                // （由 EnvProvider 记录 system_server 的 uid 1000 读取）。
+                long systemRead = StepSession.INSTANCE.moduleSystemReadAt;
+                long age = systemRead <= 0 ? -1 : System.currentTimeMillis() - systemRead;
+                if (systemRead > 0 && age >= 0 && age <= SYSTEM_MODULE_SILENCE_MS) {
+                    stepTag += String.format(Locale.US, " · 系统框架已接管 %ds前", age / 1000);
+                } else {
+                    stepTag += " · 系统框架未接管";
+                }
             } else {
-                stepTag += " · 模块未注入";
+                long lastRead = StepSession.INSTANCE.moduleLastReadAt;
+                long heartbeat = StepSession.INSTANCE.moduleHeartbeatAt;
+                if (lastRead > 0) {
+                    long age = Math.max(0, (System.currentTimeMillis() - lastRead) / 1000);
+                    stepTag += String.format(Locale.US, " · 模块读取中 %ds前", age);
+                } else if (heartbeat > 0) {
+                    stepTag += " · 模块已注入（目标App未读传感器）";
+                } else {
+                    stepTag += " · 模块未注入";
+                }
             }
         }
         String status = String.format(Locale.US, "%s · %d 个路径点%s%s%s",
@@ -800,11 +847,20 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             } else if (session.held) {
                 hintText.setText("已停止移动，定位保持在原地 · 只有这里「彻底停止」才会恢复真实定位");
             } else if (session.mode != Session.Mode.IDLE
+                    && systemInjectMode
+                    && !isSystemModuleFresh()) {
+                // 模式二选一：system_inject 走的是「系统框架」作用域，提示里绝不能再让
+                // 用户去勾目标 App（那是 root/provider 注入的配置）。
+                hintText.setText("系统框架未接管：请确认 LSPosed 已启用本模块，作用域勾选「系统框架（android）」"
+                        + "后重启手机；系统级注入不需要勾选目标 App");
+            } else if (session.mode != Session.Mode.IDLE
+                    && !systemInjectMode
                     && session.sessionSteps > 0
                     && StepSession.INSTANCE.moduleLastReadAt <= 0
                     && StepSession.INSTANCE.moduleHeartbeatAt > 0) {
                 hintText.setText("模块已注入目标 App，但它没有读取计步传感器（可能走系统健康数据，无法伪造）");
             } else if (session.mode != Session.Mode.IDLE
+                    && !systemInjectMode
                     && session.sessionSteps > 0
                     && StepSession.INSTANCE.moduleHeartbeatAt <= 0) {
                 hintText.setText("模块未注入：请确认 LSPosed 已启用本模块、作用域勾选目标 App，并重启目标 App");

@@ -5,6 +5,8 @@ import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import android.os.Binder;
+import android.os.Process;
 
 import com.vloc.motion.core.RouteStore;
 
@@ -36,6 +38,15 @@ public final class EnvProvider extends ContentProvider {
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
         MatrixCursor cursor = new MatrixCursor(COLUMNS);
+        if (isLocationUri(uri) || isGnssUri(uri)) {
+            // uid==1000 说明这次读取来自 system_server（系统级注入的模块，见
+            // hidden/SystemHooks.java 的 currentLocation()/currentSatellites()）。
+            // 目标进程内的模块（hidden/AntiDetect.java）也读同一个 URI，但 uid 是目标 App，
+            // 不能算作"系统级接管"的证据。
+            if (Binder.getCallingUid() == Process.SYSTEM_UID) {
+                StepSession.INSTANCE.markModuleSystemRead();
+            }
+        }
         if (isLocationUri(uri)) {
             LocationSession location = LocationSession.INSTANCE;
             if (!location.active) {

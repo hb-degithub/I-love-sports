@@ -40,6 +40,21 @@ public final class RealLocationProvider {
     }
 
     public static void request(final Context context, final Callback callback) {
+        request(context, callback, true);
+    }
+
+    /**
+     * 只请求一次**新**定位，不使用 last known。
+     *
+     * <p>用于停止模拟后让真实 provider 再上报一次：last known 可能是模拟运行期留下的
+     * mock 值，不能拿来当"真实位置"。
+     */
+    public static void requestFresh(final Context context, final Callback callback) {
+        request(context, callback, false);
+    }
+
+    private static void request(final Context context, final Callback callback,
+                                final boolean allowLastKnown) {
         if (!hasPermission(context)) {
             callback.onError("未授予定位权限");
             return;
@@ -52,7 +67,7 @@ public final class RealLocationProvider {
             return;
         }
 
-        Location lastKnown = bestLastKnown(locationManager);
+        Location lastKnown = allowLastKnown ? bestLastKnown(locationManager) : null;
         if (lastKnown != null && System.currentTimeMillis() - lastKnown.getTime() < 120000L) {
             callback.onLocation(lastKnown);
             return;

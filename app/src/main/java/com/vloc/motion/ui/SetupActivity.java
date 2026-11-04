@@ -7,6 +7,7 @@ import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationManager;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.MotionEvent;
 import android.text.InputType;
 import android.widget.EditText;
@@ -49,6 +50,7 @@ import java.util.Locale;
 /** 开工向导：① 选目标位置 → ② 选模拟路线 → ③ 采集/配置基站与 Wi-Fi 环境 → 开始模拟。 */
 public class SetupActivity extends AppCompatActivity {
 
+    private static final String TAG = "VLocSetup";
     private static final int REQ_ENV_PERMISSIONS = 4001;
     private static final int REQ_LOCATION = 4002;
     /** 快照与目标位置距离超过该值时不建议回放指纹（改用隐藏）。 */
@@ -467,7 +469,18 @@ public class SetupActivity extends AppCompatActivity {
 
         configureEnvSession(hasRoute, hasTarget);
 
-        RouteStore.saveRoute(this, route);
+        // 只有"确实选了一条路线（>=2 点）"时才写回持久化：
+        // 向导里的 route 默认是空 Route（字段初始化），只有从主界面带入（"route" extra）
+        // 或在地图上生成预设路线时才 >=2 点。旧代码无条件 saveRoute，会在
+        // "主界面只有 1 个点 + 只设目标点"时把已存的多点路线覆盖成空路线。
+        // 目标点-only 场景不需要持久化：坐标已随 Intent 下发给 LocationService
+        // （ACTION_START_SPOT 的 EXTRA_LAT/EXTRA_LON），临时定位本身不是长期路线。
+        if (hasRoute) {
+            RouteStore.saveRoute(this, route);
+        } else if (route.size() > 0) {
+            Log.i(TAG, "skip saveRoute(): route has only " + route.size()
+                    + " point(s), keep stored route");
+        }
         Session.INSTANCE.route = route.copy();
         Session.INSTANCE.loop = RouteStore.loadLoop(this);
 
