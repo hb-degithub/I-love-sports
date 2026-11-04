@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.util.Log;
 import android.graphics.Paint;
 import android.os.Build;
 import android.os.Bundle;
@@ -79,6 +80,7 @@ import java.util.Locale;
 /** 主界面：地图选点、路径编辑、播放控制。 */
 public class MainActivity extends AppCompatActivity implements Session.Listener {
 
+    private static final String TAG = "VLocMain";
     private static final int REQ_PERMISSIONS = 2001;
 
     /**
@@ -92,6 +94,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private static final long SYSTEM_MODULE_SILENCE_MS = 30_000L;
 
     private MapView mapView;
+    /** 是否已 detach 过 MapView：onDestroy 只释放一次，避免重复 onDetach。 */
+    private boolean mapViewDetached;
     private Polyline routePolyline;
     private final List<Marker> pointMarkers = new ArrayList<>();
     private Marker currentMarker;
@@ -181,6 +185,27 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         super.onPause();
         Session.INSTANCE.removeListener(this);
         saveMapView();
+    }
+
+    @Override
+    protected void onDestroy() {
+        // osmdroid 的 MapView 持有瓦片缓存/下载器与原生资源，不 detach 会随 Activity 泄漏
+        detachMapView();
+        super.onDestroy();
+    }
+
+    /** 释放 MapView 的原生资源：判空 + 只 detach 一次，任何异常都不得让销毁流程崩溃。 */
+    private void detachMapView() {
+        MapView view = mapView;
+        if (view == null || mapViewDetached) {
+            return;
+        }
+        mapViewDetached = true;
+        try {
+            view.onDetach();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "mapView.onDetach failed", e);
+        }
     }
 
     // ------------------------------------------------------------ 初始化
@@ -1267,8 +1292,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         route = PresetRoutes.create(preset.id, lat, lon);
         refreshRouteOverlays();
         fitRoute();
+        // saveRoute() 内部已经 updateInfoTexts() + refreshUi()，这里不要重复刷新
         saveRoute();
-        refreshUi();
         if (RouteStore.loadGoalEnabled(this)) {
             RouteStore.saveGoalLapMeters(this, (float) Math.round(route.totalMeters()));
             updateInfoTexts();
@@ -1656,8 +1681,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                     route = items.get(which).route.copy();
                     refreshRouteOverlays();
                     fitRoute();
+                    // saveRoute() 内部已刷新，避免一次操作刷两遍
                     saveRoute();
-                    refreshUi();
                     toast("已载入：" + items.get(which).name);
                 })
                 .setNeutralButton("删除…", (dialog, which) -> showDeleteRouteDialog(items))

@@ -19,6 +19,9 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * 通过系统测试 Provider 注入定位。
@@ -58,6 +61,18 @@ public final class TestProviderInjector {
     private final Map<String, String> failureReasons = new LinkedHashMap<>();
     /** 状态标志（{@link #prepared} 与上面几个集合）的并发保护：prepare/push/release 跨线程调用。 */
     private boolean prepared;
+    /**
+     * 一次性诊断任务用的线程池（懒创建、空闲线程自动回收，**不是**常驻线程）。
+     *
+     * <p>只承载"停止后的只读诊断"这类可以在任意线程完成的工作：它们要读系统定位，
+     * 而 {@link #release()} 在主线程执行，绝不能在这里阻塞收尾。
+     */
+    private static final ExecutorService DIAG_EXECUTOR =
+            Executors.newCachedThreadPool(runnable -> {
+                Thread thread = new Thread(runnable, "vloc-injector-diag");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     public TestProviderInjector(Context context, List<String> providers) {
         this.context = context == null ? null
@@ -85,11 +100,6 @@ public final class TestProviderInjector {
 
     public synchronized boolean isPrepared() {
         return prepared;
-    }
-
-    /** 本次真正接管成功的 Provider（副本，调用方不可改内部状态）。 */
-    public synchronized List<String> getPreparedProviders() {
-        return new ArrayList<>(preparedProviders);
     }
 
     /** 已在系统里注册过的 Provider（副本）：release() 的移除依据。 */
@@ -392,7 +402,18 @@ public final class TestProviderInjector {
         failedProviders.clear();
         failureReasons.clear();
         prepared = false;
-        logPassiveResidual();
+        // 诊断要读系统定位，可能在主线程阻塞（release() 由 stopInternal 在主线程调用）：
+        // 放到一次性后台任务，removeTestProvider 的收尾仍然第一时间完成，绝不因诊断推迟。
+        schedulePassiveResidualCheck();
+    }
+
+    /** 把只读诊断丢给后台线程池；线程池已关停（进程退出中）时直接丢弃，不影响停止。 */
+    private void schedulePassiveResidualCheck() {
+        try {
+            DIAG_EXECUTOR.execute(this::logPassiveResidual);
+        } catch (RejectedExecutionException e) {
+            Log.w(TAG, "skip passive residual check: executor rejected", e);
+        }
     }
 
     /**
@@ -400,6 +421,10 @@ public final class TestProviderInjector {
      *
      * <p>这一步不尝试修改（也没有 API 可改），只为真机排查留下日志证据：
      * 出现这条日志说明"测试 Provider 已全部移除，但 passive 仍是系统镜像"。
+     *
+     * <p><b>只在后台线程执行</b>（见 {@link #schedulePassiveResidualCheck()}）：
+     * {@code getLastKnownLocation} 是 binder 调用，放在停止路径的主线程会拖住
+     * removeTestProvider 之后的收尾。
      */
     private void logPassiveResidual() {
         try {

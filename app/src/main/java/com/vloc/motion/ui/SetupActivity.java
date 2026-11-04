@@ -57,6 +57,8 @@ public class SetupActivity extends AppCompatActivity {
     private static final double FINGERPRINT_MATCH_RADIUS_M = 30000.0;
 
     private MapView mapView;
+    /** 是否已 detach 过 MapView：onDestroy 只释放一次，避免重复 onDetach。 */
+    private boolean mapViewDetached;
     private Marker targetMarker;
     private TextView coordText;
     private TextView routeInfo;
@@ -86,6 +88,27 @@ public class SetupActivity extends AppCompatActivity {
         initMap();
         initViews();
         restoreRouteFromIntent();
+    }
+
+    @Override
+    protected void onDestroy() {
+        // 本页也持有 osmdroid MapView：不 detach，瓦片下载器与原生资源会随 Activity 泄漏
+        detachMapView();
+        super.onDestroy();
+    }
+
+    /** 释放 MapView 的原生资源：判空 + 只 detach 一次，任何异常都不得让销毁流程崩溃。 */
+    private void detachMapView() {
+        MapView view = mapView;
+        if (view == null || mapViewDetached) {
+            return;
+        }
+        mapViewDetached = true;
+        try {
+            view.onDetach();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "mapView.onDetach failed", e);
+        }
     }
 
     private void initMap() {

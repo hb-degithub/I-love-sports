@@ -42,6 +42,8 @@ import com.vloc.motion.ui.MainActivity;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 前台服务：驱动路径播放并持续向系统测试 Provider 写入坐标。
@@ -119,8 +121,22 @@ public class LocationService extends Service {
     /**
      * 串行化 appop 的"授权留痕"与"停止回收"：停止的回收线程在 su 执行期间，
      * 用户可能立刻重新开始模拟，必须避免把新会话刚拿到的权限回收掉。
+     *
+     * <p>用 {@link ReentrantLock} 而不是 {@code synchronized}，是为了让 start 侧能带超时
+     * 抢锁（回收侧最坏要连跑多次 su，见 {@link #MOCK_APPOP_LOCK_WAIT_MS}）。锁顺序固定为
+     * "先本锁、后 SharedPreferences 内部锁"（授权路径与回收路径一致），回收线程持锁期间
+     * <b>不获取本类其他锁</b>，因此不会出现环路等待。
      */
-    private static final Object MOCK_APPOP_LOCK = new Object();
+    private static final ReentrantLock MOCK_APPOP_LOCK = new ReentrantLock();
+    /**
+     * start 侧等待 {@link #MOCK_APPOP_LOCK} 的上限（毫秒）。
+     *
+     * <p>回收侧依次做"查询 → 写回 default → 复核"最多三次 su，每次最长 20s，su 本身还有
+     * 多候选路径 fallback，最坏约两分钟。start 若无限等待，用户会一直停在「准备注入…」。
+     * 超时后按"无锁继续"处理：此时 {@link #mockSessionEpoch} 已自增，回收线程在写 appop
+     * 之前会复查代次并放弃本次回收；留痕标记保证下一次彻底停止仍会重试回收。
+     */
+    private static final long MOCK_APPOP_LOCK_WAIT_MS = 1500L;
     /** 每次真正进入 root 注入准备时自增；异步回收据此判断是否已被新会话取代。 */
     private static final java.util.concurrent.atomic.AtomicLong mockSessionEpoch =
             new java.util.concurrent.atomic.AtomicLong();
@@ -135,8 +151,24 @@ public class LocationService extends Service {
     private int sessionSeq;
     /** 停止时触发一次真实定位上报（用于覆盖 passive 的系统缓存），每个 Service 实例一次。 */
     private boolean passiveRefreshStarted;
+    /**
+     * 本会话开始时定格的 {@code system_inject} 模式：<b>这一份是本会话的判定依据</b>。
+     *
+     * <p>会话已开始的接管 / 授权不会因为用户在运行中改开关而改变，停止时必须按同一份
+     * 判定收尾。旧实现停止时重读最新配置，用户在本次会话运行期间打开 system_inject，
+     * 停止路径就会跳过 appop 回收，{@code mock_appop_granted_by_app} 留痕永远清不掉、
+     * appop 永久 allow。只在主线程的 start / stop 里读写。
+     */
+    private volatile boolean sessionSystemInject;
     /** 系统级注入下"模块不在线"只提示一次，避免 10Hz 刷屏。 */
     private boolean systemModuleWarned;
+    /**
+     * 本会话是否已经提示过"部分接管"（哪些 Provider 没接管成功）。
+     *
+     * <p>每会话最多一次：这条提示只说明"部分 App 可能仍读真实定位"，不改变会话状态，
+     * 也不能跟着每次 notifyChanged / 每帧注入重复出现。在 startRoute/startSpot 重置。
+     */
+    private boolean partialTakeoverNotified;
     private PowerManager.WakeLock wakeLock;
     private Runnable ticker;
     private float accuracyMeters = 5.0f;
@@ -178,14 +210,34 @@ public class LocationService extends Service {
         final boolean ok;
         /** 仅 root 注入路径非 null；system_inject 模式恒为 null（由模块负责注入）。 */
         final TestProviderInjector injector;
+        /**
+         * 本次准备失败的原因（ok=false 时非 null）：随结果带回，不靠共享的
+         * {@code session.error} 传话——那个字段可能残留上一次会话的失败文案。
+         */
+        final String error;
+        /** 成功后仍需一次性告知用户的提示（例如部分 Provider 没接管成功），null=无需提示。 */
+        final String notice;
 
         PrepareResult(boolean ok, TestProviderInjector injector) {
-            this.ok = ok;
-            this.injector = injector;
+            this(ok, injector, null, null);
         }
 
-        static PrepareResult failed() {
-            return new PrepareResult(false, null);
+        PrepareResult(boolean ok, TestProviderInjector injector, String error, String notice) {
+            this.ok = ok;
+            this.injector = injector;
+            this.error = error;
+            this.notice = notice;
+        }
+
+        /** 失败：把原因写进会话状态，并原样带回给主线程（两者永远是同一份文案）。 */
+        static PrepareResult failed(Session session, String error) {
+            session.error = error;
+            return new PrepareResult(false, null, error, null);
+        }
+
+        /** 失败但不需要写会话状态（会话已被停止/取代，结果会被丢弃）。 */
+        static PrepareResult aborted() {
+            return new PrepareResult(false, null, null, null);
         }
     }
 
@@ -290,6 +342,11 @@ public class LocationService extends Service {
         Session session = Session.INSTANCE;
         // 新会话代次：仍在后台准备的旧会话 post 回主线程时会发现自己已经过期
         final int seq = ++sessionSeq;
+        // 定格本会话的注入方式（这一份是本会话的判定依据）：运行中用户改 system_inject
+        // 不会改变本会话已做的接管 / 授权，停止时必须按同一份判定收尾。
+        final boolean systemInject = RouteStore.loadSystemInject(this);
+        sessionSystemInject = systemInject;
+        partialTakeoverNotified = false;
         if (session.isActive()) {
             // 重新开始（例如到达终点后点「重新开始」）：只重置运行态，不要 stopSelf 把服务拆掉
             resetForRestart();
@@ -378,7 +435,7 @@ public class LocationService extends Service {
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
-            PrepareResult result = ensureMockPermissionAndPrepare(providers);
+            PrepareResult result = ensureMockPermissionAndPrepare(providers, systemInject);
             handler.post(() -> {
                 // 先判会话代次：停止（或已重新开始）之后到达的结果一律丢弃，
                 // 旧会话的失败也不能再 stopInternal 掉新会话。
@@ -387,7 +444,10 @@ public class LocationService extends Service {
                     return;
                 }
                 if (!result.ok) {
-                    stopInternal(Session.INSTANCE.error);
+                    // 失败原因只认本次 preparation 带回的那一份：绝不复用 session.error，
+                    // 那个字段可能还留着上一次会话/上一次失败的文案，会把用户引向错的原因。
+                    stopInternal(result.error != null ? result.error
+                            : "定位准备被中止，已停止");
                     return;
                 }
                 injector = result.injector;
@@ -395,6 +455,8 @@ public class LocationService extends Service {
                 Session.INSTANCE.notifyChanged();
                 startTicker();
                 updateNotification();
+                // 部分接管：明确告诉用户哪些 Provider 没成功（每会话最多一次，只提示不打断）
+                notifyPartialTakeover(result.notice);
                 // 主界面「开始」同时启动悬浮窗（有权限时），悬浮窗负责开始/暂停/保持
                 if (Settings.canDrawOverlays(this)) {
                     RouteStore.saveOverlayEnabled(this, true);
@@ -411,6 +473,10 @@ public class LocationService extends Service {
         Session session = Session.INSTANCE;
         // 新会话代次：仍在后台准备的旧会话 post 回主线程时会发现自己已经过期
         final int seq = ++sessionSeq;
+        // 定格本会话的注入方式（这一份是本会话的判定依据），理由见 startRoute
+        final boolean systemInject = RouteStore.loadSystemInject(this);
+        sessionSystemInject = systemInject;
+        partialTakeoverNotified = false;
         if (session.isActive()) {
             resetForRestart();
         }
@@ -443,7 +509,7 @@ public class LocationService extends Service {
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
-            PrepareResult result = ensureMockPermissionAndPrepare(providers);
+            PrepareResult result = ensureMockPermissionAndPrepare(providers, systemInject);
             handler.post(() -> {
                 // 先判会话代次：停止（或已重新开始）之后到达的结果一律丢弃，
                 // 旧会话的失败也不能再 stopInternal 掉新会话。
@@ -452,7 +518,10 @@ public class LocationService extends Service {
                     return;
                 }
                 if (!result.ok) {
-                    stopInternal(Session.INSTANCE.error);
+                    // 失败原因只认本次 preparation 带回的那一份：绝不复用 session.error，
+                    // 那个字段可能还留着上一次会话/上一次失败的文案，会把用户引向错的原因。
+                    stopInternal(result.error != null ? result.error
+                            : "定位准备被中止，已停止");
                     return;
                 }
                 injector = result.injector;
@@ -460,6 +529,8 @@ public class LocationService extends Service {
                 Session.INSTANCE.notifyChanged();
                 startTicker();
                 updateNotification();
+                // 部分接管：明确告诉用户哪些 Provider 没成功（每会话最多一次，只提示不打断）
+                notifyPartialTakeover(result.notice);
                 // 主界面「开始」同时启动悬浮窗（有权限时），悬浮窗负责开始/暂停/保持
                 if (Settings.canDrawOverlays(this)) {
                     RouteStore.saveOverlayEnabled(this, true);
@@ -501,14 +572,21 @@ public class LocationService extends Service {
         player.setRampSeconds(realismOn && withRamp ? 2.0 : 0.0);
     }
 
-    /** 拿 root → 授权 appops → 接管测试 Provider。 */
-    private PrepareResult ensureMockPermissionAndPrepare(List<String> providers) {
+    /**
+     * 拿 root → 授权 appops → 接管测试 Provider。
+     *
+     * @param systemInject 会话开始时定格的注入方式（见 {@link #sessionSystemInject}）：
+     *                     本次准备全程按它走，不重读开关，避免准备途中改开关导致
+     *                     "按 root 路径接管、停止时却按系统级模式收尾"的错配。
+     */
+    private PrepareResult ensureMockPermissionAndPrepare(List<String> providers,
+                                                         boolean systemInject) {
         Session session = Session.INSTANCE;
         String pkg = getPackageName();
 
         // 系统级注入：定位由模块在 system_server 改写，本进程不接管测试 Provider，
         // 也就不需要 appops / 测试 Provider（但模块本身依赖 root + LSPosed 已安装）
-        if (RouteStore.loadSystemInject(this)) {
+        if (systemInject) {
             // 不改既有判定（模块存活由 SystemInject 的读取痕迹证明），只留诊断线索：
             // 定位总开关关着时目标 App 的定位请求可能根本到不了模块，日志会表现为
             // "模块无活动"，排查时不要误以为 LSPosed 作用域没勾。
@@ -521,8 +599,8 @@ public class LocationService extends Service {
 
         if (!RootShell.isRooted()) {
             session.rootOk = false;
-            session.error = "未获得 root 权限，请确认设备已 root 并在 root 管理器中授权本应用";
-            return PrepareResult.failed();
+            return PrepareResult.failed(session,
+                    "未获得 root 权限，请确认设备已 root 并在 root 管理器中授权本应用");
         }
         session.rootOk = true;
 
@@ -532,30 +610,50 @@ public class LocationService extends Service {
         // 真实原因只是"没开定位"，不是 appop 被拒——这里直接给出可操作提示并停止，
         // 不再走接管流程，避免用户看到误导性的"接管被拒绝"。
         if (!LocationSwitch.isSystemLocationEnabled(this)) {
-            session.error = LocationSwitch.DISABLED_MSG;
             Log.w(TAG, "system location switch is off, abort before test provider takeover");
-            return PrepareResult.failed();
+            return PrepareResult.failed(session, LocationSwitch.DISABLED_MSG);
         }
 
         // 新会话：让上一次停止尚未完成的 appop 回收让位（见 revokeMockAppopIfGranted）
         final long myEpoch = mockSessionEpoch.incrementAndGet();
 
-        synchronized (MOCK_APPOP_LOCK) {
+        // start 不能无限期等 appop 锁：回收侧最坏要连跑多次 su（单次 20s + 多候选路径
+        // fallback）。这里带短超时抢锁，超时就跳过等待继续授权——代次已在上面自增，
+        // 回收线程在写 appop 前会复查代次并放弃本次回收；留痕标记也保证下一次停止重试。
+        final boolean locked = tryLockMockAppop();
+        if (!locked) {
+            Log.w(TAG, "appop revoke still holds the lock after " + MOCK_APPOP_LOCK_WAIT_MS
+                    + "ms; continue without it (revoke side re-checks the session epoch)");
+        }
+        try {
             RootShell.Result current = RootShell.getMockAppop(pkg);
             if (!RootShell.isMockAppopAllowed(current)) {
-                RootShell.Result grant = RootShell.grantMockAppop(pkg);
-                if (!grant.ok()) {
-                    session.error = "授予模拟位置权限失败：" + grant.combined();
-                    return PrepareResult.failed();
+                for (int attempt = 1; ; attempt++) {
+                    RootShell.Result grant = RootShell.grantMockAppop(pkg);
+                    if (!grant.ok()) {
+                        return PrepareResult.failed(session,
+                                "授予模拟位置权限失败：" + grant.combined());
+                    }
+                    // 留痕：这条 allow 是本应用改的，停止时只回收它；用户/系统本来就允许的
+                    // （走不到这个分支）没有标记，绝不能在停止时去动。
+                    RouteStore.saveMockAppopGrantedByApp(this);
+                    current = RootShell.getMockAppop(pkg);
+                    if (RootShell.isMockAppopAllowed(current)) {
+                        break;
+                    }
+                    // 无锁路径上回收线程可能刚好把 appop 写回 default（它已通过代次检查、
+                    // 正在那条 su 里）：再试一次授权。有锁路径不可能并发，直接按失败处理。
+                    if (locked || attempt >= 2) {
+                        return PrepareResult.failed(session,
+                                "模拟位置权限未生效（appops：" + current.combined() + "）");
+                    }
+                    Log.w(TAG, "mock_location appop lost right after grant, retry once: "
+                            + current.combined());
                 }
-                // 留痕：这条 allow 是本应用改的，停止时只回收它；用户/系统本来就允许的
-                // （走不到这个分支）没有标记，绝不能在停止时去动。
-                RouteStore.saveMockAppopGrantedByApp(this);
-                current = RootShell.getMockAppop(pkg);
-                if (!RootShell.isMockAppopAllowed(current)) {
-                    session.error = "模拟位置权限未生效（appops：" + current.combined() + "）";
-                    return PrepareResult.failed();
-                }
+            }
+        } finally {
+            if (locked) {
+                MOCK_APPOP_LOCK.unlock();
             }
         }
 
@@ -563,7 +661,9 @@ public class LocationService extends Service {
         // 测试 Provider，直接返回失败让上层 stopInternal 回收刚授出的 appop。
         if (Session.INSTANCE.mode == Session.Mode.IDLE && mockSessionEpoch.get() == myEpoch) {
             Log.i(TAG, "session stopped during prepare, abort provider takeover");
-            return PrepareResult.failed();
+            // 会话已被停止/取代：结果会被 isStalePrepare 丢弃，不要再写 session.error，
+            // 否则这条"放弃接管"的文案会粘到下一次会话的界面上。
+            return PrepareResult.aborted();
         }
 
         // 用局部变量持有 injector：后台线程不碰 injector 字段（主线程可能已在 stop 里
@@ -580,25 +680,59 @@ public class LocationService extends Service {
             if (!LocationSwitch.isSystemLocationEnabled(this)) {
                 Log.w(TAG, "take over aborted: system location switch was disabled | "
                         + detail, e);
-                session.error = LocationSwitch.DISABLED_MSG;
-                return PrepareResult.failed();
+                return PrepareResult.failed(session, LocationSwitch.DISABLED_MSG);
             }
             Log.e(TAG, "take over location provider rejected: " + detail, e);
-            session.error = "接管定位 Provider 被拒绝：" + detail;
-            return PrepareResult.failed();
+            return PrepareResult.failed(session, "接管定位 Provider 被拒绝：" + detail);
         } catch (RuntimeException e) {
             String detail = newInjector.describe();
             releaseQuietly(newInjector);
             Log.e(TAG, "take over location provider failed: " + detail + " | " + e, e);
-            session.error = "接管定位 Provider 失败：" + detail + "（" + e + "）";
-            return PrepareResult.failed();
+            return PrepareResult.failed(session,
+                    "接管定位 Provider 失败：" + detail + "（" + e + "）");
         }
         // 只要 ≥1 个 Provider 接管成功就继续：Android 12+ 上 network 常由系统融合定位
         // 持有、第三方接管被拒是常态，gps 往往仍可用，不能因此停掉整场模拟。
+        String partialNotice = null;
         if (!newInjector.getFailedProviders().isEmpty()) {
             Log.w(TAG, "test provider partially prepared: " + newInjector.describe());
+            // 仅 logcat 用户看不到：把"哪些 Provider 没接管成功 + 会导致部分 App 不生效"
+            // 带回主线程，由 notifyPartialTakeover 每会话提示一次（不停止会话）。
+            // 只放 Provider 名（异常细节已在上面进了 logcat），避免 toast 过长被截断。
+            partialNotice = "部分接管：" + String.join("、", newInjector.getFailedProviders())
+                    + " 未接管成功\n只读这些 Provider 的 App 可能仍拿到真实定位";
         }
-        return new PrepareResult(true, newInjector);
+        return new PrepareResult(true, newInjector, null, partialNotice);
+    }
+
+    /**
+     * 部分接管的一次性提示（每会话最多一次，只提示、不打断会话、不刷屏）。
+     *
+     * <p>接管是"尽力而为"：只接管到 gps 时会话照常运行，但只读 network/fused 的
+     * App 仍会拿到真实定位——过去这条信息只写在 logcat（{@code describe()}）里。
+     */
+    private void notifyPartialTakeover(String notice) {
+        if (notice == null || partialTakeoverNotified) {
+            return;
+        }
+        partialTakeoverNotified = true;
+        Log.w(TAG, "partial takeover told to user: " + notice);
+        toast(notice);
+    }
+
+    /**
+     * 带超时抢 {@link #MOCK_APPOP_LOCK}。
+     *
+     * @return true=已持有（调用方必须在 finally 里 unlock）；false=超时（<b>没有</b>持有，
+     *         不得 unlock）
+     */
+    private static boolean tryLockMockAppop() {
+        try {
+            return MOCK_APPOP_LOCK.tryLock(MOCK_APPOP_LOCK_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     /**
@@ -636,8 +770,7 @@ public class LocationService extends Service {
         // 仍无痕迹：绝不再"假成功"，走与 root 失败相同的失败路径
         Log.w(TAG, "system inject enabled but no module activity within "
                 + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS + "ms)");
-        session.error = SYSTEM_MODULE_MISSING_MSG;
-        return PrepareResult.failed();
+        return PrepareResult.failed(session, SYSTEM_MODULE_MISSING_MSG);
     }
 
     /**
@@ -1048,9 +1181,13 @@ public class LocationService extends Service {
         releaseInjector();
         // 收尾顺序不能反：removeTestProvider 本身也受 mock_location appop 检查，
         // 必须先移除测试 Provider（releaseInjector），再回收 appop。
-        // system_inject 模式不接管测试 Provider、不授 appop，也不碰这两个系统面。
-        if (!RouteStore.loadSystemInject(this)) {
-            revokeMockAppopIfGranted();
+        // 判定一律用会话开始时的定格值 sessionSystemInject，不要重读开关：
+        // 运行中改 system_inject 会改变"当前模式"，但不会改变本会话已做过的接管/授权。
+        // appop 回收只看留痕（本应用授予的那条 allow），与本会话模式无关——系统级注入
+        // 本身不授 appop，但更早会话留下的留痕同样必须回收，否则就是永久 allow。
+        revokeMockAppopIfGranted();
+        if (!sessionSystemInject) {
+            // passive 清理只针对 root 注入会话（system_inject 不接管测试 Provider）
             refreshRealFixForPassive();
         }
         hideOverlay();
@@ -1128,6 +1265,11 @@ public class LocationService extends Service {
      * 用户自己在开发者选项里选的"模拟位置应用"、或系统/上次运行留下的 allow 没有这个
      * 标记，停止时**绝不触碰**，避免越权修改用户设置。
      *
+     * <p>留痕是唯一依据，<b>与当前 system_inject 开关无关</b>：这条 allow 是本应用改的，
+     * 不管这次会话跑的是哪种注入模式，都要恢复成 default；否则运行中打开 system_inject
+     * 就会让这条记录泄漏成永久 allow（P2）。系统级注入本身不授 appop，走这里时通常
+     * 没有留痕、直接返回，不会触碰系统面。
+     *
      * <p>用 {@code appops set ... default} 而不是 {@code deny}：default 只是把这条 op
      * 恢复成"未显式设置"（mock_location 的默认态就是不允许），不额外写一条 denial；
      * 而 deny/ignore 本身就是一条用户可见的 AppOps 记录，反而会覆盖用户之后的手动授权。
@@ -1137,59 +1279,86 @@ public class LocationService extends Service {
      *
      * <p>与授权路径共用 {@link #MOCK_APPOP_LOCK}，并用 {@link #mockSessionEpoch} 判断
      * 停止后是否已开始新会话：用户点了彻底停止又立刻点开始，回收线程绝不能把新会话
-     * 刚拿到的 appop 收走。
+     * 刚拿到的 appop 收走。start 侧已改为"带超时抢锁"（见 {@link #tryLockMockAppop}），
+     * 可能不等本方法就继续授权，所以本方法在<b>每次写 appop / 清留痕之前</b>都要复查
+     * 代次，发现新会话立即放弃，不能假定自己独占。
      */
     private void revokeMockAppopIfGranted() {
-        // 系统级注入不接管测试 Provider、不授 appop：这条路径不得触碰该 appop
-        if (RouteStore.loadSystemInject(this)) {
-            return;
-        }
         if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
             return;   // 不是本应用授予的：用户/系统的设置，原样保留
         }
         final long epoch = mockSessionEpoch.get();
         final String pkg = getPackageName();
         new Thread(() -> {
-            synchronized (MOCK_APPOP_LOCK) {
-                try {
-                    if (mockSessionEpoch.get() != epoch) {
-                        // 已经重新开始模拟：权限留给新会话，由新会话停止时回收
-                        Log.i(TAG, "skip appop revoke: a newer session has started");
-                        return;
-                    }
-                    if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
-                        return;   // 另一个并发停止已经回收
-                    }
-                    RootShell.Result current = RootShell.getMockAppop(pkg);
-                    if (!current.ok()) {
-                        // su / appops 不可用：无法判断当前状态，保留留痕下次再试，
-                        // 不能凭"查不到"就当作已回收。
-                        Log.w(TAG, "query mock_location appop failed, keep grant mark: " + current);
-                        return;
-                    }
-                    if (!RootShell.isMockAppopAllowed(current)) {
-                        // 用户/系统已经改回不允许：没有要回收的 allow，只清自己的留痕
-                        RouteStore.clearMockAppopGrantedByApp(this);
-                        Log.i(TAG, "mock_location appop already not allowed, grant mark cleared");
-                        return;
-                    }
-                    RootShell.Result revoke = RootShell.revokeMockAppop(pkg);
-                    if (!revoke.ok()) {
-                        Log.w(TAG, "revoke mock_location appop failed: " + revoke);
-                        return;   // 保留标记，下次彻底停止再试
-                    }
-                    RootShell.Result after = RootShell.getMockAppop(pkg);
-                    if (!after.ok() || RootShell.isMockAppopAllowed(after)) {
-                        Log.w(TAG, "mock_location appop still allowed after revoke: " + after);
-                        return;   // 保留标记，下次彻底停止再试
-                    }
-                    RouteStore.clearMockAppopGrantedByApp(this);
-                    Log.i(TAG, "revoked mock_location appop granted by this app");
-                } catch (Throwable t) {
-                    Log.w(TAG, "revoke mock_location appop failed", t);
-                }
+            MOCK_APPOP_LOCK.lock();
+            try {
+                revokeMockAppopLocked(epoch, pkg);
+            } catch (Throwable t) {
+                Log.w(TAG, "revoke mock_location appop failed", t);
+            } finally {
+                MOCK_APPOP_LOCK.unlock();
             }
         }, "vloc-appop-revoke").start();
+    }
+
+    /**
+     * {@link #revokeMockAppopIfGranted} 的持锁主体。
+     *
+     * <p>成功才清留痕；su 失败、复核仍为 allow、或期间开始了新会话都保留留痕，
+     * 由下一次彻底停止重试，绝不把"没确认回收"当成已回收。
+     *
+     * <p>持锁期间只做 su 与 SharedPreferences 读写（锁顺序与授权路径一致：先
+     * {@link #MOCK_APPOP_LOCK}、后 prefs 内部锁），不获取本类其他锁，不构成环路。
+     */
+    private void revokeMockAppopLocked(long epoch, String pkg) {
+        if (isAppopRevokeSuperseded(epoch)) {
+            // 已经重新开始模拟：权限留给新会话，由新会话停止时回收
+            Log.i(TAG, "skip appop revoke: a newer session has started");
+            return;
+        }
+        if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
+            return;   // 另一个并发停止已经回收
+        }
+        RootShell.Result current = RootShell.getMockAppop(pkg);
+        if (isAppopRevokeSuperseded(epoch)) {
+            // 查询期间新会话已经开始（它可能刚授出 allow）：不要再写 appop
+            Log.i(TAG, "skip appop revoke: a newer session started during query");
+            return;
+        }
+        if (!current.ok()) {
+            // su / appops 不可用：无法判断当前状态，保留留痕下次再试，
+            // 不能凭"查不到"就当作已回收。
+            Log.w(TAG, "query mock_location appop failed, keep grant mark: " + current);
+            return;
+        }
+        if (!RootShell.isMockAppopAllowed(current)) {
+            // 用户/系统已经改回不允许：没有要回收的 allow，只清自己的留痕
+            RouteStore.clearMockAppopGrantedByApp(this);
+            Log.i(TAG, "mock_location appop already not allowed, grant mark cleared");
+            return;
+        }
+        RootShell.Result revoke = RootShell.revokeMockAppop(pkg);
+        if (!revoke.ok()) {
+            Log.w(TAG, "revoke mock_location appop failed: " + revoke);
+            return;   // 保留标记，下次彻底停止再试
+        }
+        RootShell.Result after = RootShell.getMockAppop(pkg);
+        if (isAppopRevokeSuperseded(epoch)) {
+            // 复核期间新会话可能刚好重新授权：留痕不清，交给下一次停止核对
+            Log.i(TAG, "keep grant mark: a newer session started during revoke");
+            return;
+        }
+        if (!after.ok() || RootShell.isMockAppopAllowed(after)) {
+            Log.w(TAG, "mock_location appop still allowed after revoke: " + after);
+            return;   // 保留标记，下次彻底停止再试
+        }
+        RouteStore.clearMockAppopGrantedByApp(this);
+        Log.i(TAG, "revoked mock_location appop granted by this app");
+    }
+
+    /** 回收线程：本次停止之后是否已经开始了新会话（新会话可能正在/已经重新授权 appop）。 */
+    private static boolean isAppopRevokeSuperseded(long epoch) {
+        return mockSessionEpoch.get() != epoch;
     }
 
     /**
