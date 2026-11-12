@@ -295,6 +295,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     new XC_MethodReplacement() {
                         @Override
                         protected Object replaceHookedMethod(MethodHookParam param) {
+                            // 心跳补试（极轻量：两次 volatile 读，未成功且距上次 >2s 才真的去 insert）：
+                            // 开机早期主 App 未就绪导致首次心跳失败时，靠这里在既有回调里补上，
+                            // 不需要常驻线程或轮询，见 HookHeartbeat#retryIfPending。
+                            HookHeartbeat.retryIfPending();
                             return Boolean.FALSE;
                         }
                     });
@@ -361,6 +365,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
+                        // 心跳补试（与 isFromMockProvider 里同一入口，开销仅为两次 volatile 读）：
+                        // 目标 App 读 Location 时顺手补一次开机早期失败的心跳。
+                        HookHeartbeat.retryIfPending();
                         final Object result = param.getResult();
                         if (!(result instanceof Bundle)) {
                             return; // null 或非 Bundle：保持原样
