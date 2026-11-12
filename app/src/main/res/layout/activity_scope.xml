@@ -43,7 +43,7 @@
         android:paddingStart="14dp"
         android:paddingTop="3dp"
         android:paddingEnd="14dp"
-        android:text="注意：作用域只对「系统级注入」生效。root / 测试 Provider 模式下系统位置由本应用全局改写，无法按应用隔离。"
+        android:text="注意：作用域只对「系统级注入」生效。root / 测试 Provider 模式下系统位置由本应用全局改写，无法按应用隔离。部分 ROM（定位经 com.android.location.fused 中转）在系统层无法识别最终应用，此时会退化为全局生效，并在模块日志中提示。"
         android:textColor="@color/text_secondary"
         android:textSize="11sp" />
 

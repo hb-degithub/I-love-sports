@@ -4,7 +4,9 @@ import android.content.Context;
 import android.location.GnssStatus;
 import android.location.Location;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.IInterface;
+import android.os.Process;
 import android.os.SystemClock;
 
 import org.json.JSONArray;
@@ -40,9 +42,15 @@ import de.robv.android.xposed.XposedHelpers;
  *
  * <p><b>作用域（目标应用）</b>：主 App 开启「仅对选定应用生效」后，系统层也不再无差别改写：
  * <ul>
- *   <li>投递链：注册时把 <b>transport / listener binder → 包名</b>记进表，投递时从
- *       {@code param.thisObject} 反查接收方，不在名单就不改写（见 {@link #REGISTRATION_HOOK}、{@link #LOCATION_HOOK}）；</li>
+ *   <li>投递链：注册时把 <b>transport / listener binder → 接收方身份（包名 + uid）</b>记进表，
+ *       投递时从 {@code param.thisObject} 反查接收方，不在名单就不改写
+ *       （见 {@link #REGISTRATION_HOOK}、{@link #LOCATION_HOOK}）；</li>
  *   <li>同步方法（{@code getLastLocation}）：用 {@code Binder.getCallingUid()} 反查调用方包名；</li>
+ *   <li><b>系统/框架身份不按名单过滤</b>：接收方是 {@code android}、
+ *       {@code com.android.location.fused}、{@code com.android.providers.*}，或 uid 为
+ *       {@link Process#SYSTEM_UID} 时，system_server 侧看到的不是最终 App（本 ROM 的定位经
+ *       {@code com.android.location.fused} 中转），按名单过滤必然全挡，因此<b>退化为全局生效</b>
+ *       并每进程记一条日志；</li>
  *   <li>查不到接收方 → 按契约“保持现状”（全局生效）并每个进程记一次日志；</li>
  *   <li>GNSS 卫星表（{@code onReportSvStatus}）没有接收方信息，<b>保持全局生效</b>。</li>
  * </ul>
@@ -99,15 +107,15 @@ final class SystemHooks {
     };
 
     /**
-     * 投递目标 transport 实例 → 接收方包名：<b>注册时写入，投递时查表</b>。
+     * 投递目标 transport 实例 → 接收方身份（包名 + uid）：<b>注册时写入，投递时查表</b>。
      * 用弱键，注册被移除后自然回收，不会在 system_server 里长期堆积。
      */
-    private static final Map<Object, String> sTransportPackages =
-            Collections.synchronizedMap(new WeakHashMap<Object, String>());
+    private static final Map<Object, Target> sTransportTargets =
+            Collections.synchronizedMap(new WeakHashMap<Object, Target>());
 
-    /** ILocationListener binder → 接收方包名（transport 查不到时的兜底路径）。 */
-    private static final Map<Object, String> sBinderPackages =
-            Collections.synchronizedMap(new WeakHashMap<Object, String>());
+    /** ILocationListener binder → 接收方身份（transport 查不到时的兜底路径）。 */
+    private static final Map<Object, Target> sBinderTargets =
+            Collections.synchronizedMap(new WeakHashMap<Object, Target>());
 
     private static volatile Class<?> sManagerClass;
     private static volatile Class<?> sIdentityClass;
@@ -123,6 +131,10 @@ final class SystemHooks {
 
     private static volatile boolean sLoggedFirstScopeSkip;
     private static volatile boolean sLoggedFirstCallerSkip;
+    /** 每进程只记一次：系统/框架身份无法按应用隔离，已降级为全局生效。 */
+    private static volatile boolean sLoggedSystemIdentity;
+
+    private static final String[] EMPTY_PACKAGES = new String[0];
 
     private SystemHooks() {
     }
@@ -164,11 +176,61 @@ final class SystemHooks {
         boolean hasEphemeris;
     }
 
+    /**
+     * 注册时记下的接收方身份：包名 + uid（任意一项解析不到时为 {@code null} / {@code -1}）。
+     *
+     * <p>为什么连 uid 一起记：部分 ROM 的定位投递经 {@code com.android.location.fused} 中转，
+     * {@code CallerIdentity} 里只有系统身份，而 uid 在注册那一刻就能拿到，投递时不必再反查。
+     */
+    private static final class Target {
+        /** 反查到的包名；null = 解析不到。 */
+        final String pkg;
+        /** 反查到的 uid；-1 = 解析不到。 */
+        final int uid;
+
+        Target(String pkg, int uid) {
+            this.pkg = pkg;
+            this.uid = uid;
+        }
+
+        /**
+         * 系统/框架身份：system_server 侧看到的不是最终接收 App，按名单过滤必然全挡，
+         * 只能退化为全局生效（见类注释「作用域」）。
+         */
+        boolean isSystem() {
+            return uid == Process.SYSTEM_UID || isSystemPackage(pkg);
+        }
+
+        /** 日志用：包名优先，其次 uid。 */
+        String describe() {
+            if (pkg != null) {
+                return pkg;
+            }
+            return uid > 0 ? "uid " + uid : "<unknown>";
+        }
+    }
+
+    /** 反查不到接收方时的占位：包名 null + uid -1 → 交给 TargetScope 的“解析不到 → 放行”契约。 */
+    private static final Target UNKNOWN_TARGET = new Target(null, -1);
+
+    /**
+     * 系统/框架包名：{@code android}、{@code com.android.location.fused}、
+     * {@code com.android.providers.*}。
+     *
+     * <p>这些包在 system_server 侧代表不了最终 App（本 ROM 的定位投递经 fused 中转，
+     * 反查到的身份是 {@code android}），因此不能按用户名单过滤。
+     */
+    private static boolean isSystemPackage(String pkg) {
+        return pkg != null && ("android".equals(pkg)
+                || "com.android.location.fused".equals(pkg)
+                || pkg.startsWith("com.android.providers."));
+    }
+
     // ================================================================== 安装
 
     static int install(ClassLoader classLoader) {
         int hooked = 0;
-        // 先建「注册者 → 包名」映射，投递 hook 才能查到接收方
+        // 先建「注册者 → 接收方身份（包名 + uid）」映射，投递 hook 才能查到接收方
         hooked += hookRegistrationTargets(classLoader);
         hooked += hookLocationDelivery(classLoader);
         hooked += hookLastLocation(classLoader);
@@ -302,7 +364,7 @@ final class SystemHooks {
         return false;
     }
 
-    /** 注册时：从参数里认出 CallerIdentity + LocationTransport，绑定 transport / binder → 包名。 */
+    /** 注册时：从参数里认出 CallerIdentity + LocationTransport，绑定 transport / binder → 接收方身份。 */
     private static final XC_MethodHook REGISTRATION_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
@@ -327,14 +389,14 @@ final class SystemHooks {
                 if (identity == null || transport == null) {
                     return;
                 }
-                final String pkg = packageOf(identity);
-                if (pkg == null) {
+                final Target target = targetOf(identity);
+                if (target == null) {
                     return;
                 }
-                sTransportPackages.put(transport, pkg);
+                sTransportTargets.put(transport, target);
                 final Object binder = binderOf(listenerOf(transport));
                 if (binder != null) {
-                    sBinderPackages.put(binder, pkg);
+                    sBinderTargets.put(binder, target);
                 }
             } catch (Throwable ignored) {
                 // 绝不能因为这里异常影响系统注册流程
@@ -367,19 +429,26 @@ final class SystemHooks {
                 if (identity == null || listener == null) {
                     return;
                 }
-                final String pkg = packageOf(identity);
-                if (pkg == null) {
+                final Target target = targetOf(identity);
+                if (target == null) {
                     return;
                 }
                 final Object binder = binderOf(listener);
                 if (binder != null) {
-                    sBinderPackages.put(binder, pkg);
+                    sBinderTargets.put(binder, target);
                 }
             } catch (Throwable ignored) {
                 // ignore
             }
         }
     };
+
+    /** CallerIdentity → 接收方身份；包名和 uid 都拿不到时返回 null（投递时按“解析不到”放行）。 */
+    private static Target targetOf(Object identity) {
+        final String pkg = packageOf(identity);
+        final int uid = uidOf(identity);
+        return pkg == null && uid < 0 ? null : new Target(pkg, uid);
+    }
 
     /** CallerIdentity#getPackageName()（d2.txt:40e5d4 实测调用点）。 */
     private static String packageOf(Object identity) {
@@ -393,6 +462,19 @@ final class SystemHooks {
             // ignore
         }
         return null;
+    }
+
+    /** CallerIdentity#getUid()（@SystemApi）；解析不到返回 -1。 */
+    private static int uidOf(Object identity) {
+        try {
+            final Object value = XposedHelpers.callMethod(identity, "getUid");
+            if (value instanceof Integer) {
+                return (Integer) value;
+            }
+        } catch (Throwable ignored) {
+            // 老版本 / 方法改名：uid 未知，退回按包名判定
+        }
+        return -1;
     }
 
     /**
@@ -439,13 +521,16 @@ final class SystemHooks {
         }
     }
 
-    /** 投递侧反查接收方包名；null = 无法判定（调用方按“全局生效”处理并记一次日志）。 */
-    private static String resolveTargetPackage(Object transport) {
+    /**
+     * 投递侧反查接收方身份；查不到返回 {@link #UNKNOWN_TARGET}
+     * （调用方按 TargetScope 的契约“解析不到 → 放行”处理）。
+     */
+    private static Target resolveTarget(Object transport) {
         if (transport == null) {
-            return null;
+            return UNKNOWN_TARGET;
         }
         try {
-            final String direct = sTransportPackages.get(transport);
+            final Target direct = sTransportTargets.get(transport);
             if (direct != null) {
                 return direct;
             }
@@ -454,13 +539,71 @@ final class SystemHooks {
         }
         final Object binder = binderOf(listenerOf(transport));
         if (binder == null) {
-            return null;
+            return UNKNOWN_TARGET;
         }
         try {
-            return sBinderPackages.get(binder);
+            final Target target = sBinderTargets.get(binder);
+            return target != null ? target : UNKNOWN_TARGET;
         } catch (Throwable ignored) {
-            return null;
+            return UNKNOWN_TARGET;
         }
+    }
+
+    /**
+     * 调用方（{@code Binder.getCallingUid()}）若是系统/框架身份，返回用于日志的包名；
+     * 能确定是第三方应用时返回 null。
+     *
+     * <p>uid 1000 = system_server / {@code android} / {@code com.android.location.fused} /
+     * {@code com.android.providers.*}：这些身份代表不了最终 App，按名单过滤必然误杀。
+     */
+    private static String systemCallerPackage() {
+        final int uid;
+        try {
+            uid = Binder.getCallingUid();
+        } catch (Throwable ignored) {
+            return "unknown uid";   // 非 binder 线程：TargetScope 本来也会放行，这里兜底
+        }
+        if (uid <= 0) {
+            return "unknown uid";
+        }
+        if (uid == Process.SYSTEM_UID) {
+            return "android";
+        }
+        for (String pkg : packagesForUid(uid)) {
+            if (isSystemPackage(pkg)) {
+                return pkg;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * uid → 包名。system_server 里 {@code Context#getPackageManager()} 背后的 IPackageManager
+     * 是进程内对象（不走 binder），这里用公开 API 避免反射；只在名单未命中时调用一次。
+     */
+    private static String[] packagesForUid(int uid) {
+        try {
+            final Context context = systemContext();
+            if (context != null) {
+                final String[] packages = context.getPackageManager().getPackagesForUid(uid);
+                if (packages != null) {
+                    return packages;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 解析失败：按“不是系统身份”处理，仍交给 TargetScope 的名单判定
+        }
+        return EMPTY_PACKAGES;
+    }
+
+    /** 每进程只记一次：系统/框架身份无法按应用隔离，已降级为全局生效。 */
+    private static void logSystemIdentityOnce(String pkg) {
+        if (sLoggedSystemIdentity) {
+            return;
+        }
+        sLoggedSystemIdentity = true;
+        log("target scope: system caller (" + pkg + "), applying globally "
+                + "(ROM routes location via fused)");
     }
 
     // ================================================================== 定位下发
@@ -541,8 +684,10 @@ final class SystemHooks {
     /**
      * 替换投递给 App 的 Location / LocationResult；未在模拟时不改动。
      *
-     * <p>作用域门控：先用 {@code param.thisObject}（本次投递的 transport 实例）反查接收方包名，
-     * 只有名单里的应用才改写；查不到包名时按“保持现状”放行，每个进程只记一次日志。
+     * <p>作用域门控：先用 {@code param.thisObject}（本次投递的 transport 实例）反查接收方身份，
+     * 只有名单里的应用才改写；<b>系统/框架身份（uid 1000 / android / fused / providers.*）不按名单
+     * 过滤</b>，因为这类身份代表不了最终 App（见类注释）；查不到包名时按“保持现状”放行，
+     * 每个进程只记一次日志。
      */
     private static final XC_MethodHook LOCATION_HOOK = new XC_MethodHook() {
         @Override
@@ -550,11 +695,17 @@ final class SystemHooks {
             try {
                 if (TargetScope.isScoped()) {
                     // 只在开启「仅对选定应用生效」时才反查接收方（关闭时保持旧行为、零额外开销）
-                    final String target = resolveTargetPackage(param.thisObject);
-                    if (!TargetScope.allowsDelivery(target)) {
+                    final Target target = resolveTarget(param.thisObject);
+                    if (target.isSystem()) {
+                        // 系统/框架身份：本 ROM 的定位经 com.android.location.fused 中转，
+                        // system_server 侧只能看到“系统”，按名单过滤必然全挡 → 降级为全局生效
+                        logSystemIdentityOnce(target.describe());
+                    } else if (!TargetScope.allowsDelivery(target.pkg)) {
+                        // 能确定是第三方应用包名 → 仍然按名单过滤
+                        // （解析不到包名时 allowsDelivery 按契约放行，并自带一条每进程日志）
                         if (!sLoggedFirstScopeSkip) {
                             sLoggedFirstScopeSkip = true;
-                            log("skip delivery: " + target + " not in scope");
+                            log("skip delivery: " + target.pkg + " not in scope");
                         }
                         return;   // 不改写，让原逻辑继续（App 收到真实定位）
                     }
@@ -614,11 +765,18 @@ final class SystemHooks {
                                     // 作用域门控：这类同步方法没有 transport 可查，
                                     // 用 Binder.getCallingUid() 反查调用方包名（见 TargetScope）。
                                     if (!TargetScope.allowsCaller()) {
-                                        if (!sLoggedFirstCallerSkip) {
-                                            sLoggedFirstCallerSkip = true;
-                                            log("skip getLastLocation: caller not in scope");
+                                        // 名单未命中 → 再确认是不是系统/框架身份（uid 1000 /
+                                        // android / fused / providers.*）：这类身份代表不了最终
+                                        // App，按名单过滤必然误杀，按契约退化为全局生效。
+                                        final String systemCaller = systemCallerPackage();
+                                        if (systemCaller == null) {
+                                            if (!sLoggedFirstCallerSkip) {
+                                                sLoggedFirstCallerSkip = true;
+                                                log("skip getLastLocation: caller not in scope");
+                                            }
+                                            return;
                                         }
-                                        return;
+                                        logSystemIdentityOnce(systemCaller);
                                     }
                                     final Snapshot snapshot = currentLocation();
                                     if (snapshot == null) {
