@@ -14,6 +14,7 @@ import org.json.JSONObject;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,8 +38,12 @@ import de.robv.android.xposed.XposedHelpers;
  *   <li>默认所有 App 都生效，不需要逐个勾选作用域；</li>
  *   <li>Location 由我们自己 new 出来，<b>不带 mock 标记</b>，所以 isMock/isFromMockProvider
  *       天然为 false，也不再需要 appops 授权；</li>
- *   <li>数据来源：主 App 的 ContentProvider
- *       {@code content://com.vloc.motion.env/location}（定位）与 {@code /gnss}（卫星）。</li>
+ *   <li>数据来源（<b>套接字优先</b>）：主 App 的 Unix 抽象套接字
+ *       {@code com.vloc.motion.snapshot}（{@link SnapshotClient}），请求 {@code LOC} / {@code GNSS}；
+ *       失败才回退 ContentProvider {@code content://com.vloc.motion.env/location}（定位）与
+ *       {@code /gnss}（卫星）——Android 17 的 system_server（uid 1000）读 Provider 会抛
+ *       {@code SecurityException}（{@code Isolated process not allowed to call getContentProvider}），
+ *       所以 Provider 只作为老版本主 App 的兜底。</li>
  * </ul>
  *
  * <p><b>作用域（目标应用）</b>：主 App 开启「仅对选定应用生效」后，系统层也不再无差别改写：
@@ -59,8 +64,8 @@ import de.robv.android.xposed.XposedHelpers;
  * <p>计步 / IMU / 摄像头<b>不在此处</b>：传感器事件由 native SensorService 分发、
  * 相机在 HAL/相机服务层，Java 层拦不到系统级，仍然走目标进程内 Hook。
  *
- * <p>安全约束：所有 hook 独立 try/catch；读 Provider 失败 / 未在模拟时一律透传真实定位，
- * 绝不阻断系统服务。
+ * <p>安全约束：所有 hook 独立 try/catch；套接字 / Provider 都读不到、或未在模拟时一律透传真实定位，
+ * 绝不阻断系统服务（套接字总超时 ≤300ms、带缓存，见 {@link #currentLocation()}）。
  */
 final class SystemHooks {
 
@@ -69,7 +74,7 @@ final class SystemHooks {
     private static final String LOCATION_URI = "content://com.vloc.motion.env/location";
     private static final String GNSS_URI = "content://com.vloc.motion.env/gnss";
 
-    /** 定位快照缓存：Pro**vider 读取有 binder 开销，缓存 120ms 足够跟上 10Hz 注入。 */
+    /** 定位快照缓存：异常走套接字 / Provider 有 IPC 开销，缓存 120ms 足够跟上 10Hz 注入。 */
     private static final long LOCATION_CACHE_MS = 120L;
     private static final long GNSS_CACHE_MS = 900L;
 
@@ -769,6 +774,23 @@ final class SystemHooks {
         return total;
     }
 
+    // ============================================================== 替换诊断（每进程每类一条）
+
+    /*
+     * 替换有没有生效，日志必须自己说清楚，绝不再被 catch 吞掉：
+     *   replace skipped: arg type unknown: <类名>                     ← 参数既不是 Location 也不是 LocationResult
+     *   replace failed: <异常类名> at <方法名> (<message 首行>) ...    ← 反射 / setter 失败，附前 3 层堆栈
+     *   system location replaced: lat,lon (argType=..., items=N)      ← 只有真的改写了 N 个 Location 才打
+     * 投递是 10Hz 高频路径，所以每进程每类只打一条（sLoggedReplaceNotes 去重），绝不刷屏。
+     */
+    private static final Set<String> sLoggedReplaceNotes =
+            Collections.synchronizedSet(new LinkedHashSet<String>());
+
+    /** LocationResult 取列表的反射句柄缓存：Method / Field / Method[]{size,get} / NO_LOCATIONS_ACCESSOR。 */
+    private static final Map<Class<?>, Object> sLocationsAccessors =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, Object>());
+    private static final Object NO_LOCATIONS_ACCESSOR = new Object();
+
     /**
      * 替换投递给 App 的 Location / LocationResult；未在模拟时不改动。
      *
@@ -776,6 +798,13 @@ final class SystemHooks {
      * 只有名单里的应用才改写；<b>系统/框架身份（uid 1000 / android / fused / providers.*）不按名单
      * 过滤</b>，因为这类身份代表不了最终 App（见类注释）；查不到包名时按“保持现状”放行，
      * 每个进程只记一次日志。
+     *
+     * <p>替换策略：<b>原地改写</b>参数里的 Location 字段（{@code LocationResult} 交给
+     * {@link #replaceLocationResult} 逐个 Location 改，不新建对象）。Android 17 的
+     * {@code LocationListenerTransport#deliverOnLocationChanged} 是在 hook 之后才调用
+     * {@code LocationResult.asList()} / {@code getLastLocation()} 取位置再下发
+     * （d2.txt:409570、4098d2），所以改同一批 Location 对象对投递必然可见；反射新建
+     * LocationResult 只作为“取不到列表”时的兜底，并且成功/失败都会留下日志。
      */
     private static final XC_MethodHook LOCATION_HOOK = new XC_MethodHook() {
         @Override
@@ -809,26 +838,53 @@ final class SystemHooks {
                 if (param.args == null) {
                     return;
                 }
+                final String methodName = methodNameOf(param);
+                String argType = null;
+                int replacedArgs = 0;
+                int replacedItems = 0;
                 for (int i = 0; i < param.args.length; i++) {
                     final Object arg = param.args[i];
-                    if (arg instanceof Location) {
-                        param.args[i] = buildLocation(snapshot, ((Location) arg).getProvider());
-                    } else if (isLocationResult(arg)) {
-                        // LocationResult 是 @SystemApi（不在公开 SDK 里），只能反射构造
-                        final List<Location> list = new ArrayList<>();
-                        list.add(buildLocation(snapshot, "gps"));
-                        final Object replaced = createLocationResult(list);
-                        if (replaced != null) {
-                            param.args[i] = replaced;
+                    if (arg == null) {
+                        continue;
+                    }
+                    try {
+                        if (arg instanceof Location) {
+                            // 参数是 Location：原地改字段（不新建对象，provider / mock 标记都留在原对象上）
+                            if (applySnapshot((Location) arg, snapshot, methodName)) {
+                                replacedArgs++;
+                                replacedItems++;
+                                argType = "Location";
+                            }
+                        } else if (isLocationResult(arg)) {
+                            // 参数是 LocationResult：优先原地改里面每个 Location，避免反射新建对象
+                            final Replace replace = replaceLocationResult(arg, snapshot, methodName);
+                            if (replace.items > 0) {
+                                if (replace.arg != null) {
+                                    // 只有“取不到列表 → 新建 LocationResult”这一兜底才需要写回参数
+                                    param.args[i] = replace.arg;
+                                }
+                                replacedArgs++;
+                                replacedItems += replace.items;
+                                argType = replace.argType;
+                            }
+                        } else {
+                            // 不是定位载体（如 A17 签名里的 IRemoteCallback）：每进程一行，别让它静默
+                            logReplaceSkippedOnce(arg.getClass().getName());
                         }
+                    } catch (Throwable t) {
+                        // 单个参数失败不牵连其它参数，但必须留下可见诊断
+                        logReplaceFailureOnce(argTypeName(arg), methodName, t);
                     }
                 }
-                if (!sLoggedFirstReplace) {
+                if (replacedArgs > 0 && !sLoggedFirstReplace) {
                     sLoggedFirstReplace = true;
-                    log("system location replaced: " + snapshot.lat + "," + snapshot.lon);
+                    log("system location replaced: " + snapshot.lat + "," + snapshot.lon
+                            + " (argType=" + (argType == null ? "?" : argType)
+                            + ", items=" + replacedItems + ")");
                 }
             } catch (Throwable t) {
-                // 出错就透传真实定位
+                // 出错就透传真实定位 —— 但先让失败可见（每进程每类一次）
+                logReplaceFailureOnce("hook", methodNameOf(param), t);
             }
         }
     };
@@ -921,25 +977,481 @@ final class SystemHooks {
         return 0;   // 不单独计数，避免日志夸大
     }
 
-    /** 判断参数是否是 android.location.LocationResult（@SystemApi，不能用 instanceof）。 */
+    // ============================================================== LocationResult 原地替换
+
+    /** 判断参数是否是 android.location.LocationResult（@SystemApi，不能用 instanceof）；子类也认。 */
     private static boolean isLocationResult(Object arg) {
-        return arg != null && "android.location.LocationResult".equals(arg.getClass().getName());
+        if (arg == null) {
+            return false;
+        }
+        for (Class<?> c = arg.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            if ("android.location.LocationResult".equals(c.getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    /** 反射构造 LocationResult：SDK 37 为 {@code create(Location...)}，旧版本为 {@code create(List)}。 */
-    private static Object createLocationResult(List<Location> locations) {
+    /** 一次参数替换的结果。 */
+    private static final class Replace {
+        /** 实际改写的 Location 个数；0 = 没改成。 */
+        final int items;
+        /** 日志里的 argType（Location / LocationResult）。 */
+        final String argType;
+        /** 要写回 param.args[i] 的新对象；null = 原地改好了，不必写回。 */
+        final Object arg;
+
+        Replace(int items, String argType, Object arg) {
+            this.items = items;
+            this.argType = argType;
+            this.arg = arg;
+        }
+    }
+
+    private static final Replace NO_REPLACE = new Replace(0, null, null);
+
+    /**
+     * 替换 LocationResult：<b>先原地改里面每个 Location 的字段</b>，不新建 LocationResult。
+     *
+     * <p>只有列表取不到 / 是深拷贝（改完再读还是旧值）才退回“反射新建 LocationResult”的旧方案，
+     * 并且失败原因一定通过 {@code replace failed: ...} 留痕（每条每进程一次）。
+     *
+     * @return items&gt;0 表示成功；arg 非 null 时要写回 {@code param.args[i]}
+     */
+    private static Replace replaceLocationResult(Object result, Snapshot snapshot, String methodName) {
+        List<Location> locations = null;
         try {
-            final Class<?> clazz = Class.forName("android.location.LocationResult");
-            final Location[] array = locations.toArray(new Location[0]);
-            try {
-                // Android 14+（含 SDK 37 真机 dexdump：create:([Landroid/location/Location;)）
-                return XposedHelpers.callStaticMethod(clazz, "create", (Object) array);
-            } catch (Throwable notVarargs) {
-                // Android 12/13：create(List<Location>)
-                return XposedHelpers.callStaticMethod(clazz, "create", locations);
-            }
+            locations = locationsOf(result);
         } catch (Throwable t) {
-            return null;
+            // 取列表失败：可见 + 仍然尝试新建兜底
+            logReplaceFailureOnce("LocationResult", methodName, t);
+        }
+        int items = 0;
+        if (locations != null) {
+            for (Location location : locations) {
+                if (location == null) {
+                    continue;
+                }
+                if (applySnapshot(location, snapshot, methodName)) {
+                    items++;
+                }
+            }
+        }
+        if (items > 0) {
+            if (isSnapshotVisible(result, snapshot)) {
+                return new Replace(items, "LocationResult", null);
+            }
+            // 改完再读还是旧值：getLocations/asList 返回的是深拷贝，原地改对投递不可见
+            logReplaceFailureOnce("LocationResult", methodName, new IllegalStateException(
+                    "in-place update not visible on re-read (items=" + items + ")"));
+            items = 0;
+        }
+        // 兜底：新建一个 LocationResult 塞回参数（A17 上 create/wrap 是否可用不假设）
+        final List<Location> fresh = new ArrayList<>(1);
+        fresh.add(buildLocation(snapshot, "gps"));
+        try {
+            final Object rebuilt = createLocationResult(fresh);
+            return rebuilt == null ? NO_REPLACE : new Replace(1, "LocationResult", rebuilt);
+        } catch (Throwable t) {
+            logReplaceFailureOnce("LocationResult", methodName, t);
+            return NO_REPLACE;
+        }
+    }
+
+    /**
+     * 原地改写一个 Location 的位置字段（<b>不新建对象</b>）。
+     *
+     * <p>只动公开 setter：provider / mock 标记 / 对象身份都保留，投递链路后续无论怎么读都拿到新值。
+     * setter 失败不再静默，统一走 {@code replace failed: ...}。
+     *
+     * @return true = 位置本体（经纬度等）已改写；false = 本体没改成（调用方走新建兜底）
+     */
+    private static boolean applySnapshot(Location location, Snapshot snapshot, String methodName) {
+        final float accuracy = snapshot.accuracy > 0 ? snapshot.accuracy : 5f;
+        try {
+            location.setLatitude(snapshot.lat);
+            location.setLongitude(snapshot.lon);
+            location.setAltitude(snapshot.alt);
+            location.setTime(System.currentTimeMillis());
+            location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            location.setAccuracy(accuracy);
+            location.setSpeed(snapshot.speed);
+            location.setBearing(snapshot.bearing);
+        } catch (Throwable t) {
+            logReplaceFailureOnce("Location.core", methodName, t);
+            return false;
+        }
+        try {
+            location.setVerticalAccuracyMeters(Math.max(1f, accuracy * 1.6f));
+            location.setSpeedAccuracyMetersPerSecond(Math.max(0.2f, snapshot.speed * 0.05f));
+            location.setBearingAccuracyDegrees(3f);
+        } catch (Throwable t) {
+            // 精度三项只是附属信息：失败不影响位置本体，但同样要可见
+            logReplaceFailureOnce("Location.accuracy", methodName, t);
+        }
+        applySatellitesExtra(location, snapshot.satellites, methodName);
+        return true;
+    }
+
+    /** 保留 satellites extras（与主 App 快照一致）：合并而不是覆盖原有 extras。 */
+    private static void applySatellitesExtra(Location location, int satellites, String methodName) {
+        if (satellites <= 0) {
+            return;
+        }
+        try {
+            final android.os.Bundle existing = location.getExtras();
+            final android.os.Bundle extras =
+                    existing == null ? new android.os.Bundle() : new android.os.Bundle(existing);
+            extras.putInt("satellites", satellites);
+            location.setExtras(extras);
+        } catch (Throwable t) {
+            // 位置本体已经改好，extras 只影响卫星数显示 → 记一条即可
+            logReplaceFailureOnce("Location.extras", methodName, t);
+        }
+    }
+
+    /**
+     * 反射取 LocationResult 里的 {@code List<Location>}（元素一律用 {@code instanceof Location} 判定）。
+     *
+     * <p>Android 17 真机 dexdump（services.jar/classes2.dex）实测的取法是
+     * {@code LocationResult.asList:()Ljava/util/List;}、{@code get:(I)}、{@code size:()}，
+     * <b>没有</b> {@code getLocations()} 的引用。所以按四级兜底：
+     * <ol>
+     *   <li>{@code getLocations()}：Android 7~14 的 @SystemApi；</li>
+     *   <li>{@code getDeclaredMethods()} 里名字包含 {@code getLocations} 的无参方法（OEM 改名）；</li>
+     *   <li>{@code asList()}：Android 17 的取列表方法；</li>
+     *   <li>{@code mLocations} 字段，或 {@code size() + get(int)} 逐项取。</li>
+     * </ol>
+     *
+     * @throws Throwable 取不到 / 不是 {@code List<Location>}；调用方负责记录可见日志并走新建兜底
+     */
+    private static List<Location> locationsOf(Object result) throws Throwable {
+        if (result == null) {
+            throw new IllegalStateException("LocationResult is null");
+        }
+        final Class<?> clazz = result.getClass();
+        final Object accessor = resolveLocationsAccessor(clazz);
+        if (accessor == null) {
+            throw new IllegalStateException("no list accessor on " + clazz.getName());
+        }
+        if (accessor instanceof Method) {
+            return toLocationList(invokeAccessor((Method) accessor, result), clazz);
+        }
+        if (accessor instanceof Field) {
+            try {
+                return toLocationList(((Field) accessor).get(result), clazz);
+            } catch (Throwable t) {
+                throw unwrapReflective(t);
+            }
+        }
+        // Method[]{size(), get(int)}：A17 的最后兜底
+        final Method[] pair = (Method[]) accessor;
+        final int size;
+        try {
+            final Object value = pair[0].invoke(result);
+            size = value instanceof Integer ? ((Integer) value).intValue() : 0;
+        } catch (Throwable t) {
+            throw unwrapReflective(t);
+        }
+        final List<Location> list = new ArrayList<>(Math.max(0, size));
+        for (int i = 0; i < size; i++) {
+            try {
+                final Object item = pair[1].invoke(result, i);
+                if (item instanceof Location) {
+                    list.add((Location) item);
+                }
+            } catch (Throwable t) {
+                throw unwrapReflective(t);
+            }
+        }
+        return list;
+    }
+
+    /** 反射句柄调用：把 InvocationTargetException 里的真实原因抛出来，日志才看得懂。 */
+    private static Object invokeAccessor(Method method, Object instance) throws Throwable {
+        try {
+            return method.invoke(instance);
+        } catch (Throwable t) {
+            throw unwrapReflective(t);
+        }
+    }
+
+    /** 把反射拿到的 List / Location[] 统一成 List&lt;Location&gt;；不是列表就抛（原因可见）。 */
+    private static List<Location> toLocationList(Object value, Class<?> owner) {
+        if (value instanceof List) {
+            final List<?> raw = (List<?>) value;
+            final List<Location> out = new ArrayList<>(raw.size());
+            for (Object item : raw) {
+                if (item instanceof Location) {
+                    out.add((Location) item);
+                }
+            }
+            return out;
+        }
+        if (value instanceof Location[]) {
+            return new ArrayList<>(Arrays.asList((Location[]) value));
+        }
+        if (value instanceof Object[]) {
+            final List<Location> out = new ArrayList<>();
+            for (Object item : (Object[]) value) {
+                if (item instanceof Location) {
+                    out.add((Location) item);
+                }
+            }
+            return out;
+        }
+        throw new IllegalStateException("not a List<Location> from " + owner.getName() + ": "
+                + (value == null ? "null" : value.getClass().getName()));
+    }
+
+    /** 句柄解析结果按类缓存（投递每 10Hz 一次，不能每次都扫方法表）。 */
+    private static Object resolveLocationsAccessor(Class<?> clazz) {
+        final Object cached = sLocationsAccessors.get(clazz);
+        if (cached != null) {
+            return cached == NO_LOCATIONS_ACCESSOR ? null : cached;
+        }
+        Object accessor = null;
+        try {
+            accessor = findLocationsAccessor(clazz);
+        } catch (Throwable ignored) {
+            // 扫描失败按“没找到”处理；调用方会打出可见的 replace failed
+        }
+        sLocationsAccessors.put(clazz, accessor == null ? NO_LOCATIONS_ACCESSOR : accessor);
+        return accessor;
+    }
+
+    private static Object findLocationsAccessor(Class<?> clazz) {
+        for (Class<?> c = clazz; c != null && c != Object.class; c = c.getSuperclass()) {
+            Method method = findListMethod(c, "getLocations", true);
+            if (method != null) {
+                return method;
+            }
+            method = findListMethod(c, "getLocations", false);
+            if (method != null) {
+                return method;
+            }
+            method = findListMethod(c, "asList", true);
+            if (method != null) {
+                return method;
+            }
+            final Field field = findListField(c);
+            if (field != null) {
+                return field;
+            }
+        }
+        for (Class<?> c = clazz; c != null && c != Object.class; c = c.getSuperclass()) {
+            final Method size = findIndexMethod(c, "size", true);
+            final Method get = findIndexMethod(c, "get", false);
+            if (size != null && get != null) {
+                return new Method[]{size, get};
+            }
+        }
+        return null;
+    }
+
+    /** 无参、返回 List / Location[] 的方法：getLocations() / 名字含 getLocations / asList()。 */
+    private static Method findListMethod(Class<?> clazz, String name, boolean exact) {
+        for (Method method : clazz.getDeclaredMethods()) {
+            if (method.getParameterTypes().length != 0) {
+                continue;
+            }
+            final String methodName = method.getName();
+            if (exact ? !name.equals(methodName) : methodName.indexOf(name) < 0) {
+                continue;
+            }
+            final Class<?> type = method.getReturnType();
+            if (!List.class.isAssignableFrom(type)
+                    && !(type.isArray() && Location.class.isAssignableFrom(type.getComponentType()))) {
+                continue;
+            }
+            trySetAccessible(method);
+            return method;
+        }
+        return null;
+    }
+
+    /** List 类型的字段（A17 内部就是 mLocations；名字不认识就不碰）。 */
+    private static Field findListField(Class<?> clazz) {
+        for (Field field : clazz.getDeclaredFields()) {
+            if (!List.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            if (field.getName().indexOf("ocation") < 0) {
+                continue;
+            }
+            trySetAccessible(field);
+            return field;
+        }
+        return null;
+    }
+
+    /** size() / get(int) 兜底用；返回类型必须对得上，避免误抓同名方法。 */
+    private static Method findIndexMethod(Class<?> clazz, String name, boolean noArgs) {
+        for (Method method : clazz.getDeclaredMethods()) {
+            if (!name.equals(method.getName())) {
+                continue;
+            }
+            final Class<?>[] types = method.getParameterTypes();
+            if (noArgs) {
+                if (types.length != 0 || method.getReturnType() != int.class) {
+                    continue;
+                }
+            } else {
+                if (types.length != 1 || types[0] != int.class
+                        || !Location.class.isAssignableFrom(method.getReturnType())) {
+                    continue;
+                }
+            }
+            trySetAccessible(method);
+            return method;
+        }
+        return null;
+    }
+
+    private static void trySetAccessible(java.lang.reflect.AccessibleObject object) {
+        try {
+            object.setAccessible(true);
+        } catch (Throwable ignored) {
+            // 公开成员不需要；隐藏成员被拦时留给 invoke 抛出来记录
+        }
+    }
+
+    /** 原地改完后重新读一次：确认真的改了（防 getLocations/asList 返回深拷贝却不自知）。 */
+    private static boolean isSnapshotVisible(Object result, Snapshot snapshot) {
+        try {
+            final List<Location> check = locationsOf(result);
+            if (check == null || check.isEmpty()) {
+                return true;   // 读不到就别否定已经改好的结果
+            }
+            final Location first = check.get(0);
+            return first == null
+                    || (first.getLatitude() == snapshot.lat && first.getLongitude() == snapshot.lon);
+        } catch (Throwable t) {
+            return true;   // 校验本身失败：不回滚已改好的字段
+        }
+    }
+
+    /**
+     * 反射新建 LocationResult（<b>兜底用</b>）：A17 实测有 {@code create(Location[])} 与
+     * {@code wrap(Location[])}，Android 12/13 是 {@code create(List)}。
+     *
+     * @throws Throwable 全部尝试都失败时抛最后一个原因（调用方记一条可见日志）
+     */
+    private static Object createLocationResult(List<Location> locations) throws Throwable {
+        final Class<?> clazz = Class.forName("android.location.LocationResult");
+        final Location[] array = locations.toArray(new Location[0]);
+        final List<Location> copy = new ArrayList<>(locations);
+        Throwable last = null;
+        for (String factory : new String[]{"create", "wrap"}) {
+            try {
+                return XposedHelpers.callStaticMethod(clazz, factory, (Object) array);
+            } catch (Throwable t) {
+                last = unwrapReflective(t);
+            }
+            try {
+                return XposedHelpers.callStaticMethod(clazz, factory, (Object) copy);
+            } catch (Throwable t) {
+                last = unwrapReflective(t);
+            }
+        }
+        throw last == null ? new IllegalStateException("no create/wrap on LocationResult") : last;
+    }
+
+    // ============================================================== 替换诊断
+
+    /** 参数类型不是 Location / LocationResult：每进程每类型一条（下一轮判定靠它）。 */
+    private static void logReplaceSkippedOnce(String argClass) {
+        try {
+            if (sLoggedReplaceNotes.add("skip:" + argClass)) {
+                log("replace skipped: arg type unknown: " + argClass);
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 替换失败：每进程每（位置类型 + 异常类）一条，附前 3 层堆栈。 */
+    private static void logReplaceFailureOnce(String argType, String methodName, Throwable t) {
+        try {
+            final Throwable cause = unwrapReflective(t == null
+                    ? new IllegalStateException("unknown") : t);
+            final String exceptionName = cause.getClass().getName();
+            if (!sLoggedReplaceNotes.add("fail:" + argType + ":" + exceptionName)) {
+                return;
+            }
+            final StringBuilder message = new StringBuilder("replace failed: ")
+                    .append(exceptionName)
+                    .append(" at ").append(methodName == null || methodName.isEmpty() ? "?" : methodName)
+                    .append(" (").append(firstLine(cause.getMessage())).append(')');
+            appendStackFrames(message, cause, 3);
+            log(message.toString());
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 反射异常必然是 InvocationTargetException 包一层，取里面真正的原因。 */
+    private static Throwable unwrapReflective(Throwable t) {
+        Throwable cause = t;
+        for (int depth = 0; depth < 3; depth++) {
+            if (cause == null || !(cause instanceof InvocationTargetException)
+                    || cause.getCause() == null) {
+                break;
+            }
+            cause = cause.getCause();
+        }
+        return cause == null ? new IllegalStateException("unknown") : cause;
+    }
+
+    private static String firstLine(String message) {
+        if (message == null || message.isEmpty()) {
+            return "no message";
+        }
+        final int newline = message.indexOf('\n');
+        final String line = newline >= 0 ? message.substring(0, newline) : message;
+        return line.length() > 160 ? line.substring(0, 160) + "…" : line;
+    }
+
+    /** 附前 limit 层堆栈：只用于诊断，任何异常都忽略。 */
+    private static void appendStackFrames(StringBuilder message, Throwable t, int limit) {
+        try {
+            final StackTraceElement[] frames = t.getStackTrace();
+            if (frames == null || frames.length == 0) {
+                return;
+            }
+            message.append(" stack=[");
+            for (int i = 0; i < frames.length && i < limit; i++) {
+                if (i > 0) {
+                    message.append(" <- ");
+                }
+                message.append(frames[i]);
+            }
+            message.append(']');
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    private static String methodNameOf(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param != null && param.method instanceof Method) {
+                return ((Method) param.method).getName();
+            }
+        } catch (Throwable ignored) {
+            // 日志用，失败退化成占位
+        }
+        return "?";
+    }
+
+    private static String argTypeName(Object arg) {
+        try {
+            if (arg == null) {
+                return "null";
+            }
+            final String simple = arg.getClass().getSimpleName();
+            return simple == null || simple.isEmpty() ? arg.getClass().getName() : simple;
+        } catch (Throwable ignored) {
+            return "?";
         }
     }
 
@@ -1044,14 +1556,65 @@ final class SystemHooks {
         }
     }
 
-    // ================================================================== Provider 读取（带缓存）
+    // ================================================================== 快照读取（套接字优先，Provider 兜底）
+
+    /*
+     * Android 17 的 system_server（uid 1000）读 content://com.vloc.motion.env/* 会抛
+     * SecurityException（logcat: Isolated process not allowed to call getContentProvider），
+     * 所以主通道换成 Unix 抽象套接字（SnapshotClient）：
+     *   1. 套接字有答复（含「空行 = 无数据」）→ 直接采用，不再碰 Provider；
+     *   2. 套接字失败（未装新版主 App / 连接被拒 / 超时）→ 回退原来的 Provider 路径，行为不变；
+     *   3. 两条通道都没有数据 → 返回 null（透传真实定位），与旧行为一致。
+     * 缓存判断放在方法入口：命中缓存不建连接（10Hz 投递不会变成 10Hz 连接）。
+     */
 
     private static Snapshot currentLocation() {
         final long now = System.currentTimeMillis();
         if (now - sLocationAt < LOCATION_CACHE_MS) {
-            return sLocation;
+            return sLocation;   // 缓存命中：不建连
         }
         sLocationAt = now;
+        final String line = SnapshotClient.readLine(SnapshotClient.REQ_LOCATION,
+                SnapshotClient.DEFAULT_TIMEOUT_MS);
+        final Snapshot parsed;
+        if (line != null) {
+            // 通道已答复；"" = 主 App 明确表示当前没有数据（不再花一次 Provider 读取）
+            parsed = line.isEmpty() ? null : parseLocationJson(line);
+        } else {
+            parsed = readProviderSnapshot();   // 套接字不可用：回退 ContentProvider
+        }
+        sLocation = parsed;
+        return parsed;
+    }
+
+    /** 解析套接字返回的 /location 同款 JSON；{@code active=false} 与解析失败都返回 null。 */
+    private static Snapshot parseLocationJson(String json) {
+        try {
+            final JSONObject root = new JSONObject(json);
+            if (!root.optBoolean("active", false)) {
+                logSnapshotUnavailableOnce("inactive snapshot (socket)");
+                return null;
+            }
+            return new Snapshot(
+                    root.optDouble("lat"), root.optDouble("lon"),
+                    root.optDouble("alt"), (float) root.optDouble("speed"),
+                    (float) root.optDouble("bearing"),
+                    (float) root.optDouble("acc"),
+                    root.optInt("satellites", 0),
+                    root.optLong("updatedAt", 0L));
+        } catch (Throwable t) {
+            logSnapshotUnavailableOnce("socket json: " + t.getClass().getName());
+            return null;
+        }
+    }
+
+    /**
+     * 兜底通道：主 App 的 ContentProvider（原逻辑，行为不变）。
+     *
+     * <p>Android 17 的 system_server 里这条路会抛 {@code SecurityException}；
+     * 只在新版主 App 的套接字不可用时才会走到（老版本主 App / 套接字被拒）。
+     */
+    private static Snapshot readProviderSnapshot() {
         Snapshot parsed = null;
         String unavailable = null;
         try {
@@ -1092,16 +1655,65 @@ final class SystemHooks {
         if (parsed == null) {
             logSnapshotUnavailableOnce(unavailable == null ? "unknown" : unavailable);
         }
-        sLocation = parsed;
         return parsed;
     }
 
     private static List<Satellite> currentSatellites() {
         final long now = System.currentTimeMillis();
         if (now - sGnssAt < GNSS_CACHE_MS) {
-            return sSatellites;
+            return sSatellites;   // 缓存命中：不建连
         }
         sGnssAt = now;
+        final String line = SnapshotClient.readLine(SnapshotClient.REQ_GNSS,
+                SnapshotClient.DEFAULT_TIMEOUT_MS);
+        final List<Satellite> parsed;
+        if (line != null) {
+            // 通道已答复；"" = 主 App 当前没有卫星数据
+            parsed = line.isEmpty() ? null : parseSatellitesJson(line);
+        } else {
+            parsed = readProviderSatellites();   // 套接字不可用：回退 ContentProvider
+        }
+        sSatellites = parsed;
+        return parsed;
+    }
+
+    /** 解析套接字返回的 /gnss 同款数组；空 / 非法内容返回 null（= 不注入卫星表）。 */
+    private static List<Satellite> parseSatellitesJson(String json) {
+        try {
+            final JSONArray array = new JSONArray(json);
+            final List<Satellite> list = new ArrayList<>(array.length());
+            for (int i = 0; i < array.length(); i++) {
+                final JSONObject item = array.optJSONObject(i);
+                if (item == null) {
+                    continue;
+                }
+                Satellite sat = new Satellite();
+                sat.svid = item.optInt("svid", 0);
+                if (sat.svid <= 0) {
+                    continue;
+                }
+                sat.constellation = item.optInt("const", 1);
+                sat.elevation = (float) item.optDouble("ele", 0);
+                sat.azimuth = (float) item.optDouble("azi", 0);
+                sat.cn0 = (float) item.optDouble("cn0", 30);
+                sat.usedInFix = item.optBoolean("fix", true);
+                sat.hasAlmanac = item.optBoolean("alm", true);
+                sat.hasEphemeris = item.optBoolean("eph", true);
+                sat.carrierHz = (float) item.optDouble("cf", 1575.42e6);
+                list.add(sat);
+            }
+            return list.isEmpty() ? null : list;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 兜底通道：主 App 的 ContentProvider（原逻辑，行为不变）。
+     *
+     * <p>只有 {@code GNSS} 套接字不可用时才会走到（老版本主 App / 套接字被拒）。
+     */
+    private static List<Satellite> readProviderSatellites() {
         List<Satellite> parsed = null;
         try {
             final Context context = systemContext();
@@ -1113,38 +1725,13 @@ final class SystemHooks {
                         if (column < 0) {
                             column = 1;
                         }
-                        final JSONArray array = new JSONArray(cursor.getString(column));
-                        final List<Satellite> list = new ArrayList<>(array.length());
-                        for (int i = 0; i < array.length(); i++) {
-                            final JSONObject item = array.optJSONObject(i);
-                            if (item == null) {
-                                continue;
-                            }
-                            Satellite sat = new Satellite();
-                            sat.svid = item.optInt("svid", 0);
-                            if (sat.svid <= 0) {
-                                continue;
-                            }
-                            sat.constellation = item.optInt("const", 1);
-                            sat.elevation = (float) item.optDouble("ele", 0);
-                            sat.azimuth = (float) item.optDouble("azi", 0);
-                            sat.cn0 = (float) item.optDouble("cn0", 30);
-                            sat.usedInFix = item.optBoolean("fix", true);
-                            sat.hasAlmanac = item.optBoolean("alm", true);
-                            sat.hasEphemeris = item.optBoolean("eph", true);
-                            sat.carrierHz = (float) item.optDouble("cf", 1575.42e6);
-                            list.add(sat);
-                        }
-                        if (!list.isEmpty()) {
-                            parsed = list;
-                        }
+                        parsed = parseSatellitesJson(cursor.getString(column));
                     }
                 }
             }
         } catch (Throwable ignored) {
             // ignore
         }
-        sSatellites = parsed;
         return parsed;
     }
 

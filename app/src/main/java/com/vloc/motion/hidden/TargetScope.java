@@ -24,9 +24,12 @@ import de.robv.android.xposed.XposedHelpers;
  *
  * <p>数据契约（主 App 侧实现，见 {@code EnvProvider#PATH_TARGETS}）：
  * <pre>
+ * 套接字（Unix 抽象 {@code com.vloc.motion.snapshot}，请求 {@code TARGETS}）  或
  * content://com.vloc.motion.env/targets  →  单列 {@code json}、单行
  * {"enabled":true,"packages":["com.a","com.b"]}
  * </pre>
+ * 两条通道内容一致：<b>套接字优先</b>（system_server 里读 Provider 会抛 SecurityException），
+ * 套接字不可用才回退 Provider，解析逻辑共用一份。
  * <ul>
  *   <li>{@code enabled=false}：不做限制，保持旧行为（全机所有进程生效）；</li>
  *   <li>{@code enabled=true}：只有 {@code packages} 里的包名会被安装 hook / 改写定位；</li>
@@ -35,7 +38,8 @@ import de.robv.android.xposed.XposedHelpers;
  * </ul>
  *
  * <p>性能：定位投递是高频路径（10Hz × N 个注册者），所以整份配置按 {@link #TTL_MS} 缓存，
- * 过期才跨进程 query 一次；判定本身只是一次 HashSet 查找。
+ * 过期才走一次通道（套接字优先，失败才跨进程 query Provider）；判定本身只是一次 HashSet 查找。
+ * 套接字单次交换总超时 ≤300ms，且只在缓存过期时发生。
  *
  * <p>线程安全：投递可能在多个 binder / handler 线程并发触发，缓存的读写用
  * {@code volatile + 双检锁}，uid→包名表用一把小锁保护。
@@ -180,7 +184,7 @@ final class TargetScope {
     static String summary() {
         final Scope scope = current();
         if (scope == null) {
-            return "unavailable -> allow all (reading " + TARGETS_URI + " failed)";
+            return "unavailable -> allow all (socket + " + TARGETS_URI + " both failed)";
         }
         if (!scope.enabled) {
             return "disabled -> all apps (enabled=false)";
@@ -217,8 +221,65 @@ final class TargetScope {
         }
     }
 
-    /** 跨进程读一次作用域配置；任何一步失败都返回 null。 */
+    /**
+     * 读一次作用域配置：<b>套接字优先，ContentProvider 兜底</b>；任何一步失败都返回 null（= 放行）。
+     *
+     * <p>顺序与原因：
+     * <ol>
+     *   <li>{@code TARGETS} → Unix 抽象套接字（{@link SnapshotClient}）：system_server（uid 1000）
+     *       读 Provider 会抛 SecurityException（Android 17），套接字不受 Provider 权限限制；</li>
+     *   <li>套接字失败（老版本主 App / 连接被拒 / 超时 / 空行）→ 原来的 Provider 路径，行为不变。</li>
+     * </ol>
+     * 两条通道共用 {@link #parse(String)}，enabled / packages 的语义完全一致。
+     */
     private static Scope read() {
+        final String line = SnapshotClient.readLine(SnapshotClient.REQ_TARGETS,
+                SnapshotClient.DEFAULT_TIMEOUT_MS);
+        if (line != null && !line.isEmpty()) {
+            final Scope scope = parse(line);
+            if (scope != null) {
+                return scope;
+            }
+            // 套接字有内容但解析失败（主 App 正在升级 / 契约不符）：再用 Provider 兜一次
+        }
+        return readProvider();
+    }
+
+    /** 解析 {@code {"enabled":bool,"packages":[...]}}；失败记一条日志并返回 null。 */
+    private static Scope parse(String raw) {
+        final JSONObject root;
+        try {
+            root = new JSONObject(raw);
+        } catch (Throwable t) {
+            logParseFail(t);
+            return null;
+        }
+        final boolean enabled = root.optBoolean("enabled", false);
+        final Set<String> packages = new HashSet<>();
+        final JSONArray array = root.optJSONArray("packages");
+        if (array != null) {
+            for (int i = 0; i < array.length(); i++) {
+                final String pkg = array.optString(i, null);
+                if (pkg != null && !pkg.trim().isEmpty()) {
+                    packages.add(pkg.trim());
+                }
+            }
+        }
+        final Scope scope = new Scope(enabled, Collections.unmodifiableSet(packages));
+        if (!sLoggedFirstRead) {
+            sLoggedFirstRead = true;
+            log("target scope: enabled=" + enabled + " packages=" + packages.size());
+        }
+        return scope;
+    }
+
+    /**
+     * 兜底通道：主 App 的 ContentProvider（原逻辑，行为不变）。
+     *
+     * <p>Android 17 的 system_server 里这条路会抛 SecurityException（由 {@link #current()} 兜住），
+     * 只在套接字不可用时才会走到。
+     */
+    private static Scope readProvider() {
         final Context context = context();
         if (context == null) {
             logNoContext();
@@ -246,30 +307,7 @@ final class TargetScope {
                 logReadFail("empty json");
                 return null;
             }
-            final JSONObject root;
-            try {
-                root = new JSONObject(raw);
-            } catch (Throwable parse) {
-                logParseFail(parse);
-                return null;
-            }
-            final boolean enabled = root.optBoolean("enabled", false);
-            final Set<String> packages = new HashSet<>();
-            final JSONArray array = root.optJSONArray("packages");
-            if (array != null) {
-                for (int i = 0; i < array.length(); i++) {
-                    final String pkg = array.optString(i, null);
-                    if (pkg != null && !pkg.trim().isEmpty()) {
-                        packages.add(pkg.trim());
-                    }
-                }
-            }
-            final Scope scope = new Scope(enabled, Collections.unmodifiableSet(packages));
-            if (!sLoggedFirstRead) {
-                sLoggedFirstRead = true;
-                log("target scope: enabled=" + enabled + " packages=" + packages.size());
-            }
-            return scope;
+            return parse(raw);
         } finally {
             if (cursor != null) {
                 try {

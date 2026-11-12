@@ -440,6 +440,10 @@ public class LocationService extends Service {
         startForegroundSafe(buildNotification("准备注入…"));
         acquireWakeLock();
         collectGnssSnapshot();
+        // 先开快照套接字再准备注入：模块（system_server）在 Android 17 上读不了
+        // ContentProvider（SecurityException），只能从抽象套接字拿快照；
+        // 绑定失败只记一条 Log.w，不影响会话（见 SnapshotServer）。
+        SnapshotServer.INSTANCE.start(this);
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
@@ -514,6 +518,8 @@ public class LocationService extends Service {
         startForegroundSafe(buildNotification("准备注入…"));
         acquireWakeLock();
         collectGnssSnapshot();
+        // 临时定位会话同样要发布快照套接字（与 startRoute 一致，start() 幂等）
+        SnapshotServer.INSTANCE.start(this);
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
@@ -1244,6 +1250,9 @@ public class LocationService extends Service {
         // 先让仍在后台准备的会话过期：它之后的 post 会被 isStalePrepare 丢弃并自行释放
         ++sessionSeq;
         stopTicker();
+        // 紧接着摘掉快照套接字：模块必须立刻停止改写、回到真实定位，不能继续读到本场快照。
+        // stop() 幂等、且最多等待守护线程 500ms（见 SnapshotServer），不会拖住主线程收尾。
+        SnapshotServer.INSTANCE.stop();
         releaseInjector();
         // 收尾顺序不能反：removeTestProvider 本身也受 mock_location appop 检查，
         // 必须先移除测试 Provider（releaseInjector），再回收 appop。
