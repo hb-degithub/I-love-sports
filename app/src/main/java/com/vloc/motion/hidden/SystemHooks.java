@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -606,6 +607,74 @@ final class SystemHooks {
                 + "(ROM routes location via fused)");
     }
 
+    // ================================================================== 诊断日志（每进程一次）
+
+    /*
+     * 「hook 没触发」与「触发了但读不到快照」是两种完全不同的故障：
+     * 前者查候选类 / 方法名（见 hookCandidates 的逐类日志），后者查主 App 的 Provider。
+     * 每条日志各自一个 AtomicBoolean，CAS 保证并发投递下每进程也只打一条，绝不刷屏。
+     */
+    private static final AtomicBoolean sLoggedDeliveryFired = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedLastLocationFired = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedNoSnapshot = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedLastLocationNoSnapshot = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedSnapshotUnavailable = new AtomicBoolean();
+
+    /** 日志用「方法名 args=参数个数」；任何异常都退化成占位，绝不影响 hook。 */
+    private static String describeCall(XC_MethodHook.MethodHookParam param) {
+        String name = "?";
+        int args = 0;
+        try {
+            if (param != null) {
+                if (param.method instanceof Method) {
+                    name = ((Method) param.method).getName();
+                }
+                if (param.args != null) {
+                    args = param.args.length;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 日志用，失败退化为占位
+        }
+        return name + " args=" + args;
+    }
+
+    /** 投递 hook 首次被调用：每进程一行；{@code path} 非空时用来区分同步兜底路径。 */
+    private static void logHookFiredOnce(AtomicBoolean flag, XC_MethodHook.MethodHookParam param,
+                                         String path) {
+        try {
+            if (flag.compareAndSet(false, true)) {
+                log("delivery hook fired: " + describeCall(param)
+                        + (path == null ? "" : " (" + path + ")"));
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 快照为空（主 App 未发布 / Provider 不可用）：每进程一行。 */
+    private static void logNoSnapshotOnce(AtomicBoolean flag, String path) {
+        try {
+            if (flag.compareAndSet(false, true)) {
+                log("delivery skipped: no snapshot (app not publishing / provider unavailable)"
+                        + (path == null ? "" : " (" + path + ")"));
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** Provider 读取异常 / 空游标：每进程一行，区分「应用没发布」与「Provider 读失败」。 */
+    private static void logSnapshotUnavailableOnce(String reason) {
+        try {
+            if (sLoggedSnapshotUnavailable.compareAndSet(false, true)) {
+                log("snapshot unavailable: " + reason);
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
     // ================================================================== 定位下发
 
     /**
@@ -647,6 +716,9 @@ final class SystemHooks {
     /**
      * 在候选类上挂载「方法名命中」的 hook，逐类记一行日志（成功几个 / 类不存在也记）。
      *
+     * <p>每行格式：{@code hook candidate <fqcn>: found=<bool> hooked=<n> (methods=[...]) (失败原因)}，
+     * 装完直接能看出某个方法（如 {@code deliverOnLocationChanged}）到底挂上了几处。
+     *
      * @param stopOnFirst 命中一个类就停（旧版本优先，避免同一条投递链被挂两层）
      * @return 实际挂上的方法数
      */
@@ -655,24 +727,40 @@ final class SystemHooks {
         int total = 0;
         for (String name : classes) {
             int hooked = 0;
+            int matched = 0;
+            boolean found = false;
+            String reason = null;
+            final List<String> matchedNames = new ArrayList<>();
             try {
                 final Class<?> clazz = XposedHelpers.findClass(name, classLoader);
+                found = true;
                 // 逐个重载挂：既兼容 (Location)，也兼容 (LocationResult)
                 for (Method method : clazz.getDeclaredMethods()) {
                     if (!methodNames.contains(method.getName())) {
                         continue;
                     }
+                    matched++;
+                    matchedNames.add(method.getName());
                     try {
                         XposedBridge.hookMethod(method, hook);
                         hooked++;
                     } catch (Throwable t) {
-                        log(tag + " hook failed " + name + "#" + method.getName() + ": " + t);
+                        if (reason == null) {
+                            reason = tag + " hook failed " + method.getName() + ": " + t;
+                        }
                     }
                 }
-                log(tag + " " + name + " hooks=" + hooked);
             } catch (Throwable notFound) {
-                log(tag + " " + name + " not found (skip)");
+                reason = tag + " class not found: " + notFound;
             }
+            if (reason == null && matched == 0) {
+                reason = tag + " no method match " + methodNames;
+            }
+            // 每个候选类固定一行：found=类是否解析到，hooked=真正挂上的方法数，
+            // 这样能直接看出 deliverOnLocationChanged 到底挂上了几个。
+            log("hook candidate " + name + ": found=" + found + " hooked=" + hooked
+                    + (matched > 0 ? " (methods=" + matchedNames + ")" : "")
+                    + (reason == null ? "" : " (" + reason + ")"));
             total += hooked;
             if (stopOnFirst && hooked > 0) {
                 break;
@@ -693,6 +781,8 @@ final class SystemHooks {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
             try {
+                // 诊断：先证明 hook 到底有没有被调用（每进程一行），再谈快照
+                logHookFiredOnce(sLoggedDeliveryFired, param, null);
                 if (TargetScope.isScoped()) {
                     // 只在开启「仅对选定应用生效」时才反查接收方（关闭时保持旧行为、零额外开销）
                     final Target target = resolveTarget(param.thisObject);
@@ -711,7 +801,12 @@ final class SystemHooks {
                     }
                 }
                 final Snapshot snapshot = currentLocation();
-                if (snapshot == null || param.args == null) {
+                if (snapshot == null) {
+                    // 诊断：hook 触发了但读不到快照（主 App 未发布 / Provider 不可用）
+                    logNoSnapshotOnce(sLoggedNoSnapshot, null);
+                    return;
+                }
+                if (param.args == null) {
                     return;
                 }
                 for (int i = 0; i < param.args.length; i++) {
@@ -747,8 +842,13 @@ final class SystemHooks {
         };
         int count = 0;
         for (String name : classes) {
+            int classHooked = 0;
+            boolean found = false;
+            String reason = null;
+            final List<String> matchedNames = new ArrayList<>();
             try {
                 final Class<?> clazz = XposedHelpers.findClass(name, classLoader);
+                found = true;
                 for (Method method : clazz.getDeclaredMethods()) {
                     final String methodName = method.getName();
                     if (!"getLastLocation".equals(methodName) && !"getCurrentLocation".equals(methodName)) {
@@ -757,11 +857,14 @@ final class SystemHooks {
                     if (method.getReturnType() != Location.class) {
                         continue;
                     }
+                    matchedNames.add(methodName);
                     try {
                         XposedBridge.hookMethod(method, new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
                                 try {
+                                    // 诊断：先证明这条同步兜底路径有没有被调用（每进程一行）
+                                    logHookFiredOnce(sLoggedLastLocationFired, param, "last-location");
                                     // 作用域门控：这类同步方法没有 transport 可查，
                                     // 用 Binder.getCallingUid() 反查调用方包名（见 TargetScope）。
                                     if (!TargetScope.allowsCaller()) {
@@ -780,6 +883,8 @@ final class SystemHooks {
                                     }
                                     final Snapshot snapshot = currentLocation();
                                     if (snapshot == null) {
+                                        // 诊断：hook 触发了但读不到快照（每进程一行）
+                                        logNoSnapshotOnce(sLoggedLastLocationNoSnapshot, "last-location");
                                         return;
                                     }
                                     final Object result = param.getResult();
@@ -791,14 +896,24 @@ final class SystemHooks {
                                 }
                             }
                         });
-                        count++;
-                    } catch (Throwable ignored) {
-                        // ignore
+                        classHooked++;
+                    } catch (Throwable t) {
+                        if (reason == null) {
+                            reason = "hook failed " + methodName + ": " + t;
+                        }
                     }
                 }
-            } catch (Throwable ignored) {
-                // ignore
+            } catch (Throwable notFound) {
+                reason = "class not found: " + notFound;
             }
+            if (reason == null && matchedNames.isEmpty()) {
+                reason = "no getLastLocation/getCurrentLocation(Location) match";
+            }
+            // 每个候选类一行，格式与投递链一致
+            log("hook candidate " + name + ": found=" + found + " hooked=" + classHooked
+                    + (matchedNames.isEmpty() ? "" : " (methods=" + matchedNames + ")")
+                    + (reason == null ? "" : " (" + reason + ")"));
+            count += classHooked;
         }
         if (count > 0) {
             log("hooked getLastLocation/getCurrentLocation x" + count);
@@ -938,12 +1053,19 @@ final class SystemHooks {
         }
         sLocationAt = now;
         Snapshot parsed = null;
+        String unavailable = null;
         try {
             final Context context = systemContext();
-            if (context != null) {
+            if (context == null) {
+                unavailable = "no system context";
+            } else {
                 try (android.database.Cursor cursor = context.getContentResolver()
                         .query(Uri.parse(LOCATION_URI), new String[]{"json"}, null, null, null)) {
-                    if (cursor != null && cursor.moveToFirst()) {
+                    if (cursor == null) {
+                        unavailable = "null cursor";
+                    } else if (!cursor.moveToFirst()) {
+                        unavailable = "empty cursor";
+                    } else {
                         int column = cursor.getColumnIndex("json");
                         if (column < 0) {
                             column = 1;
@@ -957,12 +1079,18 @@ final class SystemHooks {
                                     (float) root.optDouble("acc"),
                                     root.optInt("satellites", 0),
                                     root.optLong("updatedAt", 0L));
+                        } else {
+                            unavailable = "inactive snapshot";
                         }
                     }
                 }
             }
-        } catch (Throwable ignored) {
-            // 读取失败：视为未模拟
+        } catch (Throwable t) {
+            // 读取失败：视为未模拟；原因只进诊断日志（每进程一条）
+            unavailable = t.getClass().getName();
+        }
+        if (parsed == null) {
+            logSnapshotUnavailableOnce(unavailable == null ? "unknown" : unavailable);
         }
         sLocation = parsed;
         return parsed;
