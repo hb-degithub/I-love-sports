@@ -10,7 +10,9 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /** 本地持久化（SharedPreferences）：路径、速度、循环、注入 Provider、地图视野。 */
 public final class RouteStore {
@@ -40,6 +42,10 @@ public final class RouteStore {
     private static final String KEY_ATTITUDE = "attitude_replay";
     private static final String KEY_AUTO_STOP_ON_FINISH = "auto_stop_on_finish";
     private static final String KEY_SYSTEM_INJECT = "system_inject";
+    /** 作用域：只对选中的应用生效（默认关＝对所有应用生效）。 */
+    private static final String KEY_SCOPE_ENABLED = "scope_enabled";
+    /** 作用域名单：JSON 数组字符串，例如 {@code ["com.a","com.b"]}。 */
+    private static final String KEY_TARGET_PACKAGES = "target_packages";
     private static final String KEY_OVERLAY_COLLAPSED = "overlay_collapsed";
     private static final String KEY_GNSS_SNAPSHOT = "gnss_snapshot";
     private static final String KEY_RANDOM_START = "random_start";
@@ -388,6 +394,60 @@ public final class RouteStore {
 
     public static void saveSystemInject(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_SYSTEM_INJECT, enabled).apply();
+    }
+
+    // ---- 作用域（目标应用）----
+
+    /**
+     * 是否「仅对选定应用生效」（默认关）。
+     *
+     * <p>关闭＝系统级注入对全机所有应用生效；打开＝只有 {@link #loadTargetPackages} 里的包名
+     * 会被改写定位。模块侧通过 {@code content://com.vloc.motion.env/targets} 读取该状态。
+     */
+    public static boolean loadScopeEnabled(Context context) {
+        return prefs(context).getBoolean(KEY_SCOPE_ENABLED, false);
+    }
+
+    public static void saveScopeEnabled(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_SCOPE_ENABLED, enabled).apply();
+    }
+
+    /**
+     * 读取作用域名单（包名集合，可能为空）。
+     *
+     * <p>存成 JSON 数组字符串，与路线库等既有字段的存法保持一致；内容损坏时返回空集合而不是抛异常，
+     * 避免模块侧读取时踩到脏数据。
+     */
+    public static Set<String> loadTargetPackages(Context context) {
+        Set<String> packages = new LinkedHashSet<>();
+        String raw = prefs(context).getString(KEY_TARGET_PACKAGES, "");
+        if (raw == null || raw.isEmpty()) {
+            return packages;
+        }
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                String pkg = array.optString(i, "");
+                if (pkg != null && !pkg.trim().isEmpty()) {
+                    packages.add(pkg.trim());
+                }
+            }
+        } catch (JSONException ignored) {
+            // 损坏则按空名单处理
+        }
+        return packages;
+    }
+
+    public static void saveTargetPackages(Context context, Set<String> packages) {
+        JSONArray array = new JSONArray();
+        if (packages != null) {
+            for (String pkg : packages) {
+                if (pkg != null && !pkg.trim().isEmpty()) {
+                    array.put(pkg.trim());
+                }
+            }
+        }
+        prefs(context).edit().putString(KEY_TARGET_PACKAGES, array.toString()).apply();
     }
 
     /**

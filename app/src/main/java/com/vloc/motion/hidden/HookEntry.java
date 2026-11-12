@@ -2,8 +2,12 @@ package com.vloc.motion.hidden;
 
 import android.app.AppOpsManager;
 import android.content.ContentResolver;
+import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.location.Location;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Parcel;
@@ -60,6 +64,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * <ul>
  *   <li>只修改“标记”与两类旁证查询的结果，<b>不</b>修改坐标 / 速度 / 海拔 / 时间 / 精度 / provider
  *       等定位数据本身；坐标由主 App（com.vloc.motion）通过 root + test provider（含拟真模式）注入。</li>
+ *   <li><b>作用域（目标应用）</b>：主 App 开启「仅对选定应用生效」后，本进程不在名单内就
+ *       <b>一个 hook 都不装</b>（见 {@link TargetScope}），日志为 {@code skip &lt;pkg&gt;: not in scope}；
+ *       关闭时仍对全机进程生效（旧行为）。</li>
  *   <li>目标机型的 Android 版本差异很大（8.0 ~ 14），所以每个 hook 都是
  *       “独立 try/catch + 找不到就跳过”，任何一个 hook 失败都不影响其余 hook。</li>
  *   <li>所有 hook 都只做“读取路径上的遮蔽 + 写入路径上的空操作”，不会抛出异常给目标 App。</li>
@@ -159,9 +166,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
             if (SYSTEM_SERVER_PACKAGE.equals(packageName)) {
-                // 系统框架进程：安装系统级注入（定位 / GNSS 全 App 生效、无 mock 标记）。
+                // 系统框架进程：安装系统级注入（定位 / GNSS，无 mock 标记）。
                 // 模块必须被手动加入「系统框架」作用域才会走到这里。
+                // 注意：系统层「只对选定应用生效」在 SystemHooks 内部做（投递时按接收方包名判定），
+                // 这里不能整进程跳过，否则名单里也会全部失效。
                 installSystemHooks(lpparam.classLoader);
+                return;
+            }
+            if (!TargetScope.isAllowed(packageName)) {
+                // 「仅对选定应用生效」已开启且本进程不在名单内：一个 hook 都不装，直接退出。
+                // 未开启 / 读不到名单时 isAllowed 一律返回 true（保持旧行为）。
+                log("skip " + packageName + ": not in scope");
                 return;
             }
             installHooks(lpparam.classLoader, packageName);
@@ -563,6 +578,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     if (!isMockOp) {
                         return;
                     }
+                    if (isSelfAppOpsSubject(args)) {
+                        // 主体是主 App 自己：系统（system_server）替它做的 appop 自查必须按真实结果返回，
+                        // 否则 addTestProvider 会被本模块自己拦死。目标 App 的调用仍走下面两条拒绝分支。
+                        logAppOpsSelfExemptOnce(method);
+                        return;
+                    }
                     if (isThrowingCheck(method.getName())) {
                         // 与真机“没有 mock 权限”一致：抛 SecurityException 而不是返回
                         param.setThrowable(new SecurityException(
@@ -868,6 +889,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /**
      * 枚举旁路：把调用方请求里的 mock op 从入参数组剔除；只剩 mock op 时直接返回空 List。
      *
+     * <p>这里<b>不做</b>自身的 uid 豁免：枚举重载没有可靠的“调用主体 uid”
+     * （getPackagesForOps 隐式查询调用方，getOpsForPackage 的 uid 是查询目标而非主体），
+     * 且主 App 的 addTestProvider 注入链路不经过枚举接口，因此维持原拦截行为。
+     *
      * @return 成功 hook 到的方法名数量
      */
     private int hookAppOpsEnumeration(Class<?> appOpsClass, int mockOpInt) {
@@ -975,6 +1000,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * noteOp / startOp / finishOp 旁路：mock op 时按“无权限”处理——
      * throwing 变体抛 SecurityException，*NoThrow 返回 MODE_ERRORED，finishOp 直接忽略。
      *
+     * <p>例外：调用主体是主 App 自己时整体放行（见 {@link #isSelfAppOpsSubject}）。
+     * 主 App 的 addTestProvider 会由 system_server 里的 LocationManagerService 触发
+     * noteOp(OP_MOCK_LOCATION)，若在这里拒绝，应用将永远无法接管测试 Provider。
+     *
      * @return 成功 hook 到的方法名数量
      */
     private int hookAppOpsNoteAndStart(Class<?> appOpsClass, int mockOpInt) {
@@ -987,6 +1016,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         return;
                     }
                     if (!isMockOpArg(args[0], mockOpInt)) {
+                        return;
+                    }
+                    if (isSelfAppOpsSubject(args)) {
+                        // 主 App 自己触发的 mock op（system_server 代其执行）：不修改结果、不抛异常，
+                        // 交给框架原逻辑，否则 addTestProvider / setTestProviderLocation 会被自己拦死。
+                        logAppOpsSelfExemptOnce(param.method);
                         return;
                     }
                     final Method method = (Method) param.method;
@@ -1051,6 +1086,119 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return mockOpInt >= 0 && ((Integer) op).intValue() == mockOpInt;
         }
         return false;
+    }
+
+    // ------------------------------------------------------------------
+    // AppOps 自身豁免：主 App 自己触发的 mock op 必须放行
+    //
+    // 本模块会被 LSPosed 注入 system_server。主 App 调 addTestProvider 时，
+    // LocationManagerService 在 system_server 里执行 noteOp(OP_MOCK_LOCATION)；
+    // 若这里也按“无权限”拒绝，主 App 就永远拿不到测试 Provider
+    // （真机表现：op=58 mode=2，SecurityException 来自本模块）。
+    // 因此 mock op 的拦截必须先判断调用主体是不是主 App 自己。
+    // ------------------------------------------------------------------
+
+    /** 主 App uid 尚未解析。 */
+    private static final int SELF_UID_UNSET = -2;
+
+    /** 本进程解析不出主 App uid（拿不到 Context / PackageManager）：永不豁免，保持原拦截行为。 */
+    private static final int SELF_UID_UNAVAILABLE = -1;
+
+    /** 解析失败的最大尝试次数：既避免高频路径每次都查 PackageManager，也避免一次失败就永久放弃。 */
+    private static final int SELF_UID_MAX_ATTEMPTS = 4;
+
+    /** 主 App uid 缓存（每进程一份，解析成功后不再查 PackageManager）。 */
+    private static volatile int sSelfUid = SELF_UID_UNSET;
+    private static int sSelfUidAttempts;
+    /** 豁免日志每进程只打一条，避免检测库轮询时刷爆 logcat。 */
+    private static boolean sLoggedAppOpsSelfExempt;
+    private static boolean sLoggedSelfUidFailure;
+
+    /**
+     * 调用主体是否就是主 App 自己（是则 mock op 的拦截必须整体放行）。
+     *
+     * <p>主体 uid 取值顺序：① 被 hook 方法的 uid 参数（noteOp / checkOp 系列固定在 {@code args[1]}）；
+     * ② 没有 uid 参数时退回 {@link Binder#getCallingUid()}；
+     * ③ 两者都拿不到（或解析不出自己的 uid）按“不是自己”处理，保持原有拦截。
+     */
+    private static boolean isSelfAppOpsSubject(Object[] args) {
+        final int selfUid = selfUid();
+        if (selfUid < 0) {
+            return false;
+        }
+        return subjectUidOrUnknown(args) == selfUid;
+    }
+
+    /** 取调用主体 uid；没有 uid 参数的重载用 Binder 的调用方 uid，取不到返回 -1。 */
+    private static int subjectUidOrUnknown(Object[] args) {
+        if (args != null && args.length > 1 && args[1] instanceof Integer) {
+            return ((Integer) args[1]).intValue();
+        }
+        try {
+            return Binder.getCallingUid();
+        } catch (Throwable t) {
+            return SELF_UID_UNAVAILABLE;
+        }
+    }
+
+    /** 主 App 的 uid（按进程缓存）；解析不出来返回 {@link #SELF_UID_UNAVAILABLE}。 */
+    private static int selfUid() {
+        int uid = sSelfUid;
+        if (uid != SELF_UID_UNSET) {
+            return uid;
+        }
+        synchronized (HookEntry.class) {
+            uid = sSelfUid;
+            if (uid != SELF_UID_UNSET) {
+                return uid;
+            }
+            uid = resolveSelfUid();
+            if (uid >= 0) {
+                sSelfUid = uid;
+                return uid;
+            }
+            if (++sSelfUidAttempts >= SELF_UID_MAX_ATTEMPTS) {
+                sSelfUid = SELF_UID_UNAVAILABLE;
+                if (!sLoggedSelfUidFailure) {
+                    sLoggedSelfUidFailure = true;
+                    log("self uid unavailable, appops self-exemption disabled");
+                }
+            }
+            return SELF_UID_UNAVAILABLE;
+        }
+    }
+
+    /**
+     * 解析主 App 的 uid。
+     *
+     * <p>system_server 里拿不到 Xposed 的 Activity 上下文，用 @hide 的
+     * {@code AppGlobals.getInitialApplication()}（反射；system_server 里返回系统 Application）
+     * 取 PackageManager 再查 {@link #MAIN_APP_PACKAGE}；任何一步失败都退化为“不豁免”。
+     */
+    private static int resolveSelfUid() {
+        try {
+            final Class<?> appGlobals = Class.forName("android.app.AppGlobals");
+            final Object app = appGlobals.getMethod("getInitialApplication").invoke(null);
+            if (!(app instanceof Context)) {
+                return SELF_UID_UNAVAILABLE;
+            }
+            final PackageManager pm = ((Context) app).getPackageManager();
+            if (pm == null) {
+                return SELF_UID_UNAVAILABLE;
+            }
+            final ApplicationInfo info = pm.getApplicationInfo(MAIN_APP_PACKAGE, 0);
+            return info == null ? SELF_UID_UNAVAILABLE : info.uid;
+        } catch (Throwable t) {
+            return SELF_UID_UNAVAILABLE;
+        }
+    }
+
+    private static void logAppOpsSelfExemptOnce(Member method) {
+        if (sLoggedAppOpsSelfExempt) {
+            return;
+        }
+        sLoggedAppOpsSelfExempt = true;
+        log("appops self-exempt: uid=" + sSelfUid + " (first: " + method + ")");
     }
 
     private static void logAppOpsEnumHitOnce(Member method) {

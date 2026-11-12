@@ -82,6 +82,11 @@
     </item>
 
     <item
+        android:id="@+id/action_scope"
+        android:title="@string/menu_scope"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_settings"
         android:title="设置"
         app:showAsAction="never" />

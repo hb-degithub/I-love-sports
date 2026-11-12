@@ -1627,6 +1627,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         } else if (id == R.id.action_settings) {
             showSettingsDialog();
             return true;
+        } else if (id == R.id.action_scope) {
+            startActivity(new Intent(this, ScopeActivity.class));
+            return true;
         } else if (id == R.id.action_about) {
             showAboutDialog();
             return true;

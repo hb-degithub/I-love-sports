@@ -20,4 +20,6 @@
     <string name="menu_setup">开工向导</string>
     <string name="menu_save_route">保存当前路线</string>
     <string name="menu_route_library">路线库</string>
+    <string name="menu_scope">作用域（只对这些应用生效）</string>
+    <string name="scope_title">作用域</string>
 </resources>
