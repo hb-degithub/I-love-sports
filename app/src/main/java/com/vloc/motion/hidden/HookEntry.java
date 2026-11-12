@@ -99,6 +99,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** extra 中只要 key 含 "mock"（不区分大小写）就视为模拟位置残留，例如 "mockLocation"。 */
     private static final String MOCK_EXTRA_KEY_TOKEN = "mock";
 
+    /** 注入过程抛异常、成功条数不可知：{@link #installSystemHooks} 返回该值，调用方据此不报心跳（不做虚报）。 */
+    private static final int HOOKS_UNKNOWN = -1;
+
     // ------------------------------------------------------------------
     // 旁证遮蔽 1：Settings 中历史的 "mock_location" 开关
     // ------------------------------------------------------------------
@@ -170,16 +173,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 // 模块必须被手动加入「系统框架」作用域才会走到这里。
                 // 注意：系统层「只对选定应用生效」在 SystemHooks 内部做（投递时按接收方包名判定），
                 // 这里不能整进程跳过，否则名单里也会全部失效。
-                installSystemHooks(lpparam.classLoader);
+                final int systemHooks = installSystemHooks(lpparam.classLoader);
+                if (systemHooks >= 0) {
+                    // 心跳（每进程一次，由 HookHeartbeat 保证）：让主 App 不依赖
+                    // “能否看见 org.lsposed.manager” 也能知道系统层已注入、装上了几个 hook
+                    HookHeartbeat.report(null, packageName, systemHooks, HookHeartbeat.KIND_SYSTEM);
+                }
                 return;
             }
             if (!TargetScope.isAllowed(packageName)) {
                 // 「仅对选定应用生效」已开启且本进程不在名单内：一个 hook 都不装，直接退出。
                 // 未开启 / 读不到名单时 isAllowed 一律返回 true（保持旧行为）。
+                // 这里<b>不上报心跳</b>：被作用域 skip = “不该注入”，不是“注入成功”。
                 log("skip " + packageName + ": not in scope");
                 return;
             }
-            installHooks(lpparam.classLoader, packageName);
+            final int appHooks = installHooks(lpparam.classLoader, packageName);
+            // 心跳：kind 由本进程 uid 判定（系统 uid 段如 com.android.location.fused → system，
+            // 普通目标应用 → app），hooks 是下面 installHooks 里各旁路实际安装数的总和
+            HookHeartbeat.report(null, packageName, appHooks, HookHeartbeat.kindOfCurrentProcess());
         } catch (Throwable t) {
             // 顶层兜底：模块绝不能因为自身异常影响目标 App 启动
             logError("handleLoadPackage failed", t);
@@ -191,24 +203,33 @@ public final class HookEntry implements IXposedHookLoadPackage {
      *
      * <p>只做定位与 GNSS：传感器由 native SensorService 分发、相机在 HAL/相机服务层，
      * Java 层无法覆盖，仍由目标进程内 Hook 处理。
+     *
+     * @return {@link SystemHooks#install(ClassLoader)} 实际安装成功的 hook 数；
+     *         抛异常时返回 {@link #HOOKS_UNKNOWN}（安装数不可知，心跳就不报，避免虚报）
      */
-    private void installSystemHooks(ClassLoader classLoader) {
+    private int installSystemHooks(ClassLoader classLoader) {
         try {
             final int hooks = SystemHooks.install(classLoader);
             log("system-level hooks installed in system_server: " + hooks);
+            return hooks;
         } catch (Throwable t) {
             logError("installSystemHooks failed", t);
+            return HOOKS_UNKNOWN;
         }
     }
 
-    /** 安装全部 hook，每个 hook 内部各自兜底，互不影响。 */
-    private void installHooks(ClassLoader classLoader, String packageName) {
+    /**
+     * 安装全部 hook，每个 hook 内部各自兜底，互不影响。
+     *
+     * @return 本进程实际安装成功的 hook 总数（各旁路安装方法的返回值之和，用于自报心跳）
+     */
+    private int installHooks(ClassLoader classLoader, String packageName) {
         final Class<?> locationClass;
         try {
             locationClass = XposedHelpers.findClass(LOCATION_CLASS_NAME, classLoader);
         } catch (Throwable t) {
             logError("findClass " + LOCATION_CLASS_NAME + " failed, skip process " + packageName, t);
-            return;
+            return 0;
         }
 
         int installed = 0;
@@ -250,16 +271,21 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final int antiDetectHooks = AntiDetect.install(classLoader);
 
         // 安装条数随 Android 版本自然变化（如 Android 11 上没有 isMock/setMock，4/5 属正常）
+        final int total = installed + settingsHooks + appOpsHooks + appOpsExtraHooks
+                + resolverHooks + parcelHooks + envHooks + stepHooks + imuHooks + gnssHooks
+                + antiDetectHooks;
         log("hooks installed in " + packageName + " (sdk=" + Build.VERSION.SDK_INT
                 + ", location=" + installed + "/5, settings=" + settingsHooks
                 + ", appops_check=" + appOpsHooks + "/8, appops_extra=" + appOpsExtraHooks
                 + ", resolver=" + resolverHooks + "/2, parcel=" + parcelHooks + "/1"
                 + ", env=" + envHooks + "/5, step=" + stepHooks + "/2"
                 + ", imu=" + imuHooks + "/2, gnss=" + gnssHooks + "/15"
-                + ", anti_detect=" + antiDetectHooks + "/4)");
+                + ", anti_detect=" + antiDetectHooks + "/4, total=" + total + ")");
 
         // 注入成功：回报一次心跳，供主 App 区分“模块未注入 / 已注入但目标 App 不读传感器 / 正在读取”
         StepReplay.sendHeartbeatOnce();
+        // 心跳的 hooks 字段由调用方用本方法的返回值上报（见 handleLoadPackage），这里不重复上报
+        return total;
     }
 
     /** Location#isFromMockProvider() → false（API 18+，Android 12+ 已废弃但大量 App 仍在用）。 */

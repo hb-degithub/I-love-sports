@@ -18,6 +18,14 @@ import org.json.JSONObject;
 /**
  * 环境快照 Provider：仅在模拟进行时向目标 App 进程（LSPosed 模块）暴露基站/Wi-Fi 快照。
  * 无快照或未启用时返回 0 行，模块据此透传真实值。
+ *
+ * <p>除快照外还承担两条辅助通道：
+ * <ul>
+ *   <li>{@code /targets}：作用域配置（模块读"只对选定应用生效 + 名单"）；</li>
+ *   <li>{@code /hookbeat}：模块心跳，模块在每个被注入的进程里 insert 一次，
+ *       App 用它判断"模块是否生效"（{@link HookHeartbeatStore}）。</li>
+ * </ul>
+ * 心跳是唯一可从模块侧主动写进来的数据，所以 insert 只做轻量字段校验、只写 prefs。
  */
 public final class EnvProvider extends ContentProvider {
 
@@ -39,6 +47,22 @@ public final class EnvProvider extends ContentProvider {
      */
     public static final String PATH_TARGETS = "targets";
     public static final Uri TARGETS_URI = Uri.parse("content://" + AUTHORITY + "/" + PATH_TARGETS);
+    /**
+     * 模块心跳：模块在**每个被注入的进程**里 insert 一次，字段
+     * {@code process / hooks / kind / at / sdk}（见 {@link HookHeartbeatStore}）。
+     *
+     * <p>这条通道是"模块是否生效"的判定依据：包名（LSPosed 管理器）会被隐藏模块屏蔽，
+     * 心跳不会。只接收 insert，数据落在 prefs，不落任何其它副作用。
+     */
+    public static final String PATH_HOOKBEAT = "hookbeat";
+    public static final Uri HOOKBEAT_URI = Uri.parse("content://" + AUTHORITY + "/" + PATH_HOOKBEAT);
+
+    /** hookbeat 的 ContentValues key（与模块侧契约一致）。 */
+    private static final String KEY_PROCESS = "process";
+    private static final String KEY_HOOKS = "hooks";
+    private static final String KEY_KIND = "kind";
+    private static final String KEY_AT = "at";
+    private static final String KEY_SDK = "sdk";
 
     private static final String[] COLUMNS = {"mode", "json", "updated_at"};
     /** targets 路径单独用一列，避免模块侧还要按列名索引。 */
@@ -52,6 +76,10 @@ public final class EnvProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
+        // hookbeat 走最短路径：只读本地 prefs，内容与持久化结构一致（{进程名: {hooks,kind,at,sdk}}）。
+        if (isHookbeatUri(uri)) {
+            return hookbeatCursor();
+        }
         // targets 走最短路径：只读本地 prefs，不碰 PackageManager / 磁盘扫描，
         // 模块每次投递都会（带缓存地）读它，必须够快。
         if (isTargetsUri(uri)) {
@@ -135,6 +163,11 @@ public final class EnvProvider extends ContentProvider {
                 && PATH_TARGETS.equals(uri.getLastPathSegment());
     }
 
+    private static boolean isHookbeatUri(Uri uri) {
+        return uri != null && AUTHORITY.equals(uri.getAuthority())
+                && PATH_HOOKBEAT.equals(uri.getLastPathSegment());
+    }
+
     /**
      * 作用域配置游标：单列 {@code json}、单行。
      *
@@ -158,6 +191,21 @@ public final class EnvProvider extends ContentProvider {
             // JSONObject/JSONArray 在已知 key 下不会失败，兜底返回已构造部分
         }
         cursor.addRow(new Object[]{json.toString()});
+        return cursor;
+    }
+
+    /**
+     * 心跳游标：单列 {@code json}、单行，内容同持久化结构，例如
+     * {@code {"com.android.location.fused":{"hooks":12,"kind":"system","at":1699...,"sdk":34}}}。
+     *
+     * <p>没有心跳时也返回一行 {@code {}}，读方不用处理 0 行（与 targets 一致）。
+     */
+    private Cursor hookbeatCursor() {
+        MatrixCursor cursor = new MatrixCursor(TARGET_COLUMNS);
+        Context context = getContext();
+        cursor.addRow(new Object[]{
+                context == null ? "{}" : HookHeartbeatStore.snapshotJson(context)
+        });
         return cursor;
     }
 
@@ -188,9 +236,85 @@ public final class EnvProvider extends ContentProvider {
         return "vnd.android.cursor.item/vloc-env-snapshot";
     }
 
+    /**
+     * 唯一可写的路径：{@code /hookbeat}（模块心跳）。
+     *
+     * <p>其它路径（snapshot/location/gnss/steps/targets）保持只读语义，insert 返回 null——
+     * 注入数据由 App 单向写出，模块不该能改。
+     *
+     * <p>本方法运行在 Binder 线程，而且模块会在被注入进程的启动路径上调它，
+     * 所以只做**字段合法性**校验 + 一次 prefs 写入（apply），绝不查 PackageManager、
+     * 不扫磁盘、不抛异常（任何非法输入都返回 null）。
+     */
     @Override
     public Uri insert(Uri uri, ContentValues values) {
-        return null;
+        if (!isHookbeatUri(uri) || values == null) {
+            return null;
+        }
+        final String process = readString(values, KEY_PROCESS);
+        final Integer hooks = readInt(values, KEY_HOOKS);
+        final String kind = readString(values, KEY_KIND);
+        final Long rawAt = readLong(values, KEY_AT);
+        final Integer sdk = readInt(values, KEY_SDK);
+        // 必需字段：process / hooks / kind。at 缺省时用本机时间（老模块漏字段也能记下来），
+        // 但显式给了就必须在合理范围内。
+        if (!HookHeartbeatStore.isValidProcess(process) || hooks == null || hooks < 0) {
+            return null;
+        }
+        if (HookHeartbeatStore.normalizeKind(kind) == null) {
+            return null;
+        }
+        final long now = System.currentTimeMillis();
+        final long at = rawAt == null || rawAt <= 0L ? now : rawAt;
+        if (!HookHeartbeatStore.isValidAt(at, now)) {
+            return null;
+        }
+        Context context = getContext();
+        if (context == null) {
+            return null;
+        }
+        final int sdkValue = sdk == null ? 0 : sdk;   // <=0 时 store 用当前 SDK_INT 兜底
+        return HookHeartbeatStore.record(context, process, hooks, kind, at, sdkValue)
+                ? uri : null;
+    }
+
+    // ---------------------------------------------------------------- ContentValues 读取
+    // 模块可能把数值写成 String（个别老版本这样传），这里统一兼容；
+    // 类型不对只返回 null，绝不抛 ClassCastException。
+
+    private static Integer readInt(ContentValues values, String key) {
+        Object raw = values.get(key);
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof Number) {
+            return ((Number) raw).intValue();
+        }
+        try {
+            return Integer.valueOf(String.valueOf(raw).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static Long readLong(ContentValues values, String key) {
+        Object raw = values.get(key);
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof Number) {
+            return ((Number) raw).longValue();
+        }
+        try {
+            return Long.valueOf(String.valueOf(raw).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static String readString(ContentValues values, String key) {
+        Object raw = values.get(key);
+        return raw == null ? null : String.valueOf(raw);
     }
 
     @Override

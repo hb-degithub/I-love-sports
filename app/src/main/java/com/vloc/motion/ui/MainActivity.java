@@ -53,6 +53,7 @@ import com.vloc.motion.location.ModuleCheck;
 import com.vloc.motion.location.RootShell;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.service.EnvSession;
+import com.vloc.motion.service.HookHeartbeatStore;
 import com.vloc.motion.service.StepSession;
 import com.vloc.motion.service.LocationService;
 import com.vloc.motion.service.Session;
@@ -712,19 +713,32 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     }
 
     /**
-     * system_server 里的模块最近是否读过快照（系统级注入下"模块在接管"的直接证据）。
+     * system_server 里的模块是否还"在"（系统级注入下的存活判定，UI 侧）。
      *
-     * <p>判定口径与 {@code LocationService#isSystemModuleOnline()} 不同：那里启动阶段用
+     * <p>判定口径与 {@code LocationService#isSystemModuleOnline()} 略有不同：那里启动阶段用
      * 严格的 5 秒窗口防止"假成功"，UI 这里用运行期告警门槛 {@link #SYSTEM_MODULE_SILENCE_MS}
      * （30 秒），否则目标 App 暂时不请求定位时界面会闪"未接管"。
+     *
+     * <p>两条证据取**或**：快照读取新鲜（30 秒）**或** 24 小时内有 {@code kind=system} 的
+     * 模块心跳（{@link HookHeartbeatStore}）。心跳按进程注入打一次、不是周期性的，
+     * 所以窗口取 24 小时——不能用 30 秒去卡，否则注入后 30 秒就误报"未接管"。
      */
     private boolean isSystemModuleFresh() {
         long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
-        if (seenAt <= 0L) {
-            return false;
+        if (seenAt > 0L) {
+            long age = System.currentTimeMillis() - seenAt;
+            if (age >= 0L && age <= SYSTEM_MODULE_SILENCE_MS) {
+                return true;
+            }
         }
-        long age = System.currentTimeMillis() - seenAt;
-        return age >= 0L && age <= SYSTEM_MODULE_SILENCE_MS;
+        return systemHeartbeatAgeMs() >= 0L;
+    }
+
+    /** 系统框架心跳距今多少毫秒；没有（或超过 24 小时）返回 -1。 */
+    private long systemHeartbeatAgeMs() {
+        HookHeartbeatStore.Beat beat = HookHeartbeatStore.freshestSystem(this,
+                HookHeartbeatStore.FRESH_MS, Build.VERSION.SDK_INT);
+        return beat == null ? -1L : Math.max(0L, System.currentTimeMillis() - beat.at);
     }
 
     private void refreshUi() {
@@ -782,12 +796,17 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             if (systemInjectMode) {
                 // 系统级注入推荐把模块勾进「系统框架」作用域，那种配置下目标进程心跳
                 // 恒为 0；继续用心跳判定会长期显示"模块未注入"，还会把用户引向
-                // "去勾目标 App"这种与实际要求相反的配置。这里改看 moduleSystemReadAt
-                // （由 EnvProvider 记录 system_server 的 uid 1000 读取）。
+                // "去勾目标 App"这种与实际要求相反的配置。这里先看 moduleSystemReadAt
+                // （由 EnvProvider 记录 system_server 的 uid 1000 读取），再看系统框架心跳
+                // （HookHeartbeatStore 的 kind=system，24 小时窗口）——两者任一即可。
                 long systemRead = StepSession.INSTANCE.moduleSystemReadAt;
                 long age = systemRead <= 0 ? -1 : System.currentTimeMillis() - systemRead;
+                long heartbeatAge = systemHeartbeatAgeMs();
                 if (systemRead > 0 && age >= 0 && age <= SYSTEM_MODULE_SILENCE_MS) {
                     stepTag += String.format(Locale.US, " · 系统框架已接管 %ds前", age / 1000);
+                } else if (heartbeatAge >= 0L) {
+                    stepTag += String.format(Locale.US, " · 系统框架已注入（心跳 %ds前）",
+                            heartbeatAge / 1000);
                 } else {
                     stepTag += " · 系统框架未接管";
                 }
@@ -1149,25 +1168,128 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         }
     }
 
+    /**
+     * 「模块状态」：以**模块心跳**为首选判据，LSPosed 管理器包名只作附加信息。
+     *
+     * <p>旧实现用 {@link ModuleCheck#detectManager}（查 {@code org.lsposed.manager} 包名）判断
+     * "框架有没有生效"。用户装了 HideMyAppList 这类隐藏模块后包名查不到，界面就误报
+     * "LSPosed 框架没有生效"，而 LSPosed 日志里模块明明已经注入（{@code hooks installed in
+     * com.android.location.fused}）。心跳由模块自己 insert 上来，隐藏模块管不到，才是真信号：
+     * <b>管理器不可见不等于模块未生效</b>。
+     *
+     * <p>三种状态（按优先级）：
+     * <ol>
+     *   <li>有 {@code kind=system} 且 24 小时内的心跳 → 「模块已生效（系统框架）」；</li>
+     *   <li>否则有任何 {@code kind=app} 心跳 → 「已注入 N 个应用进程」；</li>
+     *   <li>一条心跳都没有 → 「未检测到模块活动」。</li>
+     * </ol>
+     */
     private void showModuleStatusDialog() {
-        String manager = ModuleCheck.detectManager(this);
-        long read = StepSession.INSTANCE.moduleLastReadAt;
-        long beat = StepSession.INSTANCE.moduleHeartbeatAt;
+        final long now = System.currentTimeMillis();
+        final List<HookHeartbeatStore.Beat> beats = HookHeartbeatStore.beats(this);
+        final HookHeartbeatStore.Beat system =
+                HookHeartbeatStore.freshestSystem(this, HookHeartbeatStore.FRESH_MS,
+                        Build.VERSION.SDK_INT);
+        int appCount = 0;
+        for (HookHeartbeatStore.Beat beat : beats) {
+            if (!beat.isSystem()) {
+                appCount++;
+            }
+        }
+        final long legacyBeat = StepSession.INSTANCE.moduleHeartbeatAt;
         StringBuilder sb = new StringBuilder();
-        sb.append("LSPosed 管理器：").append(manager == null ? "未检测到（需先安装 LSPosed）" : manager).append('\n');
-        sb.append("模块注入：").append(beat > 0 ? "已注入目标 App" : "尚未注入").append('\n');
-        sb.append("数据读取：").append(read > 0 ? "目标 App 正在读取步数" : "目标 App 未读取").append('\n');
-        sb.append("\n启用步骤：\n");
-        sb.append("1. 安装并激活 LSPosed（Magisk/KernelSU 的 Zygisk 模块）\n");
-        sb.append("2. 打开 LSPosed 管理器 → 模块 → 勾选「虚拟运动」\n");
-        sb.append("3. 进入「虚拟运动」的作用域，勾选目标 App（多进程 App 要逐个勾选）\n");
-        sb.append("4. 强制停止目标 App，再重新打开\n");
-        sb.append("5. 回到本应用开始模拟，悬浮窗第二行应显示「模块读取中」");
+        if (system != null) {
+            sb.append("结论：模块已生效（系统框架）✓");
+        } else if (appCount > 0) {
+            sb.append("结论：已注入 ").append(appCount).append(" 个应用进程");
+        } else if (legacyBeat > 0L) {
+            // 旧版模块只走 call('module_heartbeat')，没有进程明细：别把"有活动"说成"没活动"
+            sb.append("结论：已注入（旧版心跳，无进程详情）");
+        } else {
+            sb.append("结论：未检测到模块活动");
+        }
+        sb.append('\n');
+        appendHookBeatLines(sb, beats, now);
+        long lastBeat = beats.isEmpty() ? 0L : beats.get(0).at;
+        if (lastBeat <= 0L) {
+            lastBeat = legacyBeat;
+        }
+        if (lastBeat > 0L) {
+            sb.append("最后心跳：").append(formatAge(now - lastBeat))
+                    .append("（").append(formatClock(lastBeat, now)).append("）\n");
+        }
+        String manager = ModuleCheck.detectManager(this);
+        sb.append("LSPosed 管理器：")
+                .append(manager == null
+                        ? "不可见（可能被隐藏模块屏蔽，不影响模块本身）"
+                        : "可见（" + manager + "）")
+                .append('\n');
+        if (manager == null) {
+            // 只有"查不到"才需要这句解释；查到了就没有歧义，省一行
+            sb.append("管理器不可见 ≠ 模块未生效，请以模块心跳为准。");
+        }
+        if (system == null && appCount == 0 && legacyBeat <= 0L) {
+            sb.append("\n\n排查：在 LSPosed 中启用本模块，作用域勾选「系统框架（android）」或目标 App，\n")
+                    .append("然后重启手机 / 重启目标 App（注入成功的进程会留下心跳）。");
+        }
         new AlertDialog.Builder(this)
                 .setTitle("模块状态")
                 .setMessage(sb.toString())
                 .setPositiveButton("知道了", null)
                 .show();
+    }
+
+    /** 逐行列出每个进程的心跳（超过 6 条折叠），供「模块状态」自助排查。 */
+    private void appendHookBeatLines(StringBuilder sb, List<HookHeartbeatStore.Beat> beats,
+                                     long now) {
+        if (beats.isEmpty()) {
+            return;
+        }
+        sb.append('\n').append("进程心跳：");
+        final int limit = 6;
+        for (int i = 0; i < beats.size() && i < limit; i++) {
+            HookHeartbeatStore.Beat beat = beats.get(i);
+            long age = Math.max(0L, now - beat.at);
+            sb.append('\n').append("· ").append(beat.process)
+                    .append(" · ").append(beat.kind)
+                    .append(" · ").append(beat.hooks).append(" hooks")
+                    .append(" · ").append(formatAge(age));
+            if (age > HookHeartbeatStore.FRESH_MS) {
+                sb.append("（已过期）");
+            }
+        }
+        if (beats.size() > limit) {
+            sb.append('\n').append("… 共 ").append(beats.size()).append(" 个进程");
+        }
+        sb.append('\n');   // 让后面的「最后心跳」另起一行
+    }
+
+    /** 毫秒差 → 简短"多久前"文案（心跳时间用）。 */
+    private static String formatAge(long ageMs) {
+        final long age = Math.max(0L, ageMs);
+        if (age < 1500L) {
+            return "刚刚";
+        }
+        long seconds = age / 1000L;
+        if (seconds < 60L) {
+            return seconds + " 秒前";
+        }
+        long minutes = seconds / 60L;
+        if (minutes < 60L) {
+            return minutes + " 分钟前";
+        }
+        long hours = minutes / 60L;
+        if (hours < 48L) {
+            return hours + " 小时前";
+        }
+        return (hours / 24L) + " 天前";
+    }
+
+    /** 绝对时间：一天内只显示时分秒，更早的带上日期。 */
+    private static String formatClock(long at, long now) {
+        String pattern = Math.abs(now - at) < 24L * 60L * 60L * 1000L
+                ? "HH:mm:ss" : "MM-dd HH:mm";
+        return new SimpleDateFormat(pattern, Locale.US).format(new Date(at));
     }
 
     private void showDiagnostics(boolean root) {

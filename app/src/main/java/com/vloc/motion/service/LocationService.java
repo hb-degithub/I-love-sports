@@ -109,10 +109,18 @@ public class LocationService extends Service {
      * "模块已经不在接管"区分开，同时最早也能在 30 秒内暴露静默空转。
      */
     private static final long SYSTEM_MODULE_SILENCE_WARN_MS = 30_000L;
+    /**
+     * 模块心跳（{@code kind=system}）的可信窗口（毫秒）。
+     *
+     * <p>心跳按"进程注入成功"打一次，不是周期性的：模块注入 system_server 后可能几小时都
+     * 不再上报，所以不能用 5 秒 / 30 秒那种活跃窗口去卡它，取 24 小时。
+     */
+    private static final long SYSTEM_MODULE_HEARTBEAT_MS = HookHeartbeatStore.FRESH_MS;
     /** 系统级注入但模块不在线时的统一错误文案（UI 直接展示）。 */
     private static final String SYSTEM_MODULE_MISSING_MSG =
-            "系统级注入已开启，但未检测到 LSPosed 模块活动：请确认模块已启用并在 LSPosed 作用域中勾选"
-                    + "「系统框架」后重启手机；或关闭「系统级注入」改用 root 注入";
+            "系统级注入已开启，但未检测到模块活动：请确认模块已在 LSPosed 启用、作用域勾选"
+                    + "「系统框架」后重启手机；或关闭「系统级注入」改用 root 注入。"
+                    + "可打开「模块状态」查看各进程心跳";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final RoutePlayer player = new RoutePlayer();
@@ -753,8 +761,7 @@ public class LocationService extends Service {
     private PrepareResult prepareSystemInject(Session session) {
         session.rootOk = RootShell.isRooted();
         if (isSystemModuleOnline()) {
-            Log.i(TAG, "system inject ready: module read our snapshot "
-                    + (System.currentTimeMillis() - StepSession.INSTANCE.moduleSystemReadAt) + "ms ago");
+            Log.i(TAG, "system inject ready: " + describeSystemModuleEvidence());
             return new PrepareResult(true, null);
         }
         // 没有既有痕迹：主动触发一次定位读取，逼 system_server 里的模块回读快照
@@ -768,32 +775,92 @@ public class LocationService extends Service {
             SystemClock.sleep(SYSTEM_MODULE_PROBE_POLL_MS);
         }
         // 仍无痕迹：绝不再"假成功"，走与 root 失败相同的失败路径
-        Log.w(TAG, "system inject enabled but no module activity within "
-                + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS + "ms)");
+        Log.w(TAG, "system inject enabled but no module evidence: no snapshot read within "
+                + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS
+                + "ms) and no system heartbeat within " + SYSTEM_MODULE_HEARTBEAT_MS + "ms");
         return PrepareResult.failed(session, SYSTEM_MODULE_MISSING_MSG);
     }
 
     /**
-     * system_server 里的模块是否最近真的读过本应用的定位快照。
+     * system_server 里的模块是否还活着。两条证据取**或**：
      *
-     * <p>这是系统级注入唯一的直接存活证据：模块的定位/GNSS hook 一触发就会 query
-     * {@code content://com.vloc.motion.env/location|gnss}（{@code hidden/SystemHooks.java}），
-     * 该 query 由 system_server（uid 1000）发起，{@link EnvProvider} 会记录时间戳。
+     * <ol>
+     *   <li><b>快照读取新鲜</b>：模块的定位/GNSS hook 一触发就会 query
+     *       {@code content://com.vloc.motion.env/location|gnss}（{@code hidden/SystemHooks.java}），
+     *       该 query 由 system_server（uid 1000）发起，{@link EnvProvider} 记录时间戳。
+     *       窗口 {@link #SYSTEM_MODULE_FRESH_MS}（5 秒）——启动阶段的严格证据。</li>
+     *   <li><b>系统框架心跳</b>：模块注入 {@code android} 进程后 insert 了一条
+     *       {@code kind=system} 的心跳（{@link HookHeartbeatStore}）。窗口
+     *       {@link #SYSTEM_MODULE_HEARTBEAT_MS}（24 小时），SDK 一致优先。</li>
+     * </ol>
      *
-     * <p>不使用 {@link StepSession#moduleHeartbeatAt}：那个心跳来自**目标 App 进程**里的模块
-     * （{@code hidden/StepReplay.java:731}），只能证明模块在某处注入成功，不能证明
-     * 系统框架作用域生效，用它放行仍会造成"假成功"。
+     * <p>为什么要加第 2 条：目标 App 可能暂时没请求定位（刚开机、被切后台、用户还没打开），
+     * 此时第 1 条自然没有新痕迹，旧判定会把"模块明明在"误报成"未检测到模块活动"。
+     * 心跳是模块自己写的，不受 LSPosed 管理器包名被隐藏模块屏蔽的影响。
+     *
+     * <p>不使用 {@link StepSession#moduleHeartbeatAt}（{@code call("module_heartbeat")}）：
+     * 那个心跳来自**目标 App 进程**里的模块，只能证明模块在某处注入成功，不能证明系统框架
+     * 作用域生效。{@link HookHeartbeatStore} 区分了 {@code kind=system}/{@code app}，才敢用。
      *
      * <p>也不使用 {@link VlocStateFile}：它只被 App 单向写给 Zygisk 原生模块
      * （{@code zygisk/src/module.cpp} 用 PROT_READ mmap），模块不回写任何 ack，没有可读信号。
      */
     private boolean isSystemModuleOnline() {
+        final long now = System.currentTimeMillis();
         final long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
-        if (seenAt <= 0L) {
-            return false;
+        if (seenAt > 0L) {
+            final long age = now - seenAt;
+            if (age >= 0L && age <= SYSTEM_MODULE_FRESH_MS) {
+                return true;
+            }
         }
-        final long age = System.currentTimeMillis() - seenAt;
-        return age >= 0L && age <= SYSTEM_MODULE_FRESH_MS;
+        return systemHeartbeatFresh();
+    }
+
+    /**
+     * 运行期是否还该认为「系统级注入在动」：快照读取新鲜（30 秒）
+     * **或** 有 24 小时内的系统框架心跳。
+     *
+     * <p>心跳不是周期性的，用 30 秒窗口会在注入后 30 秒就报"模块不见了"，
+     * 所以这里对心跳仍用 24 小时；真正"作用域没勾、模块根本没进去"的场景
+     * 一条心跳都没有，照样会告警。
+     */
+    private boolean isSystemModuleRunning() {
+        final long now = System.currentTimeMillis();
+        final long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
+        if (seenAt > 0L) {
+            final long age = now - seenAt;
+            if (age >= 0L && age <= SYSTEM_MODULE_SILENCE_WARN_MS) {
+                return true;
+            }
+        }
+        return systemHeartbeatFresh();
+    }
+
+    /** 最近 {@link #SYSTEM_MODULE_HEARTBEAT_MS} 内有没有 {@code kind=system} 的心跳。 */
+    private boolean systemHeartbeatFresh() {
+        return HookHeartbeatStore.freshestSystem(getApplicationContext(),
+                SYSTEM_MODULE_HEARTBEAT_MS, Build.VERSION.SDK_INT) != null;
+    }
+
+    /** 日志用：说明这次判活靠哪条证据（快照读取 or 系统框架心跳），失败时说明两条都没有。 */
+    private String describeSystemModuleEvidence() {
+        final long now = System.currentTimeMillis();
+        final long seenAt = StepSession.INSTANCE.moduleSystemReadAt;
+        final long age = seenAt > 0L ? now - seenAt : -1L;
+        if (age >= 0L && age <= SYSTEM_MODULE_FRESH_MS) {
+            return "module read our snapshot " + age + "ms ago";
+        }
+        HookHeartbeatStore.Beat beat = HookHeartbeatStore.freshestSystem(getApplicationContext(),
+                SYSTEM_MODULE_HEARTBEAT_MS, Build.VERSION.SDK_INT);
+        if (beat != null) {
+            return "system heartbeat from " + beat.process + " (" + beat.hooks + " hooks, "
+                    + (now - beat.at) + "ms ago)";
+        }
+        if (age >= 0L) {
+            return "no system heartbeat; last snapshot read " + age + "ms ago";
+        }
+        return "no system heartbeat and no snapshot read yet";
     }
 
     /**
@@ -950,14 +1017,14 @@ public class LocationService extends Service {
                 fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
         if (injector == null) {
             // 系统级注入：本进程不写测试 Provider，由 system_server 里的模块改写定位。
-            // 但只有"能证明模块正在接管"时才允许空转，否则界面会显示运行中、
-            // 里程在涨，却一个坐标都没注入（v0.40.0 之前的静默缺陷）。
-            final long silentMs = System.currentTimeMillis() - StepSession.INSTANCE.moduleSystemReadAt;
-            if (StepSession.INSTANCE.moduleSystemReadAt > 0
-                    && silentMs >= 0L && silentMs <= SYSTEM_MODULE_SILENCE_WARN_MS) {
+            // 但只有"能证明模块在动"时才允许空转，否则界面会显示运行中、里程在涨，
+            // 却一个坐标都没注入（v0.40.0 之前的静默缺陷）。
+            // 证据：system_server 读过快照（30 秒内）**或** 有 24 小时内的系统框架心跳——
+            // 后者覆盖"目标 App 暂时没请求定位"的正常场景，避免误报（见 isSystemModuleRunning）。
+            if (isSystemModuleRunning()) {
                 if (systemModuleWarned) {
                     systemModuleWarned = false;
-                    // 模块恢复读取：立刻清掉上一次的静默 error，否则一次误报会永久粘在界面上
+                    // 模块恢复读取 / 有心跳：立刻清掉上一次的静默 error，否则一次误报会永久粘在界面上
                     clearSystemModuleError();
                 }
                 return;
@@ -971,9 +1038,8 @@ public class LocationService extends Service {
                 return;
             }
             systemModuleWarned = true;
-            Log.e(TAG, "injectFix: system inject mode, but module silent for "
-                    + (StepSession.INSTANCE.moduleSystemReadAt > 0 ? silentMs + "ms" : "the whole session")
-                    + "; nothing is being injected");
+            Log.e(TAG, "injectFix: system inject mode, but no module evidence ("
+                    + describeSystemModuleEvidence() + "); nothing is being injected");
             session.error = SYSTEM_MODULE_MISSING_MSG;
             session.notifyChanged();
             // 用户此刻通常在目标 App 里，MainActivity.onPause 已 removeListener：
