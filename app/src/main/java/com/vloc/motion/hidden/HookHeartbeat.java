@@ -10,6 +10,8 @@ import android.os.Looper;
 import android.os.Process;
 import android.os.SystemClock;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -89,6 +91,28 @@ final class HookHeartbeat {
     private static final long[] RETRY_DELAYS_MS = {2_000L, 5_000L, 10_000L, 30_000L};
 
     /**
+     * Context 四级回退的来源名（日志里逐字出现，下一轮可直接 grep 定位是哪一步在炸）。
+     *
+     * <p>顺序即优先级：system 进程（system_server / {@code com.android.location.fused}）里
+     * 第 1 步是<b>真机已验证可用</b>的那条（与 {@link HookEntry} 的 AppOps 自身豁免同一取法）；
+     * app 进程里第 1 步通常也能拿到，第 2 步是 Xposed 的等价入口。
+     */
+    private static final String SOURCE_APP_GLOBALS = "AppGlobals.getInitialApplication";
+    private static final String SOURCE_ANDROID_APP_HELPER = "AndroidAppHelper.currentApplication";
+    private static final String SOURCE_CURRENT_APPLICATION = "ActivityThread.currentApplication";
+    private static final String SOURCE_SYSTEM_CONTEXT =
+            "ActivityThread.currentActivityThread().getSystemContext";
+
+    /** 异常日志里最多带几层堆栈：够定位到调用点，又不会把 LSPosed 日志刷爆。 */
+    private static final int STACK_FRAME_LIMIT = 5;
+
+    /** 单条异常 message 最多保留多少字符（Android 的 NPE message 可能很长）。 */
+    private static final int MESSAGE_LIMIT = 200;
+
+    /** “各来源为什么都失败”的诊断整体上限，防止日志无限增长。 */
+    private static final int DIAGNOSIS_LIMIT = 700;
+
+    /**
      * 每进程“已成功上报”的闸门。
      *
      * <p><b>只在 {@code insert} 返回非 null Uri 之后才置位</b>（旧实现提前占坑是致命缺陷）。
@@ -111,6 +135,12 @@ final class HookHeartbeat {
     private static final AtomicBoolean sLoggedThrowable = new AtomicBoolean(false);
     private static final AtomicBoolean sLoggedAbandoned = new AtomicBoolean(false);
 
+    /** “本进程最终的 Context 来自哪条来源”只记一条（下一轮排查先看它）。 */
+    private static final AtomicBoolean sLoggedContextSource = new AtomicBoolean(false);
+
+    /** 某条来源失败、但后续来源顶上：只记一条，用来定位“哪一步在炸”。 */
+    private static final AtomicBoolean sLoggedSourceFailure = new AtomicBoolean(false);
+
     /** 上次真正尝试上报的时刻（{@link SystemClock#elapsedRealtime()}，单调钟，不受改时间影响）。 */
     private static volatile long sLastAttemptAt;
 
@@ -121,6 +151,15 @@ final class HookHeartbeat {
 
     /** 进程内复用的 Context（同一个进程里 ContentResolver 不会变，省掉每进程一次的反射）。 */
     private static volatile Context sContext;
+
+    /** 当前 {@link #sContext} 来自哪条来源（{@link #SOURCE_APP_GLOBALS} 等），供日志使用。 */
+    private static volatile String sContextSource;
+
+    /**
+     * 四个来源全部失败时，各步的失败原因（含异常 message 与前 {@value #STACK_FRAME_LIMIT} 层堆栈）。
+     * 只由 {@link #logNoContextOnce()} 一次性打进日志，之后清空。
+     */
+    private static volatile String sContextDiagnosis;
 
     /** 延迟补试用的 Handler（主线程 Looper 懒加载，创建一次后复用；拿不到就退化为回调补试）。 */
     private static volatile Handler sRetryHandler;
@@ -137,7 +176,7 @@ final class HookHeartbeat {
      * 后续由 {@link #scheduleRetry()} 排队的延迟任务或 {@link #retryIfPending()}
      * （既有 hook 回调里顺手调用）继续补试，最多 {@link #MAX_ATTEMPTS} 次。
      *
-     * @param ctx         可用的 Context；传 {@code null} 时按 {@link #context()} 的三级回退自取
+     * @param ctx         可用的 Context；传 {@code null} 时按 {@link #context()} 的**四级回退**自取
      * @param processName 进程名（{@code lpparam.packageName}）；为空时退回当前进程包名
      * @param hooks       本进程实际安装成功的 hook 数（真实计数，不做估算）
      * @param kind        {@link #KIND_SYSTEM} 或 {@link #KIND_APP}，见 {@link #kindOfCurrentProcess()}
@@ -201,17 +240,22 @@ final class HookHeartbeat {
         try {
             sLastAttemptAt = now;
             sAttempts.incrementAndGet();
-            final Context context = ctxHint != null ? ctxHint : context();
-            if (context == null) {
-                // 三级回退全失败：不放弃，挂起待上报参数，等延迟补试 / 后续 hook 回调
+            // Context 只从一个地方来：hint 可用就用 hint，否则走四级回退。两条路径都做了判空，
+            // 任何一步的 NPE 都已在各自 try/catch 里被吃掉，这里拿到的要么是可用 Context，要么是 null。
+            Context context = ctxHint;
+            if (!hasResolver(context)) {
+                context = context();
+            }
+            final ContentResolver resolver = resolverOf(context);
+            if (context == null || resolver == null) {
+                // 四个来源全部 null / 全部抛异常（或被缓存下来的 Context 已不可用）：
+                // 统一记为“没有 Context”，绝不写成 NullPointerException；
+                // 不置位成功闸门，由 finally 里的补试继续（次数 / 退避都不变）。
+                sContext = null;  // 下一轮重新探测（AppGlobals 优先），别复用坏 Context
                 logNoContextOnce();
                 return;
             }
-            final ContentResolver resolver = context.getContentResolver();
-            if (resolver == null) {
-                logNoContextOnce();
-                return;
-            }
+            sContext = context;  // 已验证有 ContentResolver：进程内复用，省掉后续反射
             final ContentValues values = new ContentValues(5);
             values.put(COL_PROCESS, name);
             values.put(COL_HOOKS, Integer.valueOf(hooks));
@@ -230,6 +274,9 @@ final class HookHeartbeat {
             sPendingKind = null;
             log("heartbeat reported: " + name + " hooks=" + hooks);
         } catch (Throwable t) {
+            // 刚用过的 Context 可能已失效（例如 insert 内部 NPE）：丢掉缓存，下一轮重新探测；
+            // 异常本身只在这里被“记录 + 吞掉”，绝不冒到宿主进程，也不再让 NPE 打满 5 次无信息日志。
+            sContext = null;
             logThrowableOnce(t);
         } finally {
             sInFlight.set(false);
@@ -348,70 +395,262 @@ final class HookHeartbeat {
     }
 
     /**
-     * 拿一个可用的 Context，三级回退（与 {@link TargetScope} 的取法一致）：
+     * 拿一个可用的 Context，<b>四级回退</b>，每一步各自独立 try/catch、独立判 null：
      * <ol>
-     *   <li>{@code ActivityThread.currentApplication()}：app 进程 attach 之后可用；</li>
-     *   <li>{@code AndroidAppHelper.currentApplication()}：Xposed 提供的等价入口；</li>
-     *   <li>{@code ActivityThread.currentActivityThread().getSystemContext()}：
-     *       {@code handleLoadPackage} 早期（Application 还没 attach）与 system_server 里都能拿到，
-     *       ContentResolver 解析主 App 的 Provider 不需要 Application 级别的东西。</li>
+     *   <li>{@link #fromAppGlobals(StringBuilder) AppGlobals.getInitialApplication()}（反射）：
+     *       system 进程首选。<b>真机已验证</b>——同进程 uid 1000 的
+     *       {@code com.android.location.fused} 里，{@link HookEntry} 的 AppOps 自身豁免
+     *       用同一条取法成功（{@code appops self-exempt: uid=10574}）；</li>
+     *   <li>{@link #fromAndroidAppHelper(StringBuilder) AndroidAppHelper.currentApplication()}：
+     *       目标 App 进程首选（Xposed 提供的等价入口）；</li>
+     *   <li>{@link #fromCurrentApplication(StringBuilder) ActivityThread.currentApplication()}（反射）：
+     *       app 进程 attach 之后可用；</li>
+     *   <li>{@link #fromSystemContext(StringBuilder) currentActivityThread().getSystemContext()}（反射）：
+     *       {@code handleLoadPackage} 早期也能拿到系统 Context；两步分别判 null，绝不链式调用。</li>
      * </ol>
-     * 三级都拿不到返回 {@code null}：调用方<b>不放弃</b>，挂起待上报参数并走补试路径。
+     *
+     * <p><b>为什么不会再冒出 NPE</b>：每一小步（含中间的反射调用、返回值、resolver 校验）都在
+     * 自己的 {@code catch (Throwable)} 里，出错只写进诊断串并继续下一步；四个来源全部失败返回
+     * {@code null}，调用方统一记 {@code heartbeat failed: no context}。因此任何来源的 NPE
+     * 既到不了 {@link #attemptOnce(Context)} 的 catch，也不可能被误报成
+     * {@code heartbeat failed: NullPointerException}。
+     *
+     * <p>只有真正的尝试路径才会走到这里（每进程最多 {@value #MAX_ATTEMPTS} 次），探测期间只分配
+     * 一个小的诊断 {@link StringBuilder}，不影响 {@link #retryIfPending()} 的快路径。
      */
     private static Context context() {
-        Context context = sContext;
-        if (context != null) {
-            return context;
-        }
-        context = callStaticContext("android.app.ActivityThread", "currentApplication");
-        if (context == null) {
-            context = callStaticContext("android.app.AndroidAppHelper", "currentApplication");
-        }
-        if (context == null) {
-            try {
-                final Class<?> activityThread = XposedHelpers.findClassIfExists(
-                        "android.app.ActivityThread", HookHeartbeat.class.getClassLoader());
-                if (activityThread != null) {
-                    final Object thread =
-                            XposedHelpers.callStaticMethod(activityThread, "currentActivityThread");
-                    if (thread != null) {
-                        final Object value = XposedHelpers.callMethod(thread, "getSystemContext");
-                        if (value instanceof Context) {
-                            context = (Context) value;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {
-                // 拿不到就交给补试路径（下一轮再试三级回退）
+        final Context cached = sContext;
+        if (cached != null) {
+            if (hasResolver(cached)) {
+                return cached;  // 缓存且仍然可用
             }
+            sContext = null;  // 缓存里的 Context 已不可用：丢掉重探，绝不把它的异常抛出去
+            sContextSource = null;
         }
-        if (context != null) {
-            sContext = context;
+        final StringBuilder diagnosis = new StringBuilder(64);
+        Context context = adopt(SOURCE_APP_GLOBALS, fromAppGlobals(diagnosis), diagnosis);
+        if (context == null) {
+            context = adopt(SOURCE_ANDROID_APP_HELPER, fromAndroidAppHelper(diagnosis), diagnosis);
         }
+        if (context == null) {
+            context = adopt(SOURCE_CURRENT_APPLICATION, fromCurrentApplication(diagnosis), diagnosis);
+        }
+        if (context == null) {
+            context = adopt(SOURCE_SYSTEM_CONTEXT, fromSystemContext(diagnosis), diagnosis);
+        }
+        if (context == null) {
+            // 四个来源都没给出可用 Context：交给 no-context 日志（每进程一条），不在这里打异常日志。
+            // 已经记过那条日志之后就不再攒诊断串，后续补试不产生多余分配。
+            if (!sLoggedNoContext.get()) {
+                sContextDiagnosis = diagnosis.toString();
+            }
+            return null;
+        }
+        sContext = context;
+        sContextDiagnosis = null;
+        logSourceFailureOnce(diagnosis.length() == 0 ? null : diagnosis.toString());
+        logContextSourceOnce(sContextSource);
         return context;
     }
 
-    private static Context callStaticContext(String className, String methodName) {
+    /**
+     * 第 1 步：{@code AppGlobals.getInitialApplication()}（反射；system 进程首选，真机已验证可用）。
+     *
+     * <p>取法与 {@link HookEntry} 的 AppOps 自身豁免完全一致（{@code Class.forName} +
+     * {@code getMethod} + {@code invoke}）；任何 Throwable（含目标方法自己的 NPE）只记录不抛出。
+     *
+     * @return 可用的 Application，或 {@code null}（这一步失败，交给下一步）
+     */
+    private static Context fromAppGlobals(StringBuilder diagnosis) {
         try {
-            final Class<?> clazz = XposedHelpers.findClassIfExists(className,
-                    HookHeartbeat.class.getClassLoader());
-            if (clazz == null) {
+            final Class<?> appGlobals = Class.forName("android.app.AppGlobals");
+            if (appGlobals == null) {
                 return null;
             }
-            final Object value = XposedHelpers.callStaticMethod(clazz, methodName);
-            return value instanceof Context ? (Context) value : null;
-        } catch (Throwable ignored) {
+            final Method getInitialApplication = appGlobals.getMethod("getInitialApplication");
+            if (getInitialApplication == null) {
+                return null;
+            }
+            final Object application = getInitialApplication.invoke(null);
+            if (application == null) {
+                return null;  // 系统还没初始化：正常的空，不是异常
+            }
+            return application instanceof Context ? (Context) application : null;
+        } catch (Throwable t) {
+            noteDiagnosis(diagnosis, SOURCE_APP_GLOBALS + " " + inlineDetail(t));
+            return null;
+        }
+    }
+
+    /**
+     * 第 2 步：{@code AndroidAppHelper.currentApplication()}（Xposed 的入口，目标 App 进程首选）。
+     *
+     * <p>该类由 Xposed 运行时注入，模块编译期不存在，只能反射；类不存在 / 方法不存在 /
+     * 目标方法抛 NPE 全部只记录不抛出。
+     *
+     * @return 可用的 Application，或 {@code null}（这一步失败，交给下一步）
+     */
+    private static Context fromAndroidAppHelper(StringBuilder diagnosis) {
+        try {
+            final Class<?> helper = Class.forName("android.app.AndroidAppHelper");
+            if (helper == null) {
+                return null;
+            }
+            final Method currentApplication = helper.getMethod("currentApplication");
+            if (currentApplication == null) {
+                return null;
+            }
+            final Object application = currentApplication.invoke(null);
+            if (application == null) {
+                return null;
+            }
+            return application instanceof Context ? (Context) application : null;
+        } catch (Throwable t) {
+            noteDiagnosis(diagnosis, SOURCE_ANDROID_APP_HELPER + " " + inlineDetail(t));
+            return null;
+        }
+    }
+
+    /**
+     * 第 3 步：{@code ActivityThread.currentApplication()}（反射）。
+     *
+     * @return 可用的 Application，或 {@code null}（这一步失败，交给下一步）
+     */
+    private static Context fromCurrentApplication(StringBuilder diagnosis) {
+        try {
+            final Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            if (activityThread == null) {
+                return null;
+            }
+            final Method currentApplication = activityThread.getMethod("currentApplication");
+            if (currentApplication == null) {
+                return null;
+            }
+            final Object application = currentApplication.invoke(null);
+            if (application == null) {
+                return null;
+            }
+            return application instanceof Context ? (Context) application : null;
+        } catch (Throwable t) {
+            noteDiagnosis(diagnosis, SOURCE_CURRENT_APPLICATION + " " + inlineDetail(t));
+            return null;
+        }
+    }
+
+    /**
+     * 第 4 步：{@code ActivityThread.currentActivityThread().getSystemContext()}（反射）。
+     *
+     * <p>两次反射拆成两行、<b>各自判 null</b>（不写
+     * {@code currentActivityThread().getSystemContext()} 这种链式调用）：ActivityThread 还没
+     * 建立时第一步就是 null，直接失败，不会在 null 上调用方法。
+     *
+     * @return 系统 Context，或 {@code null}（这一步失败，交给调用方）
+     */
+    private static Context fromSystemContext(StringBuilder diagnosis) {
+        try {
+            final Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            if (activityThread == null) {
+                return null;
+            }
+            final Method currentActivityThread = activityThread.getMethod("currentActivityThread");
+            if (currentActivityThread == null) {
+                return null;
+            }
+            final Object thread = currentActivityThread.invoke(null);
+            if (thread == null) {
+                return null;  // 进程里还没有 ActivityThread：直接失败，不在 null 上继续调用
+            }
+            final Method getSystemContext = activityThread.getMethod("getSystemContext");
+            if (getSystemContext == null) {
+                return null;
+            }
+            final Object systemContext = getSystemContext.invoke(thread);
+            if (systemContext == null) {
+                return null;
+            }
+            return systemContext instanceof Context ? (Context) systemContext : null;
+        } catch (Throwable t) {
+            noteDiagnosis(diagnosis, SOURCE_SYSTEM_CONTEXT + " " + inlineDetail(t));
+            return null;
+        }
+    }
+
+    /**
+     * 采纳一条来源的结果：先判 null，再要求 {@code getContentResolver()} 不为 null（抛异常也算不可用）。
+     *
+     * <p>这里是“拿到 Context 但 ContentResolver 不可用”的最后一道闸：这类 Context 会被丢弃并
+     * 继续下一步，而不是拿去 insert 再炸出一个 NPE。
+     *
+     * @param source   来源名（日志用）
+     * @param candidate 各 {@code fromXxx} 的返回值，可能为 {@code null}
+     * @param diagnosis 诊断串，失败原因写在这里
+     * @return 可用的 Context，或 {@code null}（继续下一步）
+     */
+    private static Context adopt(String source, Context candidate, StringBuilder diagnosis) {
+        if (candidate == null) {
+            return null;
+        }
+        try {
+            if (candidate.getContentResolver() == null) {
+                noteDiagnosis(diagnosis, source + " content resolver is null");
+                return null;
+            }
+        } catch (Throwable t) {
+            noteDiagnosis(diagnosis, source + ".getContentResolver " + inlineDetail(t));
+            return null;
+        }
+        sContextSource = source;
+        return candidate;
+    }
+
+    /** Context 是否真的可用：{@code getContentResolver()} 既不为 null 也不抛异常。 */
+    private static boolean hasResolver(Context context) {
+        if (context == null) {
+            return false;
+        }
+        try {
+            return context.getContentResolver() != null;
+        } catch (Throwable t) {
+            return false;  // 坏 Context：当成“没有”，由四级回退重探
+        }
+    }
+
+    /** 取 ContentResolver；{@code null} 或抛异常都返回 {@code null}，异常绝不给调用方。 */
+    private static ContentResolver resolverOf(Context context) {
+        if (context == null) {
+            return null;
+        }
+        try {
+            return context.getContentResolver();
+        } catch (Throwable t) {
+            // 缓存的 Context 已失效：记下原因（若还没有），并让调用方按“无 Context”处理
+            if (sContextDiagnosis == null) {
+                sContextDiagnosis = "getContentResolver " + inlineDetail(t);
+            }
             return null;
         }
     }
 
     // ================================================================ 日志
 
-    /** 拿不到 Context（含 resolver 为空）：每进程一条。 */
+    /**
+     * 拿不到 Context（四个来源全 null / 全抛异常，或 resolver 不可用）：每进程一条。
+     *
+     * <p>第一行固定 {@code heartbeat failed: no context}；若能拿到各来源的失败原因，第二行起
+     * 逐个附上（含异常 message 与前 {@value #STACK_FRAME_LIMIT} 层堆栈）。这样“没有 Context”
+     * 和“某一步抛了 NPE”在日志里是两件事，不会再混成一条 {@code NullPointerException}。
+     */
     private static void logNoContextOnce() {
-        if (sLoggedNoContext.compareAndSet(false, true)) {
-            log("heartbeat failed: no context");
+        if (!sLoggedNoContext.compareAndSet(false, true)) {
+            return;
         }
+        final String diagnosis = sContextDiagnosis;
+        sContextDiagnosis = null;
+        if (diagnosis == null || diagnosis.isEmpty()) {
+            log("heartbeat failed: no context");
+            return;
+        }
+        log("heartbeat failed: no context\n  sources: " + diagnosis);
     }
 
     /** insert 返回 null（主 App 进程未就绪 / Provider 拉不起 / 旧版未实现）：每进程一条。 */
@@ -421,21 +660,59 @@ final class HookHeartbeat {
         }
     }
 
-    /** 抛异常（DeadObjectException / SecurityException / IllegalStateException ...）：每进程一条。 */
+    /**
+     * 抛异常（DeadObjectException / SecurityException / NullPointerException ...）：每进程一条。
+     *
+     * <p>第一行仍是原有摘要 {@code heartbeat failed: <简单类名>}（老日志的匹配口径不变）；
+     * 第二行起是 message 与前 {@value #STACK_FRAME_LIMIT} 层堆栈，信息量与
+     * {@code Log.w(TAG, msg, throwable)} 等价。这里仍走 {@link XposedBridge#log(String)}，
+     * 因为真机证据（{@code [VLocHidden] heartbeat failed: ...}）就来自这条通道。
+     */
     private static void logThrowableOnce(Throwable t) {
         if (!sLoggedThrowable.compareAndSet(false, true)) {
             return;
         }
-        String name = null;
-        try {
-            name = t == null ? null : t.getClass().getSimpleName();
-            if (name == null || name.isEmpty()) {
-                name = t == null ? "unknown" : t.getClass().getName();
-            }
-        } catch (Throwable ignored) {
-            name = "unknown";
+        final Throwable real = unwrapReflective(t);
+        final StringBuilder out = new StringBuilder(192);
+        out.append("heartbeat failed: ").append(simpleNameOf(real));
+        final String message = messageOf(real);
+        if (message != null && !message.isEmpty()) {
+            out.append("\n  message: ").append(clip(message));
         }
-        log("heartbeat failed: " + name);
+        final StackTraceElement[] frames = stackOf(real);
+        if (frames != null) {
+            final int limit = Math.min(frames.length, STACK_FRAME_LIMIT);
+            for (int i = 0; i < limit; i++) {
+                out.append("\n  at ").append(frames[i]);
+            }
+        }
+        log(out.toString());
+    }
+
+    /** 本进程最终用的是哪条 Context 来源：每进程一条（{@code AppGlobals...} / {@code ActivityThread...}）。 */
+    private static void logContextSourceOnce(String source) {
+        if (source == null || !sLoggedContextSource.compareAndSet(false, true)) {
+            return;
+        }
+        log("heartbeat context: " + source);
+    }
+
+    /**
+     * 某条来源失败、但后续来源顶上：每进程一条。
+     *
+     * <p>正是这条日志回答“NPE 到底炸在哪一步”：例如 system 进程里
+     * {@code ActivityThread.currentApplication} 抛 NPE、最后由
+     * {@code AppGlobals.getInitialApplication} 顶上时，这条会把类名、message
+     * 和前几层堆栈一起留下，同时心跳照常成功。
+     */
+    private static void logSourceFailureOnce(String diagnosis) {
+        if (diagnosis == null || diagnosis.isEmpty()) {
+            return;
+        }
+        if (!sLoggedSourceFailure.compareAndSet(false, true)) {
+            return;
+        }
+        log("heartbeat source failed (fell back): " + diagnosis);
     }
 
     /** 次数用完：放弃（每进程一条，之后不再有任何补试动作）。 */
@@ -451,5 +728,111 @@ final class HookHeartbeat {
         } catch (Throwable ignored) {
             // 日志通道异常时不能影响宿主进程
         }
+    }
+
+    // ================================================================ 异常格式化（日志用，绝不抛出）
+
+    /**
+     * 反射调用的目标方法抛出的异常被包在 {@link InvocationTargetException} 里：
+     * 取里面的真身，日志里才会是 {@code NullPointerException} 而不是包装类名。
+     */
+    private static Throwable unwrapReflective(Throwable t) {
+        Throwable current = t;
+        for (int depth = 0; depth < 4 && current != null; depth++) {
+            if (!(current instanceof InvocationTargetException)) {
+                break;
+            }
+            final Throwable cause = current.getCause();
+            if (cause == null) {
+                break;
+            }
+            current = cause;
+        }
+        return current;
+    }
+
+    /** 简单类名；取不到退回全名，再不行 {@code "unknown"}（日志里永远不空白）。 */
+    private static String simpleNameOf(Throwable t) {
+        if (t == null) {
+            return "unknown";
+        }
+        try {
+            final String simple = t.getClass().getSimpleName();
+            if (simple != null && !simple.isEmpty()) {
+                return simple;
+            }
+            final String full = t.getClass().getName();
+            return full == null || full.isEmpty() ? "unknown" : full;
+        } catch (Throwable ignored) {
+            return "unknown";
+        }
+    }
+
+    private static String messageOf(Throwable t) {
+        if (t == null) {
+            return null;
+        }
+        try {
+            return t.getMessage();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static StackTraceElement[] stackOf(Throwable t) {
+        if (t == null) {
+            return null;
+        }
+        try {
+            return t.getStackTrace();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 单行诊断：简单类名[: message] + 前 {@value #STACK_FRAME_LIMIT} 层堆栈，供各来源失败记录用。 */
+    private static String inlineDetail(Throwable t) {
+        final Throwable real = unwrapReflective(t);
+        final StringBuilder out = new StringBuilder(96);
+        out.append(simpleNameOf(real));
+        final String message = messageOf(real);
+        if (message != null && !message.isEmpty()) {
+            out.append(": ").append(clip(message));
+        }
+        final StackTraceElement[] frames = stackOf(real);
+        if (frames != null) {
+            final int limit = Math.min(frames.length, STACK_FRAME_LIMIT);
+            for (int i = 0; i < limit; i++) {
+                out.append(i == 0 ? " @ " : "; ").append(frames[i]);
+            }
+        }
+        return out.toString();
+    }
+
+    /** message 压成一行并封顶：Android 的 NPE message 可能很长，日志里只要够定位。 */
+    private static String clip(String message) {
+        if (message == null) {
+            return "";
+        }
+        final String flat = message.indexOf('\n') < 0 ? message : message.replace('\n', ' ');
+        return flat.length() <= MESSAGE_LIMIT ? flat : flat.substring(0, MESSAGE_LIMIT) + "...";
+    }
+
+    /** 往诊断串里追加一条，单条与整体都封顶，绝不无限增长（每进程最多 5 次尝试）。 */
+    private static void noteDiagnosis(StringBuilder diagnosis, String text) {
+        if (diagnosis == null || text == null || text.isEmpty()) {
+            return;
+        }
+        if (diagnosis.length() >= DIAGNOSIS_LIMIT) {
+            return;
+        }
+        if (diagnosis.length() > 0) {
+            diagnosis.append("; ");
+        }
+        final int room = DIAGNOSIS_LIMIT - diagnosis.length();
+        if (room <= 0) {
+            return;
+        }
+        diagnosis.append(text.length() <= room ? text : text.substring(0, room));
     }
 }
