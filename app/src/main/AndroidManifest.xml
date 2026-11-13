@@ -57,9 +57,17 @@
         <meta-data
             android:name="xposeddescription"
             android:value="虚拟运动内置隐藏模块：Location/Settings/AppOps/ContentProvider/Parcel + 基站/Wi-Fi 环境回放" />
+        <!-- xposedminversion 必须 ≥93 才会启用 LSPosed 的 New XSharedPreferences：
+             API 93 起 LSPosed 会 hook ContextImpl.getPreferencesDir()/checkMode(int)，
+             MODE_WORLD_READABLE 的 prefs 才写得出、模块才读得到（快照通道的第三条路）。 -->
         <meta-data
             android:name="xposedminversion"
             android:value="54" />
+        <!-- 显式声明本模块使用 world-readable SharedPreferences（与 xposedminversion≥93 等价，
+             两者都写上，避免个别 LSPosed 版本只看这一条） -->
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
 
         <activity
             android:name=".ui.MainActivity"

@@ -22,14 +22,17 @@ import de.robv.android.xposed.XposedHelpers;
 /**
  * 作用域名单：把「系统级注入对所有 App 生效」收窄成「只对用户选定的 App 生效」。
  *
- * <p>数据契约（主 App 侧实现，见 {@code EnvProvider#PATH_TARGETS}）：
+ * <p>数据契约（主 App 侧实现，见 {@code EnvProvider#PATH_TARGETS} 与
+ * {@code service/SnapshotPrefs#KEY_TARGETS}）：
  * <pre>
+ * world-readable prefs（{@code vloc_snapshot} 的 {@code targets} 键）     或
  * 套接字（Unix 抽象 {@code com.vloc.motion.snapshot}，请求 {@code TARGETS}）  或
  * content://com.vloc.motion.env/targets  →  单列 {@code json}、单行
  * {"enabled":true,"packages":["com.a","com.b"]}
  * </pre>
- * 两条通道内容一致：<b>套接字优先</b>（system_server 里读 Provider 会抛 SecurityException），
- * 套接字不可用才回退 Provider，解析逻辑共用一份。
+ * 三条通道内容一致，解析逻辑共用一份：<b>prefs 优先</b>（LSPosed New XSharedPreferences，
+ * 不带 uid 限制）→ 套接字 → Provider（system_server 里读 Provider 会抛 SecurityException，
+ * 只作兜底）。
  * <ul>
  *   <li>{@code enabled=false}：不做限制，保持旧行为（全机所有进程生效）；</li>
  *   <li>{@code enabled=true}：只有 {@code packages} 里的包名会被安装 hook / 改写定位；</li>
@@ -38,8 +41,8 @@ import de.robv.android.xposed.XposedHelpers;
  * </ul>
  *
  * <p>性能：定位投递是高频路径（10Hz × N 个注册者），所以整份配置按 {@link #TTL_MS} 缓存，
- * 过期才走一次通道（套接字优先，失败才跨进程 query Provider）；判定本身只是一次 HashSet 查找。
- * 套接字单次交换总超时 ≤300ms，且只在缓存过期时发生。
+ * 过期才走一次通道（prefs 优先 → 套接字 → 跨进程 query Provider）；判定本身只是一次 HashSet 查找。
+ * 套接字单次交换总超时 ≤300ms，且只在缓存过期、且 prefs 不可用时才会发生。
  *
  * <p>线程安全：投递可能在多个 binder / handler 线程并发触发，缓存的读写用
  * {@code volatile + 双检锁}，uid→包名表用一把小锁保护。
@@ -184,7 +187,7 @@ final class TargetScope {
     static String summary() {
         final Scope scope = current();
         if (scope == null) {
-            return "unavailable -> allow all (socket + " + TARGETS_URI + " both failed)";
+            return "unavailable -> allow all (prefs + socket + " + TARGETS_URI + " all failed)";
         }
         if (!scope.enabled) {
             return "disabled -> all apps (enabled=false)";
@@ -222,17 +225,30 @@ final class TargetScope {
     }
 
     /**
-     * 读一次作用域配置：<b>套接字优先，ContentProvider 兜底</b>；任何一步失败都返回 null（= 放行）。
+     * 读一次作用域配置：<b>prefs → 套接字 → ContentProvider</b>；任何一步失败都返回 null（= 放行）。
      *
      * <p>顺序与原因：
      * <ol>
-     *   <li>{@code TARGETS} → Unix 抽象套接字（{@link SnapshotClient}）：system_server（uid 1000）
-     *       读 Provider 会抛 SecurityException（Android 17），套接字不受 Provider 权限限制；</li>
-     *   <li>套接字失败（老版本主 App / 连接被拒 / 超时 / 空行）→ 原来的 Provider 路径，行为不变。</li>
+     *   <li><b>world-readable prefs</b>（{@link PrefsClient#KEY_TARGETS}，LSPosed New
+     *       XSharedPreferences）：不带调用方 uid 限制，是 system_server 里唯一可用的通道；</li>
+     *   <li>{@code TARGETS} → Unix 抽象套接字（{@link SnapshotClient}）：旧的回退路径
+     *       （本 ROM 上 system_server 连它会被 SELinux 拒）；</li>
+     *   <li>原来的 Provider 路径（{@link #readProvider()}），行为不变。</li>
      * </ol>
-     * 两条通道共用 {@link #parse(String)}，enabled / packages 的语义完全一致。
+     * 三条通道共用 {@link #parse(String)}，enabled / packages 的语义完全一致；
+     * TTL 缓存（{@link #TTL_MS} / {@link #TTL_FAIL_MS}）与判定逻辑都不变。
      */
     private static Scope read() {
+        // 1) prefs：会话期间主 App 每 1s 检查一次，只在名单变化时重写
+        final String prefs = PrefsClient.read(PrefsClient.KEY_TARGETS);
+        if (prefs != null && !prefs.isEmpty()) {
+            final Scope scope = parse(prefs);
+            if (scope != null) {
+                return scope;
+            }
+            // prefs 有内容但解析失败（主 App 正在升级 / 契约不符）：继续回退
+        }
+        // 2) 套接字
         final String line = SnapshotClient.readLine(SnapshotClient.REQ_TARGETS,
                 SnapshotClient.DEFAULT_TIMEOUT_MS);
         if (line != null && !line.isEmpty()) {
@@ -242,6 +258,7 @@ final class TargetScope {
             }
             // 套接字有内容但解析失败（主 App 正在升级 / 契约不符）：再用 Provider 兜一次
         }
+        // 3) Provider
         return readProvider();
     }
 

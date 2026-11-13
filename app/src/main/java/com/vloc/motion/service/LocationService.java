@@ -444,6 +444,10 @@ public class LocationService extends Service {
         // ContentProvider（SecurityException），只能从抽象套接字拿快照；
         // 绑定失败只记一条 Log.w，不影响会话（见 SnapshotServer）。
         SnapshotServer.INSTANCE.start(this);
+        // 同一份快照再写进 world-readable prefs（LSPosed New XSharedPreferences）：
+        // 抽象套接字在 system_server 侧会被 SELinux 拒（avc: denied { connectto }），
+        // prefs 是 Android 11+ 唯一稳定的通道；打不开时它自己降级，不影响下面任何流程。
+        SnapshotPrefs.INSTANCE.start(this);
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
@@ -520,6 +524,8 @@ public class LocationService extends Service {
         collectGnssSnapshot();
         // 临时定位会话同样要发布快照套接字（与 startRoute 一致，start() 幂等）
         SnapshotServer.INSTANCE.start(this);
+        // prefs 通道同上：start() 幂等，打不开时自行降级（模块回退套接字 / Provider）
+        SnapshotPrefs.INSTANCE.start(this);
 
         new Thread(() -> {
             // 结果只经局部变量回主线程：不再让后台线程读写 injector 字段（P1-B）
@@ -1253,6 +1259,8 @@ public class LocationService extends Service {
         // 紧接着摘掉快照套接字：模块必须立刻停止改写、回到真实定位，不能继续读到本场快照。
         // stop() 幂等、且最多等待守护线程 500ms（见 SnapshotServer），不会拖住主线程收尾。
         SnapshotServer.INSTANCE.stop();
+        // prefs 通道同步收尾：写一条 active=false 的快照，模块解析后立即回退（不等陈旧守卫超时）
+        SnapshotPrefs.INSTANCE.stop();
         releaseInjector();
         // 收尾顺序不能反：removeTestProvider 本身也受 mock_location appop 检查，
         // 必须先移除测试 Provider（releaseInjector），再回收 appop。

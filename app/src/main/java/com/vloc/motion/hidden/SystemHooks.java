@@ -38,12 +38,20 @@ import de.robv.android.xposed.XposedHelpers;
  *   <li>默认所有 App 都生效，不需要逐个勾选作用域；</li>
  *   <li>Location 由我们自己 new 出来，<b>不带 mock 标记</b>，所以 isMock/isFromMockProvider
  *       天然为 false，也不再需要 appops 授权；</li>
- *   <li>数据来源（<b>套接字优先</b>）：主 App 的 Unix 抽象套接字
- *       {@code com.vloc.motion.snapshot}（{@link SnapshotClient}），请求 {@code LOC} / {@code GNSS}；
- *       失败才回退 ContentProvider {@code content://com.vloc.motion.env/location}（定位）与
- *       {@code /gnss}（卫星）——Android 17 的 system_server（uid 1000）读 Provider 会抛
- *       {@code SecurityException}（{@code Isolated process not allowed to call getContentProvider}），
- *       所以 Provider 只作为老版本主 App 的兜底。</li>
+ *   <li>数据来源（<b>三级回退</b>，见 {@link #currentLocation()} / {@link #currentSatellites()}）：
+ *       <ol>
+ *         <li><b>world-readable prefs</b>（首选，LSPosed 官方 New XSharedPreferences）：
+ *             主 App 写 {@code vloc_snapshot} prefs，这里用 {@link PrefsClient} 读，
+ *             不经过 Provider 权限模型、也不需要 SELinux 放行 connectto；</li>
+ *         <li>主 App 的 Unix 抽象套接字 {@code com.vloc.motion.snapshot}
+ *             （{@link SnapshotClient}），请求 {@code LOC} / {@code GNSS}；</li>
+ *         <li>ContentProvider {@code content://com.vloc.motion.env/location}（定位）与
+ *             {@code /gnss}（卫星）——Android 17 的 system_server（uid 1000）读 Provider 会抛
+ *             {@code SecurityException}（{@code Isolated process not allowed to call getContentProvider}），
+ *             所以 Provider 只作为老版本主 App 的兜底。</li>
+ *       </ol>
+ *       为什么 prefs 排第一：本 ROM 上另两条跨进程通道都被拒（Provider 抛 SecurityException、
+ *       抽象套接字被 SELinux {@code avc: denied { connectto }} 拦下），见 {@link PrefsClient}。</li>
  * </ul>
  *
  * <p><b>作用域（目标应用）</b>：主 App 开启「仅对选定应用生效」后，系统层也不再无差别改写：
@@ -77,6 +85,17 @@ final class SystemHooks {
     /** 定位快照缓存：异常走套接字 / Provider 有 IPC 开销，缓存 120ms 足够跟上 10Hz 注入。 */
     private static final long LOCATION_CACHE_MS = 120L;
     private static final long GNSS_CACHE_MS = 900L;
+
+    /**
+     * prefs 快照的新鲜度窗口（毫秒）：<b>只用于 prefs 通道</b>，与缓存无关。
+     *
+     * <p>prefs 是<b>落盘</b>数据，不像套接字那样"连接断了就没有数据"：主 App 进程被杀 / 会话
+     * 异常结束时，文件里会留着最后一帧 {@code active=true} 的坐标，若不加守卫就会无限期注入
+     * 一个几小时前的点。主 App 在会话中按 10Hz 推定位、prefs 最多 250ms 写一次
+     * （{@code SnapshotPrefs}），静止/保持定位时也至少 1Hz 刷新 {@code updatedAt}，
+     * 所以 5 秒没有任何刷新即可判定"没有会话在跑"，立即回退下一条通道。
+     */
+    private static final long PREFS_STALE_MS = 5_000L;
 
     private static volatile Context sContext;
     private static volatile long sLocationAt;
@@ -624,6 +643,8 @@ final class SystemHooks {
     private static final AtomicBoolean sLoggedNoSnapshot = new AtomicBoolean();
     private static final AtomicBoolean sLoggedLastLocationNoSnapshot = new AtomicBoolean();
     private static final AtomicBoolean sLoggedSnapshotUnavailable = new AtomicBoolean();
+    /** prefs 快照过期（主 App 已经没有会话在跑）每进程只记一条。 */
+    private static final AtomicBoolean sLoggedPrefsStale = new AtomicBoolean();
 
     /** 日志用「方法名 args=参数个数」；任何异常都退化成占位，绝不影响 hook。 */
     private static String describeCall(XC_MethodHook.MethodHookParam param) {
@@ -1556,43 +1577,95 @@ final class SystemHooks {
         }
     }
 
-    // ================================================================== 快照读取（套接字优先，Provider 兜底）
+    // ================================================================== 快照读取（prefs → 套接字 → Provider）
 
     /*
-     * Android 17 的 system_server（uid 1000）读 content://com.vloc.motion.env/* 会抛
-     * SecurityException（logcat: Isolated process not allowed to call getContentProvider），
-     * 所以主通道换成 Unix 抽象套接字（SnapshotClient）：
-     *   1. 套接字有答复（含「空行 = 无数据」）→ 直接采用，不再碰 Provider；
-     *   2. 套接字失败（未装新版主 App / 连接被拒 / 超时）→ 回退原来的 Provider 路径，行为不变；
-     *   3. 两条通道都没有数据 → 返回 null（透传真实定位），与旧行为一致。
-     * 缓存判断放在方法入口：命中缓存不建连接（10Hz 投递不会变成 10Hz 连接）。
+     * 三条跨进程通道的优先级（本 ROM 的实测结论决定了这个顺序）：
+     *   1. world-readable prefs（PrefsClient，LSPosed New XSharedPreferences）：不走 Provider
+     *      权限模型、也不需要 SELinux 放行 connectto，是 Android 17 / ColorOS 上唯一可用的通道；
+     *   2. Unix 抽象套接字（SnapshotClient）：system_server 侧被 SELinux 拒绝
+     *      （avc: denied { connectto } scontext=u:r:system_server:s0），只作旧机型的回退；
+     *   3. ContentProvider（原逻辑，行为不变）：system_server 读它会抛 SecurityException。
+     * 每一级都必须"真的拿到数据"才停止回退：prefs 无值 / 未激活 / 已过期 / 解析失败 → 下一级；
+     * 套接字回空行（主 App 明确表示没有数据）→ 直接返回 null，不再白花一次 Provider 读取。
+     * 缓存判断放在方法入口：命中缓存不读 prefs、不建连接（10Hz 投递不会变成 10Hz IO）。
      */
 
     private static Snapshot currentLocation() {
         final long now = System.currentTimeMillis();
         if (now - sLocationAt < LOCATION_CACHE_MS) {
-            return sLocation;   // 缓存命中：不建连
+            return sLocation;   // 缓存命中：不读 prefs、不建连
         }
         sLocationAt = now;
-        final String line = SnapshotClient.readLine(SnapshotClient.REQ_LOCATION,
-                SnapshotClient.DEFAULT_TIMEOUT_MS);
-        final Snapshot parsed;
-        if (line != null) {
-            // 通道已答复；"" = 主 App 明确表示当前没有数据（不再花一次 Provider 读取）
-            parsed = line.isEmpty() ? null : parseLocationJson(line);
-        } else {
-            parsed = readProviderSnapshot();   // 套接字不可用：回退 ContentProvider
+        Snapshot parsed = readPrefsLocation();   // 1) world-readable prefs
+        if (parsed == null) {
+            final String line = SnapshotClient.readLine(SnapshotClient.REQ_LOCATION,
+                    SnapshotClient.DEFAULT_TIMEOUT_MS);   // 2) 主 App 的抽象套接字
+            if (line != null) {
+                // 通道已答复；"" = 主 App 明确表示当前没有数据（不再花一次 Provider 读取）
+                parsed = line.isEmpty() ? null : parseLocationJson(line);
+            } else {
+                parsed = readProviderSnapshot();   // 3) 套接字不可用：回退 ContentProvider
+            }
         }
         sLocation = parsed;
         return parsed;
     }
 
-    /** 解析套接字返回的 /location 同款 JSON；{@code active=false} 与解析失败都返回 null。 */
+    /**
+     * 通道 1：读主 App 的 world-readable prefs（{@link PrefsClient#KEY_LOC}）。
+     *
+     * <p>prefs 读取极快（几百字节的 XML，比一次 binder 调用便宜），所以不额外缓存；
+     * 唯一多出来的是<b>新鲜度守卫</b>：prefs 是落盘数据，主 App 被杀之后最后一帧
+     * {@code active=true} 会留在文件里，必须靠 {@link #PREFS_STALE_MS} 判掉，
+     * 否则会无限期注入一个几小时前的坐标。
+     *
+     * @return 可用快照；null = prefs 通道没有数据（未发布 / 未激活 / 已过期 / 解析失败）→ 调用方回退
+     */
+    private static Snapshot readPrefsLocation() {
+        final String json = PrefsClient.read(PrefsClient.KEY_LOC);
+        if (json == null || json.isEmpty()) {
+            return null;
+        }
+        // 解析复用 /location 的同一套契约（parseLocationJson），不重复实现
+        final Snapshot snapshot = parseLocationJson(json);
+        if (snapshot == null) {
+            return null;   // active=false：主 App 已停止会话，透传真实定位
+        }
+        if (!isFreshSnapshot(snapshot.updatedAt)) {
+            logPrefsStaleOnce(snapshot.updatedAt);
+            return null;
+        }
+        return snapshot;
+    }
+
+    /** prefs 快照是否新鲜：{@code updatedAt} 在 {@link #PREFS_STALE_MS} 内（时钟异常也算过期）。 */
+    private static boolean isFreshSnapshot(long updatedAt) {
+        if (updatedAt <= 0L) {
+            return false;
+        }
+        final long age = System.currentTimeMillis() - updatedAt;
+        return age >= 0L && age <= PREFS_STALE_MS;
+    }
+
+    /** prefs 快照过期：每进程一条（现场看到它就是"prefs 里只剩上一场会话的残留"）。 */
+    private static void logPrefsStaleOnce(long updatedAt) {
+        try {
+            if (sLoggedPrefsStale.compareAndSet(false, true)) {
+                log("snapshot via prefs stale: updatedAt " + (System.currentTimeMillis() - updatedAt)
+                        + "ms ago, fallback");
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 解析 prefs 里的 /location 同款 JSON；{@code active=false} 与解析失败都返回 null。 */
     private static Snapshot parseLocationJson(String json) {
         try {
             final JSONObject root = new JSONObject(json);
             if (!root.optBoolean("active", false)) {
-                logSnapshotUnavailableOnce("inactive snapshot (socket)");
+                logSnapshotUnavailableOnce("inactive snapshot");
                 return null;
             }
             return new Snapshot(
@@ -1603,7 +1676,7 @@ final class SystemHooks {
                     root.optInt("satellites", 0),
                     root.optLong("updatedAt", 0L));
         } catch (Throwable t) {
-            logSnapshotUnavailableOnce("socket json: " + t.getClass().getName());
+            logSnapshotUnavailableOnce("snapshot json: " + t.getClass().getName());
             return null;
         }
     }
@@ -1661,23 +1734,42 @@ final class SystemHooks {
     private static List<Satellite> currentSatellites() {
         final long now = System.currentTimeMillis();
         if (now - sGnssAt < GNSS_CACHE_MS) {
-            return sSatellites;   // 缓存命中：不建连
+            return sSatellites;   // 缓存命中：不读 prefs、不建连
         }
         sGnssAt = now;
-        final String line = SnapshotClient.readLine(SnapshotClient.REQ_GNSS,
-                SnapshotClient.DEFAULT_TIMEOUT_MS);
-        final List<Satellite> parsed;
-        if (line != null) {
-            // 通道已答复；"" = 主 App 当前没有卫星数据
-            parsed = line.isEmpty() ? null : parseSatellitesJson(line);
-        } else {
-            parsed = readProviderSatellites();   // 套接字不可用：回退 ContentProvider
+        List<Satellite> parsed = readPrefsSatellites();   // 1) world-readable prefs
+        if (parsed == null) {
+            final String line = SnapshotClient.readLine(SnapshotClient.REQ_GNSS,
+                    SnapshotClient.DEFAULT_TIMEOUT_MS);   // 2) 主 App 的抽象套接字
+            if (line != null) {
+                // 通道已答复；"" = 主 App 当前没有卫星数据
+                parsed = line.isEmpty() ? null : parseSatellitesJson(line);
+            } else {
+                parsed = readProviderSatellites();   // 3) 套接字不可用：回退 ContentProvider
+            }
         }
         sSatellites = parsed;
         return parsed;
     }
 
-    /** 解析套接字返回的 /gnss 同款数组；空 / 非法内容返回 null（= 不注入卫星表）。 */
+    /**
+     * 通道 1：卫星表走 prefs（{@link PrefsClient#KEY_GNSS}）。
+     *
+     * <p>这里<b>不</b>做新鲜度判定：卫星表只在会话开始时采一次（{@code updatedAt} 天然就旧），
+     * 而卫星注入本身以 {@link #currentLocation()} 非空为前提（见 {@code GNSS_HOOK}），
+     * 定位一旦过期/停止，卫星表也不会被用上。
+     *
+     * @return 卫星列表；null = prefs 里没有卫星表（调用方回退下一条通道）
+     */
+    private static List<Satellite> readPrefsSatellites() {
+        final String json = PrefsClient.read(PrefsClient.KEY_GNSS);
+        if (json == null || json.isEmpty()) {
+            return null;
+        }
+        return parseSatellitesJson(json);   // 与 /gnss 同一套解析
+    }
+
+    /** 解析 /gnss 同款数组（prefs 与套接字共用）；空 / 非法内容返回 null（= 不注入卫星表）。 */
     private static List<Satellite> parseSatellitesJson(String json) {
         try {
             final JSONArray array = new JSONArray(json);
