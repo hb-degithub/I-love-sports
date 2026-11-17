@@ -76,14 +76,49 @@ jobs:
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # 用 release 构建 + 显式签名：debug 构建带 debuggable=true，
+      # 对模拟定位/反检测类应用是可被目标 App 直接检测到的特征，不能作为分发产物。
+      # 若仓库配置了 KEYSTORE_B64（base64 的 keystore）则用它，保证与历史包同一签名；
+      # 否则回退到本次生成的 debug keystore（签名会与历史包不同，需卸载重装）。
+      - name: Sign release APK
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          BT="$(ls -d "$SDK"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+          echo "build-tools: $BT"
+          UNSIGNED="$(ls app/build/outputs/apk/release/*-unsigned.apk | head -1)"
+          echo "unsigned: $UNSIGNED"
+          if [ -n "${{ secrets.KEYSTORE_B64 }}" ]; then
+            echo "使用 Secrets 中的 keystore"
+            echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+            KS="$RUNNER_TEMP/release.jks"
+          else
+            echo "未配置 KEYSTORE_B64，回退到本次生成的 debug keystore"
+            KS=".toolchain/keystore/debug.keystore"
+            if [ ! -f "$KS" ]; then
+              mkdir -p .toolchain/keystore
+              keytool -genkeypair -v -keystore "$KS" -storepass android -keypass android \
+                -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US" > /dev/null
+            fi
+          fi
+          ALIAS="${{ secrets.KEY_ALIAS || 'androiddebugkey' }}"
+          KS_PASS="${{ secrets.KEYSTORE_PASSWORD || 'android' }}"
+          KEY_PASS="${{ secrets.KEY_PASSWORD || 'android' }}"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --out app/build/outputs/apk/release/app-release-signed.apk \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs app/build/outputs/apk/release/app-release-signed.apk
 
       - name: Prepare release asset
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="$(sed -n 's/.*versionName "\(.*\)".*/\1/p' app/build.gradle | head -1)"
-          APK="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
+          APK="app/build/outputs/apk/release/app-release-signed.apk"
           OUT="virtual-motion-${VERSION}.apk"
           cp "$APK" "$OUT"
           echo "ASSET=$OUT" >> "$GITHUB_ENV"
@@ -113,7 +148,7 @@ jobs:
             adb install -r virtual-motion-*.apk
             ```
             - 需要 root（Magisk / KernelSU / APatch）；隐藏模块需 LSPosed 并勾选作用域
-            - 这是 **debug 签名** 的构建产物，仅供测试
+            - 这是 **release 构建（非 debuggable）** + debug 签名的测试产物；若与已装版本签名不一致需先卸载
 
             ### 传感器系统级注入（可选）
             附件 `vloc-zygisk-*.zip` 是 **Magisk 模块**：刷入后在 App 里开启「系统级注入」，
