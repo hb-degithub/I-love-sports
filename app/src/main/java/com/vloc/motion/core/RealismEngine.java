@@ -173,6 +173,33 @@ public final class RealismEngine {
         return enabled ? gnss.toJsonArray() : "[]";
     }
 
+    /**
+     * 按给定坐标 + UTC 时间<b>显式</b>重算卫星天空（与 {@link #applyAt} 内部是同一份计算）。
+     *
+     * <p>为什么需要这个入口：{@code applyAt()} 在 {@code enabled=false} 时提前返回，<b>根本不会</b>
+     * 更新 {@link GnssSky}，卫星表会一直停在上一轮/空。而「GNSS 完全模拟」要求在拟真关闭时
+     * 也能按模拟坐标产出卫星表，所以由调用方（{@code LocationService} 的 1Hz 发布节拍）
+     * 用这个方法显式驱动。<b>不受 {@code enabled} 开关影响</b>。
+     *
+     * @param latDeg 观测点纬度（模拟坐标，WGS-84）
+     * @param lonDeg 观测点经度（模拟坐标，WGS-84）
+     * @param utcMs  当前 UTC 时间（毫秒，TLE 推算需要真实墙钟）
+     */
+    public synchronized void updateGnss(double latDeg, double lonDeg, long utcMs) {
+        gnss.update(0, latDeg, lonDeg, utcMs);
+    }
+
+    /**
+     * 逐颗卫星 JSON，<b>即使拟真关闭也返回真实数组</b>（不会退化成 {@code "[]"}）。
+     *
+     * <p>供「GNSS 完全模拟」使用：与 {@link #gnssJson()} 的区别只有一条——不看 {@code enabled}。
+     * 星表为空（assets 读取失败 / 星表缺失）时仍是合法空数组 {@code "[]"}，调用方据此判定
+     * "没有可注入的卫星表"。
+     */
+    public synchronized String gnssJsonAlways() {
+        return gnss.toJsonArray();
+    }
+
     private static double normalizeBearing(double degrees) {
         double value = degrees % 360.0;
         return value < 0 ? value + 360.0 : value;

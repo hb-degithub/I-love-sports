@@ -48,6 +48,10 @@ public final class RouteStore {
     private static final String KEY_TARGET_PACKAGES = "target_packages";
     private static final String KEY_OVERLAY_COLLAPSED = "overlay_collapsed";
     private static final String KEY_GNSS_SNAPSHOT = "gnss_snapshot";
+    /** 「GNSS 完全模拟」：不依赖本机真实卫星，用内置星表 + 模拟坐标/时间生成卫星表（默认 false = 自动）。 */
+    private static final String KEY_GNSS_SYNTHETIC = "gnss_synthetic";
+    /** 上次弹出「GNSS 星表过期」提醒的时间戳（0/缺省＝从未提醒）：同一份星表 7 天内只提醒一次。 */
+    private static final String KEY_TLE_REMIND_AT = "tle_remind_at";
     private static final String KEY_RANDOM_START = "random_start";
     private static final String KEY_BUILTIN_SEEDED = "builtin_routes_v3";
     /**
@@ -318,6 +322,35 @@ public final class RouteStore {
 
     public static void saveGnssSnapshot(Context context, String json) {
         prefs(context).edit().putString(KEY_GNSS_SNAPSHOT, json).apply();
+    }
+
+    /**
+     * 「GNSS 完全模拟」：<b>不</b>依赖本机真实 GNSS 采集，直接用内置 TLE 星表 +
+     * 模拟坐标/时间算出此刻可见卫星并注入。
+     *
+     * <p>默认 {@code false} = <b>自动</b>：真实采集有卫星就用真实的，采不到（室内 / 模拟器）才合成。
+     * 打开后强制合成，真实采集结果不参与注入。
+     */
+    public static boolean loadGnssSynthetic(Context context) {
+        return prefs(context).getBoolean(KEY_GNSS_SYNTHETIC, false);
+    }
+
+    public static void saveGnssSynthetic(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_GNSS_SYNTHETIC, enabled).apply();
+    }
+
+    /**
+     * 上次弹出「GNSS 星表过期」提醒的时间戳（毫秒；0 = 从未提醒）。
+     *
+     * <p>只用来做提醒去重（{@code TleUpdater.REMIND_INTERVAL_MS}），不影响星表本身：
+     * 星表的"是否已更新 / 过期几天"由 {@code TleUpdater.load()} 现场读盘得出。
+     */
+    public static long loadTleRemindAt(Context context) {
+        return prefs(context).getLong(KEY_TLE_REMIND_AT, 0L);
+    }
+
+    public static void saveTleRemindAt(Context context, long atMs) {
+        prefs(context).edit().putLong(KEY_TLE_REMIND_AT, atMs).apply();
     }
 
     /** 每次开始模拟时随机更换起点。 */

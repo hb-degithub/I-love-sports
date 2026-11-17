@@ -25,12 +25,14 @@ import com.vloc.motion.core.Fix;
 import com.vloc.motion.core.PacePlan;
 import com.vloc.motion.core.StepEngine;
 import com.vloc.motion.core.GaitAttitude;
+import com.vloc.motion.core.GnssSky;
 import com.vloc.motion.core.GnssTle;
 import com.vloc.motion.core.ImuWaveform;
 import com.vloc.motion.core.RealismEngine;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RoutePlayer;
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.TleUpdater;
 import com.vloc.motion.location.GnssCollector;
 import com.vloc.motion.location.LocationSwitch;
 import com.vloc.motion.location.RealLocationProvider;
@@ -38,6 +40,9 @@ import com.vloc.motion.location.RootShell;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.ui.FloatingWindow;
 import com.vloc.motion.ui.MainActivity;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -84,6 +89,11 @@ public class LocationService extends Service {
     /** 系统级注入失效告警用独立 id：复用前台通知 id 会把常驻通知顶掉。 */
     private static final int ALERT_NOTIFICATION_ID = 1002;
     private static final long TICK_MS = 100L;
+    /**
+     * 「GNSS 完全模拟」的卫星表刷新间隔：卫星仰角/方位是慢变量（分钟级才有可感变化），
+     * 1 秒足够跟上坐标移动，又避免每帧（100ms）几百次浮点轨道递推。
+     */
+    private static final long GNSS_SYNTHETIC_INTERVAL_MS = 1_000L;
 
     // ---------------------------------------------------------------- 系统级注入存活判定
     /**
@@ -149,6 +159,22 @@ public class LocationService extends Service {
     private static final java.util.concurrent.atomic.AtomicLong mockSessionEpoch =
             new java.util.concurrent.atomic.AtomicLong();
     /**
+     * 当前进程里活着的服务实例（{@code onDestroy} 置空）。
+     *
+     * <p>只给「星表更新成功后立刻换用新表」用：星表由 {@link TleUpdater} 写在文件里，
+     * 但已经加载进 {@code RealismEngine} 的是服务实例里的那一份，必须让活着的服务重读一次。
+     * 服务没在跑时不做事（下次 {@code onCreate} 自然读到新文件）。
+     */
+    private static volatile LocationService activeInstance;
+    /**
+     * 星表加载快照（来源 + 过期天数）：供设置界面只读展示与日志排查。
+     *
+     * <p>真正的加载逻辑在 {@link TleUpdater#load}（本地已更新文件优先、内置资产兜底），
+     * 这里只记"最近一次加载"的结果，免得 UI 为了展示一行字去动引擎。
+     */
+    private static volatile String tleSource = TleUpdater.SOURCE_NONE;
+    private static volatile int tleAgeDays = -1;
+    /**
      * 会话代次：每次「开始 / 彻底停止」在主线程自增。
      *
      * <p>后台准备线程把结果 post 回主线程时必须带回自己的代次，主线程据此判断
@@ -193,6 +219,21 @@ public class LocationService extends Service {
     private float lastCn0Mean;
     private float lastCn0Max;
     private long lastStepTickMs;
+    /**
+     * 本会话是否<b>强制</b>「GNSS 完全模拟」（设置项 {@code gnss_synthetic}，会话开始时定格）。
+     *
+     * <p>false = 自动：真实采集有卫星就用真实的，采不到（室内 / 模拟器）才回退合成。
+     * 会话开始时定格，与注入方式 / 拟真开关的处理一致（运行中改设置只对下次会话生效）。
+     */
+    private boolean gnssSyntheticForced;
+    /** 本会话真实采集到的原始 JSON（null = 没采到；自动模式据此决定是否回退合成）。 */
+    private volatile String gnssCollectedJson;
+    /** 采集流程是否已经有结论（回调必定触发；没结论前不抢着发合成数据，避免真实/合成来回跳）。 */
+    private volatile boolean gnssCollectResolved;
+    /** 上次发布合成卫星表的时刻（单调时钟），1Hz 节流。 */
+    private long lastSyntheticGnssMs;
+    /** 上次写进日志的卫星来源（synthetic / collected），来源变化才再打一条。 */
+    private String gnssSourceLogged;
     private boolean arrived;
     private long lastHoldPushMs;
     private float baseAltitude = 50.0f;
@@ -253,42 +294,73 @@ public class LocationService extends Service {
     public void onCreate() {
         super.onCreate();
         ensureNotificationChannel();
+        activeInstance = this;
         loadGnssCatalog();
         VlocStateFile.init(this);
     }
 
     /**
-     * 载入内置的真实 GNSS 星表（assets/gnss_tle.txt，CelesTrak TLE 快照）。
+     * 载入 GNSS 星表：<b>应用内已更新的 {@code files/gnss_tle.txt} 优先，内置
+     * {@code assets/gnss_tle.txt} 兜底</b>（解析优先级见 {@link TleUpdater#load}）。
+     *
+     * <p>来源与 {@code ageDays}（{@link GnssTle#newestEpochMs} 推出的过期天数）记录到静态字段，
+     * 供设置界面展示与日志排查；超过 {@link TleUpdater#STALE_DAYS} 天打告警。
      *
      * <p>失败不影响主流程：没有星表时不产出 gnss 数据，模块会透传真实卫星状态。
      */
     private void loadGnssCatalog() {
-        String text = null;
-        try (java.io.InputStream is = getAssets().open("gnss_tle.txt")) {
-            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
-            byte[] chunk = new byte[8192];
-            int read;
-            while ((read = is.read(chunk)) > 0) {
-                buffer.write(chunk, 0, read);
-            }
-            text = buffer.toString("UTF-8");
-        } catch (Exception e) {
-            android.util.Log.w("VLocService", "load gnss tle failed: " + e);
+        final TleUpdater.Catalog catalog = TleUpdater.load(this);
+        if (catalog.text == null) {
+            resetTleSnapshot();
+            Log.w(TAG, "gnss catalog missing: 不产出卫星数据");
+            return;
         }
-        if (text != null) {
-            realism.setTleData(text);
-            final long newest = GnssTle.newestEpochMs(GnssTle.parse(text));
-            final long ageDays = newest <= 0 ? -1
-                    : (System.currentTimeMillis() - newest) / 86400000L;
-            if (ageDays > 45) {
-                android.util.Log.w("VLocService", "gnss tle stale: " + ageDays
-                        + " 天未更新，仰角/方位角误差会变大；用 scripts/update_gnss_tle.py 刷新");
-            }
-            android.util.Log.i("VLocService", "gnss catalog=" + realism.gnssCatalogSize()
-                    + " tleAgeDays=" + ageDays);
-        } else {
-            android.util.Log.w("VLocService", "gnss catalog missing: 不产出卫星数据");
+        realism.setTleData(catalog.text);
+        tleSource = catalog.source;
+        tleAgeDays = catalog.ageDays;
+        if (catalog.ageDays > TleUpdater.STALE_DAYS) {
+            Log.w(TAG, "gnss tle stale: " + catalog.ageDays + " 天未更新（>" + TleUpdater.STALE_DAYS
+                    + "），仰角/方位角误差会变大；可在设置里点「检查更新」或运行"
+                    + " scripts/update_gnss_tle.py 刷新");
         }
+        Log.i(TAG, "gnss catalog=" + realism.gnssCatalogSize()
+                + " source=" + catalog.source
+                + " sats=" + catalog.satCount
+                + " tleAgeDays=" + catalog.ageDays);
+    }
+
+    /** 最近一次加载的星表来源：{@link TleUpdater#SOURCE_UPDATED} / {@link TleUpdater#SOURCE_ASSET} / {@link TleUpdater#SOURCE_NONE}。 */
+    public static String gnssTleSource() {
+        return tleSource;
+    }
+
+    /** 最近一次加载的星表过期天数（-1 = 未知/无星表）。 */
+    public static int gnssTleAgeDays() {
+        return tleAgeDays;
+    }
+
+    /**
+     * 星表文件更新成功后重新加载。
+     *
+     * <p>服务活着就在一次性后台线程里重读（写盘 + 解析约几十 KB，不占主线程）；
+     * 服务没在跑（还没开始模拟）则什么都不做——下次 {@code onCreate} 读到的就是新文件。
+     */
+    public static void reloadTleCatalog() {
+        final LocationService service = activeInstance;
+        if (service == null) {
+            // 服务没在跑：清掉"最近一次加载"快照，让设置界面回落到现场读盘，
+            // 否则更新后的文件会被旧的"内置 · 过期 N 天"盖住。
+            resetTleSnapshot();
+            Log.i(TAG, "gnss tle reload skipped: service not running（下次启动自动加载）");
+            return;
+        }
+        new Thread(service::loadGnssCatalog, "vloc-tle-reload").start();
+    }
+
+    /** 清空星表加载快照（= 没有在运行的引擎在用星表）。 */
+    private static void resetTleSnapshot() {
+        tleSource = TleUpdater.SOURCE_NONE;
+        tleAgeDays = -1;
     }
 
     @Override
@@ -337,6 +409,9 @@ public class LocationService extends Service {
 
     @Override
     public void onDestroy() {
+        if (activeInstance == this) {
+            activeInstance = null;
+        }
         stopTicker();
         releaseInjector();
         hideOverlay();
@@ -439,6 +514,8 @@ public class LocationService extends Service {
 
         startForegroundSafe(buildNotification("准备注入…"));
         acquireWakeLock();
+        // 维持真实采集优先：先定格本会话的卫星来源判定，再采一次真实卫星（采不到时由 1Hz 节拍回退合成）
+        beginGnssSyntheticSession();
         collectGnssSnapshot();
         // 先开快照套接字再准备注入：模块（system_server）在 Android 17 上读不了
         // ContentProvider（SecurityException），只能从抽象套接字拿快照；
@@ -521,6 +598,8 @@ public class LocationService extends Service {
 
         startForegroundSafe(buildNotification("准备注入…"));
         acquireWakeLock();
+        // 维持真实采集优先：先定格本会话的卫星来源判定，再采一次真实卫星（采不到时由 1Hz 节拍回退合成）
+        beginGnssSyntheticSession();
         collectGnssSnapshot();
         // 临时定位会话同样要发布快照套接字（与 startRoute 一致，start() 幂等）
         SnapshotServer.INSTANCE.start(this);
@@ -573,13 +652,225 @@ public class LocationService extends Service {
         lastHoldPushMs = 0L;
     }
 
+    /**
+     * 新会话的「GNSS 完全模拟」起始状态：定格设置项、清掉上一轮的采集结果与节流。
+     *
+     * <p>必须在 {@link #collectGnssSnapshot()} 之前调用：上一轮采集到的卫星 JSON 不能当成
+     * 本轮的证据（否则在室内第二次开始时会误判"有真实卫星"而不回退合成）。
+     */
+    private void beginGnssSyntheticSession() {
+        try {
+            gnssSyntheticForced = RouteStore.loadGnssSynthetic(this);
+        } catch (Throwable t) {
+            gnssSyntheticForced = false;   // 读设置失败：退回自动模式
+        }
+        gnssCollectedJson = null;
+        gnssCollectResolved = false;
+        lastSyntheticGnssMs = 0L;
+        gnssSourceLogged = null;
+    }
+
     /** 采集真实卫星分布（用于模块回放 GnssStatus），失败则复用上次快照。 */
     private void collectGnssSnapshot() {
         GnssCollector.collect(this, json -> {
+            // 自动模式的判据只有这一份"本次采集结果"：null / 空 / 解析不出卫星 → 回退合成
+            gnssCollectedJson = json;
+            gnssCollectResolved = true;
+            if (gnssSyntheticForced) {
+                // 强制合成：采集结果只留作诊断，绝不写进卫星通道
+                // （否则模块会先用真实卫星注入，下一秒才被合成表覆盖）
+                return;
+            }
             if (json != null) {
                 GnssSession.INSTANCE.set(json);
+                if (hasSatellites(json)) {
+                    logGnssSource("collected");
+                }
             }
         });
+    }
+
+    /**
+     * 「GNSS 完全模拟」的发布节拍：用<b>当前模拟坐标 + 当前时间</b>重算卫星表并写进
+     * {@link GnssSession}（模块经 prefs / 套接字 / Provider 读到后回放 GnssStatus）。
+     *
+     * <p>为什么不能靠 {@code realism.applyAt()} 顺带更新：拟真关闭时它提前 return，
+     * 根本不碰 {@link com.vloc.motion.core.GnssSky}，卫星表会永远停在上一次（或空）。
+     * 所以这里显式调用 {@link RealismEngine#updateGnss} 驱动，它是唯一不受拟真开关影响的入口。
+     *
+     * <p>节流 {@link #GNSS_SYNTHETIC_INTERVAL_MS}（1 秒）：卫星仰角/方位是慢变量，1Hz 与真机
+     * GnssStatus 上报节奏一致；但必须**持续**更新——坐标一变，可见卫星集合就要跟着变。
+     *
+     * @param nowMs 单调时钟（{@link SystemClock#uptimeMillis()}），只用于节流；
+     *              TLE 推算用的是墙钟 {@link System.currentTimeMillis()}
+     */
+    private void publishSyntheticGnss(long nowMs) {
+        try {
+            if (!shouldPublishSyntheticGnss()) {
+                return;
+            }
+            if (nowMs - lastSyntheticGnssMs < GNSS_SYNTHETIC_INTERVAL_MS) {
+                return;
+            }
+            final double[] position = currentGnssPosition();
+            if (Double.isNaN(position[0]) || Double.isNaN(position[1])) {
+                return;   // 还没有有效模拟坐标：本帧不发，下一帧再试
+            }
+            lastSyntheticGnssMs = nowMs;
+            realism.updateGnss(position[0], position[1], System.currentTimeMillis());
+            final String json = realism.gnssJsonAlways();
+            if (json == null || json.length() <= 2) {
+                // "[]"：星表缺失 / 全部算不出可见卫星。此时保持原样（真实快照仍可用），不清空通道
+                return;
+            }
+            GnssSession.INSTANCE.set(json);
+            logGnssSource("synthetic");
+        } catch (Throwable t) {
+            // 合成失败绝不能影响注入主流程
+            Log.w(TAG, "publish synthetic gnss failed", t);
+        }
+    }
+
+    /**
+     * 本帧的卫星表是否由<b>合成</b>数据提供。
+     *
+     * <ul>
+     *   <li>{@code gnss_synthetic=true}：无条件合成（不等真实采集结果）；</li>
+     *   <li>自动模式：等采集流程有结论后，只有<b>没采到卫星</b>才合成。</li>
+     * </ul>
+     */
+    private boolean syntheticGnssActive() {
+        if (gnssSyntheticForced) {
+            return true;
+        }
+        return gnssCollectResolved && !hasSatellites(gnssCollectedJson);
+    }
+
+    /** 是否该发合成卫星表（与 {@link #syntheticGnssActive()} 同义，语义分开便于阅读）。 */
+    private boolean shouldPublishSyntheticGnss() {
+        return syntheticGnssActive();
+    }
+
+    /**
+     * 合成卫星表用的观测点：优先本帧正在注入的坐标。
+     *
+     * <p>SPOT = 定点坐标；ROUTE = 当前轨迹采样点（暂停/保持时也有效）；
+     * 都取不到时退回会话里最后一次注入的坐标。返回 {lat, lon}，无效为 NaN。
+     */
+    private double[] currentGnssPosition() {
+        final double[] out = {Double.NaN, Double.NaN};
+        try {
+            final Session session = Session.INSTANCE;
+            if (session.mode == Session.Mode.SPOT) {
+                out[0] = spotLat;
+                out[1] = spotLon;
+                return out;
+            }
+            final Route.Sample sample = player.currentSample();
+            if (sample != null) {
+                out[0] = sample.lat;
+                out[1] = sample.lon;
+                return out;
+            }
+            if (session.hasStart) {
+                out[0] = session.lat;
+                out[1] = session.lon;
+            }
+        } catch (Throwable ignored) {
+            // 取不到就当无效，调用方本帧不发布
+        }
+        return out;
+    }
+
+    /**
+     * 统一出口：{@code realism.apply(...)} + （合成模式下）补齐 GNSS 附属数据。
+     *
+     * <p>为什么需要补齐：拟真关闭时 {@link RealismEngine#applyAt} 提前 return，
+     * {@code satellites / meanCn0 / maxCn0} 恒为 0；而「GNSS 完全模拟」此刻正把一张
+     * 真实可见的卫星表注入给模块——目标 App 若同时看 Location extras 与 GnssStatus，
+     * 就会看到"0 颗"与"几十颗"的矛盾。
+     *
+     * <p>这里只在"拟真关闭 + 合成生效"这一组合下用<b>同一份</b> GnssSky 结果
+     * 补上聚合值（与 {@link GnssSky#meanCn0()} / {@link GnssSky#maxCn0()} 同一口径：
+     * 只统计 usedInFix，不人为放大）；拟真开着时 applyAt 已经是这个口径，原样返回。
+     */
+    private Fix applyRealismFix(double lat, double lon, double altitude,
+                                double speedMps, double bearingDeg) {
+        final Fix fix = realism.apply(lat, lon, altitude, speedMps, bearingDeg, accuracyMeters);
+        try {
+            if (realism.isEnabled() || !syntheticGnssActive()) {
+                return fix;
+            }
+            int used = 0;
+            double sum = 0;
+            double max = 0;
+            for (GnssSky.Satellite sat : realism.gnssSatellites()) {
+                if (!sat.usedInFix) {
+                    continue;
+                }
+                used++;
+                sum += sat.cn0DbHz;
+                max = Math.max(max, sat.cn0DbHz);
+            }
+            if (used <= 0) {
+                return fix;   // 这一刻没有可用卫星：保持原值（0），不编造
+            }
+            return new Fix(fix.lat, fix.lon, fix.altitudeMeters, fix.speedMps, fix.bearingDeg,
+                    fix.accuracyMeters, fix.verticalAccuracyMeters, used,
+                    (float) (sum / used), (float) max);
+        } catch (Throwable t) {
+            return fix;   // 补齐失败就用原值，绝不影响注入主流程
+        }
+    }
+
+    /**
+     * 采集结果里是否真的有可用卫星（数组 / 列式对象两种格式都认）。
+     *
+     * <p>判定口径与模块解析器一致：必须存在一颗 {@code svid > 0} 的卫星。
+     * 空串 / {@code "[]"} / 缺 {@code svid} 列 / svid 全是 0 / 解析失败 一律按"没有卫星"
+     * 处理 = 自动回退合成。
+     */
+    private static boolean hasSatellites(String json) {
+        if (json == null) {
+            return false;
+        }
+        final String trimmed = json.trim();
+        if (trimmed.isEmpty() || "null".equals(trimmed)) {
+            return false;
+        }
+        try {
+            if (trimmed.charAt(0) == '[') {
+                final JSONArray array = new JSONArray(trimmed);
+                for (int i = 0; i < array.length(); i++) {
+                    final JSONObject item = array.optJSONObject(i);
+                    if (item != null && item.optInt("svid", 0) > 0) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            final JSONArray svid = new JSONObject(trimmed).optJSONArray("svid");
+            if (svid == null) {
+                return false;
+            }
+            for (int i = 0; i < svid.length(); i++) {
+                if (svid.optInt(i, 0) > 0) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 卫星表来源打日志：只在来源变化时打一条（现场据此判定 synthetic / collected）。 */
+    private void logGnssSource(String source) {
+        if (source == null || source.equals(gnssSourceLogged)) {
+            return;
+        }
+        gnssSourceLogged = source;
+        Log.i("VLocService", "gnss source: " + source);
     }
 
     /** 读取并应用"拟真模式 / 海拔 / 起步缓动"配置。 */
@@ -930,6 +1221,8 @@ public class LocationService extends Service {
                 }
                 if (Session.INSTANCE.mode == Session.Mode.SPOT) {
                     pushSpotLocation();
+                    // 「GNSS 完全模拟」：定点坐标不变，卫星仍会随时间升落，照样按 1Hz 刷新
+                    publishSyntheticGnss(SystemClock.uptimeMillis());
                     handler.postDelayed(this, 1000L);
                     return;
                 }
@@ -962,6 +1255,9 @@ public class LocationService extends Service {
                     // 暂停 / 停止移动时真实 GPS 仍在持续上报，保持 1Hz 同一坐标，避免"定位冻结"
                     holdPosition(now, sample);
                 }
+                // 「GNSS 完全模拟」：放在本帧坐标推进/保持之后、updateSteps 之前——
+                // ①用的是**当前**模拟坐标 + 当前时间；②steps 里的 "gnss" 数组随后就能取到这一份。
+                publishSyntheticGnss(now);
                 updateSteps(now);
                 updateNotification();
                 updateOverlay();
@@ -989,7 +1285,7 @@ public class LocationService extends Service {
     }
 
     private void pushSpotLocation() {
-        Fix fix = realism.apply(spotLat, spotLon, baseAltitude, 0.0, 0.0, accuracyMeters);
+        Fix fix = applyRealismFix(spotLat, spotLon, baseAltitude, 0.0, 0.0);
         // 系统级注入：本进程不写测试 Provider，但要发布快照给模块
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
                 fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
@@ -1019,8 +1315,8 @@ public class LocationService extends Service {
     /** 轨迹采样 → 拟真化（漂移/噪声/卫星数据）→ 注入。 */
     private Fix buildRouteFix(Route.Sample sample) {
         double altitude = Double.isNaN(sample.altitude) ? baseAltitude : sample.altitude;
-        return realism.apply(sample.lat, sample.lon, altitude,
-                player.getCurrentSpeedMps(), sample.bearingDeg, accuracyMeters);
+        return applyRealismFix(sample.lat, sample.lon, altitude,
+                player.getCurrentSpeedMps(), sample.bearingDeg);
     }
 
     private void injectFix(Fix fix) {
@@ -1106,8 +1402,7 @@ public class LocationService extends Service {
         }
         lastHoldPushMs = nowMs;
         double altitude = Double.isNaN(sample.altitude) ? baseAltitude : sample.altitude;
-        Fix fix = realism.apply(sample.lat, sample.lon, altitude, 0.0, sample.bearingDeg,
-                accuracyMeters);
+        Fix fix = applyRealismFix(sample.lat, sample.lon, altitude, 0.0, sample.bearingDeg);
         injectFix(fix);
         updateSessionFromFix(sample, fix);
     }
@@ -1134,8 +1429,27 @@ public class LocationService extends Service {
         session.strideMeters = stepEngine.getStrideMeters();
         StepSession.INSTANCE.update(
                 stepEngine.toJson(true, RouteStore.loadAttitudeReplay(this),
-                        lastSatellites, lastCn0Mean, lastCn0Max, realism.gnssJson()), true);
+                        lastSatellites, lastCn0Mean, lastCn0Max, stepsGnssJson()), true);
         publishNativeSensorState(dt, speed, bearing);
+    }
+
+    /**
+     * 下发给模块（目标进程内 {@code hidden/GnssReplay}）的卫星数组。
+     *
+     * <p>合成模式用 {@link RealismEngine#gnssJsonAlways()}：拟真关闭时 {@link RealismEngine#gnssJson()}
+     * 恒为 {@code "[]"}，目标进程会以为"没有卫星数据"而透传真实 GnssStatus——同一台设备上
+     * system_server 注入合成表、目标进程却回真实（室内为空）状态，自相矛盾。
+     * 其它情况保持原语义：拟真开关决定模块是否接管卫星状态。
+     */
+    private String stepsGnssJson() {
+        try {
+            if (syntheticGnssActive()) {
+                return realism.gnssJsonAlways();
+            }
+        } catch (Throwable ignored) {
+            // 兜底：退回原语义，绝不让卫星表拖垮 steps 通道
+        }
+        return realism.gnssJson();
     }
 
     /**

@@ -139,8 +139,8 @@ public class GnssSkyTest {
             assertTrue("cn0=" + sat.cn0DbHz, sat.cn0DbHz >= 20 && sat.cn0DbHz <= 45);
             assertTrue("baseband<=rf", sat.basebandCn0DbHz <= sat.cn0DbHz);
             assertTrue("carrier>1GHz", sat.carrierHz > 1.0e9);
-            assertTrue("低仰角不该参与定位", sat.usedInFix
-                    || sat.elevationDeg < GnssSky.FIX_ELEVATION_DEG);
+            assertTrue("参与定位必须满足仰角门限", !sat.usedInFix
+                    || sat.elevationDeg >= GnssSky.FIX_ELEVATION_DEG);
         }
         // 排序稳定：先星座后 Svid
         for (int i = 1; i < sats.size(); i++) {

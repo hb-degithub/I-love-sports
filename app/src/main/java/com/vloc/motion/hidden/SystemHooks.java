@@ -1769,8 +1769,37 @@ final class SystemHooks {
         return parseSatellitesJson(json);   // 与 /gnss 同一套解析
     }
 
-    /** 解析 /gnss 同款数组（prefs 与套接字共用）；空 / 非法内容返回 null（= 不注入卫星表）。 */
+    /**
+     * 解析卫星表（prefs / 套接字 / Provider 三条通道共用）；空 / 非法内容返回 null（= 不注入卫星表）。
+     *
+     * <p>支持两种格式：
+     * <ol>
+     *   <li><b>数组</b>（模块自己的契约，{@code GnssSky.toJsonArray()}）：
+     *       {@code [{"svid":5,"const":1,"ele":42.3,"azi":128.7,"cn0":34.2,"fix":true,
+     *       "alm":true,"eph":true,"cf":1575420000}, ...]}；</li>
+     *   <li><b>列式对象</b>（主 App 真实采集 {@code location/GnssCollector#toJson}，
+     *       老版本会话/快照里留下的就是这种）：
+     *       {@code {"version":1,"count":n,"svid":[..],"cn0":[..],"elevation":[..],
+     *       "azimuth":[..],"usedInFix":[..],"constellation":[..]}}。
+     *       逐字段按下标对齐到同样的 {@link Satellite} 列表。</li>
+     * </ol>
+     * 两种都解析不出卫星才返回 null。
+     */
     private static List<Satellite> parseSatellitesJson(String json) {
+        if (json == null) {
+            return null;
+        }
+        // 1) 首选数组（新契约）：解析失败就落到列式兜底，而不是直接放弃
+        final List<Satellite> fromArray = parseSatelliteArrayJson(json);
+        if (fromArray != null) {
+            return fromArray;
+        }
+        // 2) 向后兼容：真实采集留下的列式对象
+        return parseSatelliteColumnsJson(json);
+    }
+
+    /** 数组格式：{@code [{"svid":..,"const":..,"ele":..,"azi":..,"cn0":..,"fix":..,"alm":..,"eph":..,"cf":..}]}。 */
+    private static List<Satellite> parseSatelliteArrayJson(String json) {
         try {
             final JSONArray array = new JSONArray(json);
             final List<Satellite> list = new ArrayList<>(array.length());
@@ -1796,8 +1825,64 @@ final class SystemHooks {
             }
             return list.isEmpty() ? null : list;
         } catch (Throwable ignored) {
+            return null;   // 不是数组（例如列式对象）或内容非法：交给下一种格式
+        }
+    }
+
+    /**
+     * 列式对象格式（主 App 真实采集 / 老版本快照），字段名与 {@code GnssCollector#toJson} 逐字对应。
+     *
+     * <p>缺失列按"可定位的常规值"兜底（载噪比 30 dB-Hz、星座 1=GPS、参与定位 true），
+     * 单颗卫星下标越界只影响该颗，不影响整张表；一条都解析不出返回 null。
+     */
+    private static List<Satellite> parseSatelliteColumnsJson(String json) {
+        try {
+            final JSONObject root = new JSONObject(json);
+            final JSONArray svid = root.optJSONArray("svid");
+            if (svid == null) {
+                return null;   // 既不是数组也没有列式字段：不是卫星表
+            }
+            final JSONArray cn0 = root.optJSONArray("cn0");
+            final JSONArray elevation = root.optJSONArray("elevation");
+            final JSONArray azimuth = root.optJSONArray("azimuth");
+            final JSONArray used = root.optJSONArray("usedInFix");
+            final JSONArray constellation = root.optJSONArray("constellation");
+            final List<Satellite> list = new ArrayList<>(svid.length());
+            for (int i = 0; i < svid.length(); i++) {
+                final int id = svid.optInt(i, 0);
+                if (id <= 0) {
+                    continue;   // 与数组格式一致：没有 svid 的条目跳过
+                }
+                Satellite sat = new Satellite();
+                sat.svid = id;
+                sat.constellation = optIntAt(constellation, i, 1);
+                sat.elevation = (float) optDoubleAt(elevation, i, 0);
+                sat.azimuth = (float) optDoubleAt(azimuth, i, 0);
+                sat.cn0 = (float) optDoubleAt(cn0, i, 30);
+                sat.usedInFix = optBooleanAt(used, i, true);
+                sat.hasAlmanac = true;
+                // 与 GnssSky 口径一致：参与定位、或仰角够高，才算有星历
+                sat.hasEphemeris = sat.usedInFix || sat.elevation > 15f;
+                // 采集快照里没有载波频率：按 GPS L1 兜底（模块只把它当 GnssStatus 的展示字段）
+                sat.carrierHz = 1575.42e6f;
+                list.add(sat);
+            }
+            return list.isEmpty() ? null : list;
+        } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static int optIntAt(JSONArray array, int index, int fallback) {
+        return array == null ? fallback : array.optInt(index, fallback);
+    }
+
+    private static double optDoubleAt(JSONArray array, int index, double fallback) {
+        return array == null ? fallback : array.optDouble(index, fallback);
+    }
+
+    private static boolean optBooleanAt(JSONArray array, int index, boolean fallback) {
+        return array == null ? fallback : array.optBoolean(index, fallback);
     }
 
     /**

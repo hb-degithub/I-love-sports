@@ -48,6 +48,7 @@ import com.vloc.motion.core.PresetRoutes;
 import com.vloc.motion.core.TileSources;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.TleUpdater;
 import com.vloc.motion.location.RealLocationProvider;
 import com.vloc.motion.location.ModuleCheck;
 import com.vloc.motion.location.RootShell;
@@ -126,6 +127,11 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     /** null=检测中，TRUE=已授权，FALSE=未授权 */
     private Boolean rootGranted;
 
+    /** 星表更新是否进行中：启动提醒 / 设置里的「检查更新」共用一次任务，防止重复下载。 */
+    private boolean tleUpdating;
+    /** 启动期星表检查只做一次（Activity 因配置变化重建时不重复弹提醒）。 */
+    private boolean tleReminderChecked;
+
     // 目标配速选择器候选值（用选择器代替手工输入，避免非法数据）
     private static final int[] LAP_OPTIONS = {200, 300, 350, 398, 400, 500, 800, 1000};
     private static final String[] LAP_LABELS = {"200 m", "300 m", "350 m", "398 m（标准跑道）",
@@ -164,6 +170,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         }
         autoPickTileSource(false);
         watchTileLoading();
+        maybeRemindTleUpdate();
     }
 
     @Override
@@ -1844,6 +1851,10 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         SwitchMaterial switchAutoStop = content.findViewById(R.id.switchAutoStop);
         SwitchMaterial switchSystemInject = content.findViewById(R.id.switchSystemInject);
         TextView textInjectMode = content.findViewById(R.id.textInjectMode);
+        // 「GNSS 完全模拟」：不改布局 XML（本次只动 Java），运行时插进「定位参数」之前
+        CheckBox cbGnssSynthetic = addGnssSyntheticOption(content);
+        // 「GNSS 星表」信息行 + 检查更新按钮：同样运行时插进布局末尾
+        addTleUpdateRow(content);
 
         // ---- 回填当前值 ----
         editAltitude.setText(String.format(Locale.US, "%.0f", RouteStore.loadAltitude(this)));
@@ -1858,6 +1869,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         switchRandomStart.setChecked(RouteStore.loadRandomStart(this));
         switchAutoStop.setChecked(RouteStore.loadAutoStopOnFinish(this));
         switchSystemInject.setChecked(RouteStore.loadSystemInject(this));
+        cbGnssSynthetic.setChecked(RouteStore.loadGnssSynthetic(this));
         updateInjectModeHint(textInjectMode, switchSystemInject.isChecked());
         // 系统级注入时 Provider 勾选无意义，直接禁用避免误解
         switchSystemInject.setOnCheckedChangeListener((v, checked) -> {
@@ -1872,7 +1884,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 .setPositiveButton("保存", (dialog, which) -> {
                     saveSettings(editAltitude, editAccuracy, cbGps, cbNetwork, cbFused,
                             switchRealism, switchSpeedVariance, switchAttitude,
-                            switchRandomStart, switchAutoStop, switchSystemInject);
+                            switchRandomStart, switchAutoStop, switchSystemInject,
+                            cbGnssSynthetic);
                 })
                 .setNegativeButton("取消", null)
                 .show();
@@ -1897,12 +1910,209 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         }
     }
 
+    /**
+     * 「GNSS 完全模拟（室内/模拟器可用）」复选框：运行时插进设置弹窗。
+     *
+     * <p>为什么在代码里建视图：本次改动只允许动 Java 后端文件，{@code res/layout/dialog_settings.xml}
+     * 属于前端资源不能碰；插进 {@code ScrollView → LinearLayout} 的效果与写进 XML 完全一致。
+     * 位置紧随「拟真与反检测」分组（它属于同一类"伪装得更像真机"的选项，排在「定位参数」之前）；
+     * 找不到分组标题时退回追加到末尾。
+     *
+     * @return 复选框本身——即使插不进布局也照常返回，保证 {@link #saveSettings} 仍能读写该项
+     */
+    private CheckBox addGnssSyntheticOption(View content) {
+        final CheckBox checkbox = new CheckBox(this);
+        checkbox.setText("GNSS 完全模拟（室内/模拟器可用）");
+        final TextView hint = new TextView(this);
+        hint.setText("不依赖本机真实卫星，使用内置星表按模拟位置生成");
+        hint.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f);
+        hint.setPadding(0, 0, 0,
+                Math.round(getResources().getDisplayMetrics().density * 4f));
+        try {
+            hint.setTextColor(ContextCompat.getColor(this, R.color.text_secondary));
+        } catch (Throwable ignored) {
+            // 取不到主题色就用默认色：只是观感差异，不影响功能
+        }
+        try {
+            final LinearLayout container = settingsContainer(content);
+            if (container == null) {
+                return checkbox;   // 布局结构变了：设置仍可读写，绝不因为插不进视图而崩
+            }
+            int index = container.getChildCount();
+            for (int i = 0; i < container.getChildCount(); i++) {
+                final View child = container.getChildAt(i);
+                if (child instanceof TextView
+                        && "定位参数".contentEquals(((TextView) child).getText())) {
+                    index = i;
+                    break;
+                }
+            }
+            container.addView(checkbox, index);
+            container.addView(hint, index + 1);
+        } catch (Throwable t) {
+            Log.w("VLocSettings", "add gnss synthetic option failed", t);
+        }
+        return checkbox;
+    }
+
+    /** 设置弹窗的内容容器：{@code ScrollView} 里的那个 {@code LinearLayout}（取不到返回 null）。 */
+    private static LinearLayout settingsContainer(View content) {
+        View root = content;
+        if (root instanceof ScrollView && ((ScrollView) root).getChildCount() > 0) {
+            root = ((ScrollView) root).getChildAt(0);
+        }
+        return root instanceof LinearLayout ? (LinearLayout) root : null;
+    }
+
+    // ------------------------------------------------------------ GNSS 星表（过期提醒 / 一键更新）
+
+    /**
+     * 启动时的星表过期提醒：`ageDays > STALE_DAYS` 且距上次提醒 ≥ 7 天才弹，
+     * 每个 Activity 实例只检查一次。
+     *
+     * <p>读盘/解析放在一次性后台线程（星表约 40 KB），算完回主线程决定是否弹窗，不阻塞启动。
+     */
+    private void maybeRemindTleUpdate() {
+        if (tleReminderChecked) {
+            return;
+        }
+        tleReminderChecked = true;
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            final TleUpdater.Catalog catalog = TleUpdater.load(app);
+            if (catalog.text == null) {
+                return;
+            }
+            final long lastAt = RouteStore.loadTleRemindAt(app);
+            if (!TleUpdater.shouldRemind(catalog.ageDays, lastAt, System.currentTimeMillis())) {
+                return;   // 没过期，或 7 天内提醒过
+            }
+            final int ageDays = catalog.ageDays;
+            runOnUiThread(() -> showTleRemindDialog(ageDays));
+        }, "vloc-tle-check").start();
+    }
+
+    /** 过期提醒对话框：立即更新 / 稍后。弹出即记「已提醒」，点「稍后」也不会每次启动都弹。 */
+    private void showTleRemindDialog(final int ageDays) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        RouteStore.saveTleRemindAt(this, System.currentTimeMillis());
+        new AlertDialog.Builder(this)
+                .setTitle("GNSS 星表已过期 " + Math.max(ageDays, 0) + " 天")
+                .setMessage("卫星仰角/方位角会逐渐偏差，长期不更新容易被识别。是否现在更新？")
+                .setPositiveButton("立即更新", (dialog, which) -> startTleUpdate(null))
+                .setNegativeButton("稍后", null)
+                .show();
+    }
+
+    /**
+     * 更新星表：后台拉取 4 组 CelesTrak TLE → 校验 → 原子落盘，完成后回主线程提示。
+     *
+     * <p>进度用不可取消的对话框展示（不阻塞主线程）；成功才让服务重新加载星表，
+     * 失败只提示原因、继续用当前星表。
+     *
+     * @param statusView 设置里那一行信息文本（更新后原地刷新）；启动提醒传 null
+     */
+    private void startTleUpdate(final TextView statusView) {
+        if (tleUpdating) {
+            toast("正在更新星表，请稍候…");
+            return;
+        }
+        tleUpdating = true;
+        final AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("更新 GNSS 星表")
+                .setMessage("正在从 CelesTrak 拉取 4 个分组（每组超时 10 秒）…")
+                .setCancelable(false)
+                .create();
+        progress.show();
+        TleUpdater.update(this, result -> {
+            tleUpdating = false;
+            if (!isFinishing() && !isDestroyed() && progress.isShowing()) {
+                progress.dismiss();
+            }
+            // 无论成功失败都算"提醒过了"：失败时没必要每次启动再弹一遍
+            RouteStore.saveTleRemindAt(this, System.currentTimeMillis());
+            if (result.ok) {
+                // 与界面无关：服务在跑就立刻换用新表（Activity 已销毁也照做）
+                LocationService.reloadTleCatalog();
+            }
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (result.ok) {
+                toast("星表已更新：" + result.satCount + " 颗（历元 "
+                        + TleUpdater.formatEpochUtc(result.newestEpochMs) + "）");
+                if (statusView != null) {
+                    statusView.setText(tleSummary("已更新", result.ageDays));
+                }
+            } else {
+                toast("更新失败：" + result.error + "，继续使用当前星表");
+            }
+        });
+    }
+
+    /** 设置弹窗里的「GNSS 星表」信息行 + 「检查更新」按钮（运行时插入，不动布局 XML）。 */
+    private void addTleUpdateRow(View content) {
+        final LinearLayout container = settingsContainer(content);
+        if (container == null) {
+            return;
+        }
+        final TextView info = new TextView(this);
+        info.setText("GNSS 星表：读取中…");
+        info.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+        try {
+            info.setTextColor(ContextCompat.getColor(this, R.color.text_secondary));
+        } catch (Throwable ignored) {
+            // 取不到主题色只是观感差异，不影响功能
+        }
+        final Button check = new Button(this);
+        check.setText("检查更新");
+        check.setOnClickListener(v -> startTleUpdate(info));
+        container.addView(info);
+        container.addView(check);
+        fillTleInfo(info);
+    }
+
+    /** 后台读一次当前生效星表，把「来源 · 过期 N 天」填进设置里的信息行。 */
+    private void fillTleInfo(final TextView info) {
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            final String summary = tleSummaryText(app);
+            runOnUiThread(() -> info.setText(summary));
+        }, "vloc-tle-info").start();
+    }
+
+    /**
+     * 当前星表摘要（设置界面用）：优先读服务最近一次加载的来源 / ageDays
+     * （{@link LocationService#gnssTleSource()}），服务还没加载过就按同一优先级现场读一次。
+     */
+    private static String tleSummaryText(Context context) {
+        String source = LocationService.gnssTleSource();
+        int ageDays = LocationService.gnssTleAgeDays();
+        if (TleUpdater.SOURCE_NONE.equals(source)) {
+            final TleUpdater.Catalog catalog = TleUpdater.load(context);
+            source = catalog.source;
+            ageDays = catalog.ageDays;
+        }
+        if (TleUpdater.SOURCE_NONE.equals(source)) {
+            return "GNSS 星表：无（不产出卫星数据）";
+        }
+        final String label = TleUpdater.SOURCE_UPDATED.equals(source) ? "已更新" : "内置";
+        return tleSummary(label, ageDays);
+    }
+
+    private static String tleSummary(String label, int ageDays) {
+        return String.format(Locale.US, "GNSS 星表：%s · 过期 %d 天", label, Math.max(ageDays, 0));
+    }
+
     /** 保存设置：所有字段各自校验、各自写回，某一项非法不影响其它项。 */
     private void saveSettings(EditText editAltitude, EditText editAccuracy,
                               CheckBox cbGps, CheckBox cbNetwork, CheckBox cbFused,
                               SwitchMaterial switchRealism, SwitchMaterial switchSpeedVariance,
                               SwitchMaterial switchAttitude, SwitchMaterial switchRandomStart,
-                              SwitchMaterial switchAutoStop, SwitchMaterial switchSystemInject) {
+                              SwitchMaterial switchAutoStop, SwitchMaterial switchSystemInject,
+                              CheckBox cbGnssSynthetic) {
         // 海拔：-500 ~ 9000 m 之外的输入夹紧
         float altitude = RouteStore.loadAltitude(this);
         try {
@@ -1946,6 +2156,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         RouteStore.saveRandomStart(this, switchRandomStart.isChecked());
         RouteStore.saveAutoStopOnFinish(this, switchAutoStop.isChecked());
         RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
+        // GNSS 完全模拟：不依赖本机真实卫星（室内/模拟器）；与注入方式一样，下次「开始」生效
+        RouteStore.saveGnssSynthetic(this, cbGnssSynthetic.isChecked());
 
         if (switchSystemInject.isChecked()) {
             toast("系统级注入已开启（下次开始生效）\n请确认 LSPosed 已勾选「系统框架」并重启系统");
