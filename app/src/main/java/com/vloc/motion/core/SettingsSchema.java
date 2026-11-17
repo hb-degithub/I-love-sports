@@ -72,6 +72,10 @@ public final class SettingsSchema {
         list.add(new Item("auto_stop_on_finish", Group.BEHAVIOR,
                 "到达终点后自动停止", false, 0, 0));
         list.add(new Item("random_start", Group.BEHAVIOR, "每次开始随机更换起点", false, 0, 0));
+        // 「停止时清 logcat」也算停止后的行为：它是 TraceCleaner.Options.clearLogcat 的
+        // 唯一主持久开关（默认关），此前只有读写入口、没有界面也没有清单条目。
+        list.add(new Item("clear_logcat_on_stop", Group.BEHAVIOR,
+                "停止时清理日志（logcat）", false, 0, 0));
         return list;
     }
 

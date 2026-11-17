@@ -5,6 +5,8 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -53,7 +55,17 @@ public final class FloatingWindow {
     private final TextView startView;
     private final TextView pauseView;
     private final TextView holdView;
-    private boolean shown;
+    private volatile boolean shown;
+
+    /**
+     * 进程内最近一次成功显示的实例（null = 当前没有窗口挂在 WindowManager 上）。
+     *
+     * <p>为什么需要静态记录：唯一实例是 {@code LocationService} 的私有成员，Activity 拿不到它；
+     * 而「屏幕上有没有悬浮窗」这个只读判断与"谁持有的实例"无关，设置页的「注入环境」面板要的
+     * 就是这个答案。隐藏仍然优先走服务自己的 {@code hideOverlay()}，静态入口只是给
+     * 「立即清理痕迹」用的兜底（见 {@link #hideAnyShowing()}）。
+     */
+    private static volatile FloatingWindow visibleInstance;
 
     public FloatingWindow(Context context, Actions actions) {
         this.context = context.getApplicationContext();
@@ -185,6 +197,43 @@ public final class FloatingWindow {
         return shown;
     }
 
+    /** {@link #isShown()} 的别名（只读）：按语义取用，调用方无需知道字段名。 */
+    public boolean isShowing() {
+        return shown;
+    }
+
+    /**
+     * 进程内是否有悬浮窗正在显示（<b>只读</b>；设置页「注入环境」面板用）。
+     *
+     * <p>跨实例：服务持有的是私有成员，Activity 侧只能通过这个静态入口查询。
+     * 不做任何 IO，可在任意线程调用。
+     */
+    public static boolean isAnyShowing() {
+        final FloatingWindow instance = visibleInstance;
+        return instance != null && instance.isShown();
+    }
+
+    /**
+     * 隐藏进程内正在显示的悬浮窗（「立即清理痕迹」用；服务自己的 {@code hideOverlay()} 仍是主路径）。
+     *
+     * <p>{@code WindowManager.removeView} 有线程亲和性：当前不在主线程时转投主线程执行。
+     * 隐藏后实例的 {@code shown} 会变 false，服务的空闲自动隐藏逻辑据此也能得到一致结论。
+     *
+     * @return true = 当时确实有窗口并已请求移除；false = 本来就没有
+     */
+    public static boolean hideAnyShowing() {
+        final FloatingWindow instance = visibleInstance;
+        if (instance == null) {
+            return false;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            instance.hide();
+            return true;
+        }
+        new Handler(Looper.getMainLooper()).post(instance::hide);
+        return true;
+    }
+
     /** 显示悬浮窗（需要悬浮窗权限）。 */
     public void show() {
         if (shown || windowManager == null) {
@@ -196,6 +245,7 @@ public final class FloatingWindow {
         try {
             windowManager.addView(root, params);
             shown = true;
+            visibleInstance = this;
         } catch (RuntimeException ignored) {
             shown = false;
         }
@@ -203,6 +253,9 @@ public final class FloatingWindow {
 
     /** 移除悬浮窗。 */
     public void hide() {
+        if (visibleInstance == this) {
+            visibleInstance = null;   // 先摘静态引用：并发查询立刻得到"没有窗口"
+        }
         if (!shown || windowManager == null) {
             return;
         }

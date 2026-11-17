@@ -217,6 +217,20 @@ public final class SnapshotPrefs {
         }
     }
 
+    /**
+     * 是否处于"会话中、正在按节流写快照"的状态。
+     *
+     * <p>供 {@code TraceCleaner} 判断能否安全删除 {@code shared_prefs/vloc_snapshot.xml}：
+     * {@link #stop()} 之后是 false，新会话 {@link #start(Context)} 之后立刻变 true。
+     * 删除动作是异步的（后台线程 + root 调用可能很慢），用户"停止后立刻重新开始"时
+     * 必须靠这个标记避免把新会话正在写的文件删掉。
+     *
+     * @return true = 正在写快照（此时不要动 prefs 文件）
+     */
+    public boolean isRunning() {
+        return running;
+    }
+
     // ---------------------------------------------------------------- 定时写入
 
     /** 定时任务：每 {@link #LOC_INTERVAL_MS} 跑一次 {@link #onTick()}（会话停止后自行结束）。 */

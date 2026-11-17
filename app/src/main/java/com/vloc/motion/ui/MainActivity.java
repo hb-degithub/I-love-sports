@@ -12,6 +12,7 @@ import android.util.Log;
 import android.graphics.Paint;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
@@ -49,12 +50,14 @@ import com.vloc.motion.core.TileSources;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.core.TleUpdater;
+import com.vloc.motion.core.TraceCleaner;
 import com.vloc.motion.location.RealLocationProvider;
 import com.vloc.motion.location.ModuleCheck;
 import com.vloc.motion.location.RootShell;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.service.EnvSession;
 import com.vloc.motion.service.HookHeartbeatStore;
+import com.vloc.motion.service.SnapshotPrefs;
 import com.vloc.motion.service.StepSession;
 import com.vloc.motion.service.LocationService;
 import com.vloc.motion.service.Session;
@@ -69,6 +72,7 @@ import org.osmdroid.views.overlay.Marker;
 import org.osmdroid.views.overlay.Polyline;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -94,6 +98,17 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
      * 改动其中一个必须同步另一个。
      */
     private static final long SYSTEM_MODULE_SILENCE_MS = 30_000L;
+
+    /**
+     * 前台服务通知 / 系统级注入告警通知的 id。
+     *
+     * <p>必须与 {@code LocationService.NOTIFICATION_ID = 1001} /
+     * {@code ALERT_NOTIFICATION_ID = 1002} 保持一致：那两个常量是 private，而设置页的
+     * 「立即清理痕迹」要在 Activity 侧撤掉这两条通知（{@link TraceCleaner.Options#notificationId}），
+     * 只能在这里复刻一份。改动其中一个必须同步另一个。
+     */
+    private static final int SERVICE_NOTIFICATION_ID = 1001;
+    private static final int ALERT_NOTIFICATION_ID = 1002;
 
     private MapView mapView;
     /** 是否已 detach 过 MapView：onDestroy 只释放一次，避免重复 onDetach。 */
@@ -1756,6 +1771,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         } else if (id == R.id.action_settings) {
             showSettingsDialog();
             return true;
+        } else if (id == R.id.action_usage) {
+            startActivity(new Intent(this, UsageLogActivity.class));
+            return true;
         } else if (id == R.id.action_scope) {
             startActivity(new Intent(this, ScopeActivity.class));
             return true;
@@ -1855,6 +1873,10 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         CheckBox cbGnssSynthetic = addGnssSyntheticOption(content);
         // 「GNSS 星表」信息行 + 检查更新按钮：同样运行时插进布局末尾
         addTleUpdateRow(content);
+        // 「注入环境」只读状态面板 + 「立即清理痕迹」：追加在既有 9 项之后，不重排
+        final InjectionPanel injectPanel = addInjectionStatusPanel(content);
+        // 「停止时清理日志（logcat）」：新增开关（SettingsSchema 里登记为 clear_logcat_on_stop）
+        SwitchMaterial switchClearLogcat = addClearLogcatOption(content);
 
         // ---- 回填当前值 ----
         editAltitude.setText(String.format(Locale.US, "%.0f", RouteStore.loadAltitude(this)));
@@ -1870,6 +1892,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         switchAutoStop.setChecked(RouteStore.loadAutoStopOnFinish(this));
         switchSystemInject.setChecked(RouteStore.loadSystemInject(this));
         cbGnssSynthetic.setChecked(RouteStore.loadGnssSynthetic(this));
+        switchClearLogcat.setChecked(RouteStore.loadClearLogcatOnStop(this));
         updateInjectModeHint(textInjectMode, switchSystemInject.isChecked());
         // 系统级注入时 Provider 勾选无意义，直接禁用避免误解
         switchSystemInject.setOnCheckedChangeListener((v, checked) -> {
@@ -1878,17 +1901,22 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         });
         setProvidersEnabled(cbGps, cbNetwork, cbFused, !switchSystemInject.isChecked());
 
-        new AlertDialog.Builder(this)
+        // 先 create() 再 show()：异步查询（appop / 心跳）回调里要用 dialog.isShowing()
+        // 判断"面板还在不在"，拿到 dialog 引用后才能安全回写视图
+        final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("设置")
                 .setView(content)
-                .setPositiveButton("保存", (dialog, which) -> {
-                    saveSettings(editAltitude, editAccuracy, cbGps, cbNetwork, cbFused,
-                            switchRealism, switchSpeedVariance, switchAttitude,
-                            switchRandomStart, switchAutoStop, switchSystemInject,
-                            cbGnssSynthetic);
-                })
+                .setPositiveButton("保存", (d, which) ->
+                        saveSettings(editAltitude, editAccuracy, cbGps, cbNetwork, cbFused,
+                                switchRealism, switchSpeedVariance, switchAttitude,
+                                switchRandomStart, switchAutoStop, switchSystemInject,
+                                cbGnssSynthetic, switchClearLogcat))
                 .setNegativeButton("取消", null)
-                .show();
+                .create();
+        injectPanel.dialog = dialog;
+        dialog.show();
+        // 打开即刷新；心跳/appop 在后台查，回来才更新（不会阻塞弹窗）
+        refreshInjectionPanel(injectPanel);
     }
 
     /** 系统级注入 / 测试 Provider 两种模式互斥，界面上把当前模式说清楚。 */
@@ -1962,6 +1990,423 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             root = ((ScrollView) root).getChildAt(0);
         }
         return root instanceof LinearLayout ? (LinearLayout) root : null;
+    }
+
+    // ------------------------------------------------------------ 注入环境面板（只读 + 立即清理）
+
+    /**
+     * 「注入环境」面板的视图句柄。
+     *
+     * <p>只做一件事：把 7 行状态文本和「立即清理痕迹」按钮攒在一起，供异步回调回写；
+     * {@link #dialog} 是"面板还在不在"的唯一判据——对话框关掉后所有后台回调直接丢弃，
+     * 既不会更新已销毁的视图，也不会因为 Activity 已 finishing 而崩。
+     */
+    private final class InjectionPanel {
+        TextView moduleValue;
+        TextView modeValue;
+        TextView providerValue;
+        TextView appopValue;
+        TextView overlayValue;
+        TextView snapshotValue;
+        TextView cleanupValue;
+        Button cleanButton;
+        AlertDialog dialog;
+
+        /** 面板是否仍可见（对话框已 dismiss / 尚未 show 时返回 false）。 */
+        boolean alive() {
+            try {
+                return dialog != null && dialog.isShowing()
+                        && !isFinishing() && !isDestroyed();
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * 「注入环境」只读状态面板 + 「立即清理痕迹」按钮：运行时追加到设置弹窗末尾。
+     *
+     * <p>沿用 {@link #addGnssSyntheticOption} 的做法（{@code res/layout/dialog_settings.xml}
+     * 属于前端资源、本轮不动）：整个面板按 {@code ScrollView → LinearLayout} 的结构追加，
+     * <b>不插入、不重排既有的 9 个设置项</b>。7 行数据来源见 {@link #refreshInjectionPanel}。
+     *
+     * @return 视图句柄——即使布局结构变了、插不进去也照常返回（各值仍可刷新，只是看不见）
+     */
+    private InjectionPanel addInjectionStatusPanel(View content) {
+        final InjectionPanel panel = new InjectionPanel();
+        try {
+            final LinearLayout container = settingsContainer(content);
+            if (container == null) {
+                return panel;
+            }
+            container.addView(groupTitle("注入环境（只读状态）"));
+            panel.moduleValue = addStatusRow(container, "模块注入", "检查中…");
+            panel.modeValue = addStatusRow(container, "注入模式", "…");
+            panel.providerValue = addStatusRow(container, "测试 Provider", "…");
+            panel.appopValue = addStatusRow(container, "mock_location 权限", "检查中…");
+            panel.overlayValue = addStatusRow(container, "悬浮窗", "…");
+            panel.snapshotValue = addStatusRow(container, "快照文件", "检查中…");
+            panel.cleanupValue = addStatusRow(container, "上次清理", "…");
+            panel.cleanButton = new Button(this);
+            panel.cleanButton.setText("立即清理痕迹");
+            panel.cleanButton.setOnClickListener(v -> startManualTraceCleanup(panel));
+            container.addView(panel.cleanButton);
+            container.addView(hintText("清快照 xml / 卫星快照 / 悬浮窗 / 通知 / appop 校验 / "
+                    + "/data/local/tmp/vloc*，logcat 按上面开关决定；会话运行中会跳过快照两项，"
+                    + "避免打断正在注入的通道。"));
+        } catch (Throwable t) {
+            Log.w(TAG, "add injection status panel failed", t);
+        }
+        return panel;
+    }
+
+    /**
+     * 「停止时清理日志（logcat）」开关：运行时追加在面板之后（新增项，既有项不动）。
+     *
+     * <p>开关本身的 key 是 {@code RouteStore} 的 {@code clear_logcat_on_stop}
+     * （{@code SettingsSchema} 里登记为 {@code clear_logcat_on_stop}，默认关）。
+     *
+     * @return 开关本身——即使插不进布局也照常返回，保证「保存」仍能读写该项
+     */
+    private SwitchMaterial addClearLogcatOption(View content) {
+        final SwitchMaterial switchClearLogcat = new SwitchMaterial(this);
+        switchClearLogcat.setText("停止时清理日志（logcat）");
+        try {
+            final LinearLayout container = settingsContainer(content);
+            if (container == null) {
+                return switchClearLogcat;
+            }
+            container.addView(groupTitle("停止清理"));
+            container.addView(switchClearLogcat);
+            container.addView(hintText(
+                    "停止模拟后用 root 清空 logcat 缓冲区（会清掉其他应用的日志）"));
+        } catch (Throwable t) {
+            Log.w(TAG, "add clear-logcat option failed", t);
+        }
+        return switchClearLogcat;
+    }
+
+    /**
+     * 刷新「注入环境」面板（三个更新阶段，全部回主线程写视图）。
+     *
+     * <ol>
+     *   <li><b>主线程</b>（纯内存 / prefs 读）：注入模式、测试 Provider、悬浮窗、上次清理；</li>
+     *   <li><b>后台</b> {@code vloc-inject-hb}：模块心跳（JSON 解析）与快照文件是否存在（磁盘 IO）；</li>
+     *   <li><b>后台</b> {@code vloc-inject-appop}：{@code appops get}（要 su，可能好几秒）。</li>
+     * </ol>
+     * 先生成"检查中…"，查到再覆盖；对话框关掉后回调按 {@link InjectionPanel#alive()} 丢弃。
+     */
+    private void refreshInjectionPanel(final InjectionPanel panel) {
+        if (panel == null) {
+            return;
+        }
+        // ---- 1. 主线程就能定下来的 ----
+        setValue(panel.modeValue, injectionModeText());
+        setValue(panel.providerValue, testProviderText());
+        setValue(panel.overlayValue, FloatingWindow.isAnyShowing() ? "显示中" : "已隐藏");
+        setValue(panel.cleanupValue, lastCleanupText());
+        setValue(panel.moduleValue, "检查中…");
+        setValue(panel.appopValue, "检查中…");
+
+        // ---- 2. 心跳 + 快照文件（后台；两条线程分开，appop 的 su 慢也不拖住别的行）----
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            final String module = moduleInjectionText(app);
+            final String snapshot = snapshotFileText(app);
+            runOnUiThread(() -> {
+                if (!panel.alive()) {
+                    return;
+                }
+                setValue(panel.moduleValue, module);
+                setValue(panel.snapshotValue, snapshot);
+            });
+        }, "vloc-inject-hb").start();
+
+        // ---- 3. mock_location appop（后台 su 查询）----
+        new Thread(() -> {
+            final String appop = mockAppopText(app);
+            runOnUiThread(() -> {
+                if (!panel.alive()) {
+                    return;
+                }
+                setValue(panel.appopValue, appop);
+            });
+        }, "vloc-inject-appop").start();
+    }
+
+    /** 面板第 1 行：模块心跳（system 优先，其次 app 进程数，最后「未检测到」）。 */
+    private static String moduleInjectionText(Context context) {
+        final long now = System.currentTimeMillis();
+        final HookHeartbeatStore.Beat system = HookHeartbeatStore.freshestSystem(
+                context, HookHeartbeatStore.FRESH_MS, Build.VERSION.SDK_INT);
+        if (system != null) {
+            final long age = Math.max(0L, now - system.at);
+            return age < 1500L
+                    ? "已生效（刚刚）"
+                    : "已生效（" + formatAgeTag(age) + "前）";
+        }
+        int apps = 0;
+        for (HookHeartbeatStore.Beat beat : HookHeartbeatStore.beats(context)) {
+            if (!beat.isSystem()) {
+                apps++;
+            }
+        }
+        return apps > 0 ? "已注入 " + apps + " 个应用进程" : "未检测到";
+    }
+
+    /** 面板第 2 行：当前注入模式（{@code system_inject} 优先，否则看会话是否在跑）。 */
+    private String injectionModeText() {
+        if (RouteStore.loadSystemInject(this)) {
+            return "系统级";
+        }
+        return Session.INSTANCE.isActive() ? "root 测试 Provider" : "未运行";
+    }
+
+    /** 面板第 3 行：测试 Provider 是否已接管本进程（root 成功 + 会话运行）。 */
+    private static String testProviderText() {
+        final Session session = Session.INSTANCE;
+        return session.rootOk && session.isActive() ? "已接管" : "未接管";
+    }
+
+    /**
+     * 面板第 4 行：{@code android:mock_location} appop（后台线程调用）。
+     *
+     * <p>不猜：没有 root / appops 不可用时记「未知」，输出既不含 allow 也不含 default 也记「未知」。
+     */
+    private static String mockAppopText(Context context) {
+        final String pkg = context == null ? null : context.getPackageName();
+        if (pkg == null || pkg.isEmpty()) {
+            return "未知";
+        }
+        final RootShell.Result result = RootShell.getMockAppop(pkg);
+        if (result == null || !result.ok()) {
+            return "未知";   // 没有 root / 命令失败：宁可说不知道，也不误报 default
+        }
+        if (RootShell.isMockAppopAllowed(result)) {
+            return "allow";
+        }
+        return result.combined().toLowerCase(Locale.US).contains("default") ? "default" : "未知";
+    }
+
+    /** 面板第 6 行：world-readable 快照文件是否还在（后台做一次 {@code exists()}）。 */
+    private static String snapshotFileText(Context context) {
+        final File file = snapshotPrefsFile(context);
+        if (file == null) {
+            return "未知";
+        }
+        try {
+            return file.exists() ? "存在" : "已清理";
+        } catch (Throwable t) {
+            return "未知";
+        }
+    }
+
+    /**
+     * {@code shared_prefs/vloc_snapshot.xml}（与 {@code TraceCleaner} 同一路径算法：
+     * {@code ApplicationInfo.dataDir} 优先，{@code files} 的父目录兜底）。
+     */
+    private static File snapshotPrefsFile(Context context) {
+        if (context == null) {
+            return null;
+        }
+        final String name = SnapshotPrefs.PREFS_NAME + ".xml";
+        try {
+            final String dataDir = context.getApplicationInfo() == null
+                    ? null : context.getApplicationInfo().dataDir;
+            if (dataDir != null && !dataDir.isEmpty()) {
+                return new File(new File(dataDir, "shared_prefs"), name);
+            }
+        } catch (Throwable ignored) {
+            // 落到下面的兜底
+        }
+        try {
+            final File files = context.getFilesDir();
+            if (files != null && files.getParentFile() != null) {
+                return new File(new File(files.getParentFile(), "shared_prefs"), name);
+            }
+        } catch (Throwable ignored) {
+            // 没有可用目录
+        }
+        return null;
+    }
+
+    /** 面板第 7 行：上次清理的时间 + 一行摘要（没有则「从未清理」）。 */
+    private static String lastCleanupText() {
+        final TraceCleaner.Result result = TraceCleaner.lastResult();
+        final long at = TraceCleaner.lastFinishedAtMs();
+        if (result == null || at <= 0L) {
+            return "从未清理";
+        }
+        final StringBuilder sb = new StringBuilder();
+        sb.append(new SimpleDateFormat("MM-dd HH:mm", Locale.US).format(new Date(at)))
+                .append(" · 清理 ").append(result.count(TraceCleaner.Status.OK)).append(" 项");
+        final int skipped = result.count(TraceCleaner.Status.SKIPPED);
+        final int failed = result.count(TraceCleaner.Status.FAILED);
+        if (skipped > 0) {
+            sb.append("，跳过 ").append(skipped);
+        }
+        if (failed > 0) {
+            sb.append("，失败 ").append(failed);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 「立即清理痕迹」：调 {@link TraceCleaner#cleanup}，完成后 Toast 一行摘要并刷新面板。
+     *
+     * <p>清理线程由 {@code TraceCleaner} 自己起（daemon），回调已 post 回主线程；
+     * 期间按钮置灰 + 改文案，重复点击直接忽略。
+     */
+    private void startManualTraceCleanup(final InjectionPanel panel) {
+        final Button button = panel == null ? null : panel.cleanButton;
+        if (button != null) {
+            if (!button.isEnabled()) {
+                return;   // 已经在清理：忽略重复点击
+            }
+            button.setEnabled(false);
+            button.setAlpha(0.5f);
+            button.setText("清理中…");
+        }
+        final Context app = getApplicationContext();
+        final TraceCleaner.Options options = new TraceCleaner.Options();
+        // 快照 xml / 卫星快照由 TraceCleaner 无条件执行（会话运行中按 protectActiveSession 跳过）
+        options.checkAppop = true;        // mock_location 只读校验
+        options.removeTempFiles = true;   // /data/local/tmp/vloc*
+        options.notificationId = SERVICE_NOTIFICATION_ID;
+        options.alertNotificationId = ALERT_NOTIFICATION_ID;
+        options.clearLogcat = RouteStore.loadClearLogcatOnStop(app);   // 取用户设置里的开关
+        // 服务的实例是私有成员：用 FloatingWindow 的静态入口隐藏（TraceCleaner 会在主线程跑它）
+        options.hideOverlay = FloatingWindow::hideAnyShowing;
+        TraceCleaner.cleanup(app, options, result -> {
+            if (button != null) {
+                button.setEnabled(true);
+                button.setAlpha(1f);
+                button.setText("立即清理痕迹");
+            }
+            // 用 application context 弹：Activity 可能在清理期间被销毁
+            Toast.makeText(app, cleanupSummaryText(result), Toast.LENGTH_SHORT).show();
+            if (!isFinishing() && !isDestroyed()) {
+                refreshInjectionPanel(panel);   // 刷新 appop / 快照 / 上次清理三行
+            }
+        });
+    }
+
+    /** 「已清理 N 项，跳过 M 项」一行摘要（有失败项时附上项名，便于对症排查）。 */
+    private static String cleanupSummaryText(TraceCleaner.Result result) {
+        if (result == null) {
+            return "清理未完成";
+        }
+        final StringBuilder sb = new StringBuilder();
+        sb.append("已清理 ").append(result.count(TraceCleaner.Status.OK)).append(" 项");
+        sb.append("，跳过 ").append(result.count(TraceCleaner.Status.SKIPPED)).append(" 项");
+        final int failed = result.count(TraceCleaner.Status.FAILED);
+        if (failed > 0) {
+            sb.append("，失败 ").append(failed).append(" 项：");
+            boolean first = true;
+            for (TraceCleaner.Item item : result.items) {
+                if (item.status != TraceCleaner.Status.FAILED) {
+                    continue;
+                }
+                if (!first) {
+                    sb.append('/');
+                }
+                sb.append(item.name);
+                first = false;
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 毫秒差 →「12s / 5m / 3h / 2d」短标记（面板里已带「前」字，不重复「秒/分钟」）。 */
+    private static String formatAgeTag(long ageMs) {
+        final long seconds = Math.max(0L, ageMs) / 1000L;
+        if (seconds < 60L) {
+            return seconds + "s";
+        }
+        final long minutes = seconds / 60L;
+        if (minutes < 60L) {
+            return minutes + "m";
+        }
+        final long hours = minutes / 60L;
+        return hours < 48L ? hours + "h" : (hours / 24L) + "d";
+    }
+
+    /** 面板/分组小标题（与 dialog_settings.xml 里的小标题同样式，运行时插入用）。 */
+    private TextView groupTitle(String text) {
+        final TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f);
+        view.setTypeface(null, android.graphics.Typeface.BOLD);
+        view.setTextColor(brandColor());
+        final LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(18);
+        view.setLayoutParams(lp);
+        return view;
+    }
+
+    /** 说明文案（11sp、次要色；与 XML 里的说明行一致）。 */
+    private TextView hintText(String text) {
+        final TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f);
+        view.setTextColor(secondaryColor());
+        view.setPadding(0, 0, 0, dp(4));
+        return view;
+    }
+
+    /** 一行「左标题 + 右状态」（只读），返回右侧状态文本视图。 */
+    private TextView addStatusRow(LinearLayout container, String title, String initial) {
+        final LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(3), 0, dp(3));
+        final TextView label = new TextView(this);
+        label.setText(title);
+        label.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+        label.setTextColor(secondaryColor());
+        label.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        final TextView value = new TextView(this);
+        value.setText(initial);
+        value.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+        value.setTextColor(brandColor());
+        value.setGravity(Gravity.END);
+        row.addView(label);
+        row.addView(value);
+        container.addView(row);
+        return value;
+    }
+
+    /** 写状态文本（视图可能还没建出来 / 已分离：判空即可）。 */
+    private static void setValue(TextView view, String text) {
+        if (view != null) {
+            view.setText(text == null ? "" : text);
+        }
+    }
+
+    /** 主题强调色；取不到就退回硬编码值（只是观感差异，不影响功能）。 */
+    private int brandColor() {
+        try {
+            return ContextCompat.getColor(this, R.color.brand);
+        } catch (Throwable t) {
+            return 0xFF2962FF;
+        }
+    }
+
+    /** 次要文本色；取不到就退回硬编码值。 */
+    private int secondaryColor() {
+        try {
+            return ContextCompat.getColor(this, R.color.text_secondary);
+        } catch (Throwable t) {
+            return 0xFF5F6368;
+        }
+    }
+
+    /** dp → px（运行时插入的视图用；项目里 XML 外的视图都按显示密度换算）。 */
+    private int dp(float value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     // ------------------------------------------------------------ GNSS 星表（过期提醒 / 一键更新）
@@ -2112,7 +2557,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                               SwitchMaterial switchRealism, SwitchMaterial switchSpeedVariance,
                               SwitchMaterial switchAttitude, SwitchMaterial switchRandomStart,
                               SwitchMaterial switchAutoStop, SwitchMaterial switchSystemInject,
-                              CheckBox cbGnssSynthetic) {
+                              CheckBox cbGnssSynthetic, SwitchMaterial switchClearLogcat) {
         // 海拔：-500 ~ 9000 m 之外的输入夹紧
         float altitude = RouteStore.loadAltitude(this);
         try {
@@ -2158,6 +2603,10 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
         // GNSS 完全模拟：不依赖本机真实卫星（室内/模拟器）；与注入方式一样，下次「开始」生效
         RouteStore.saveGnssSynthetic(this, cbGnssSynthetic.isChecked());
+        // 停止时清 logcat（默认关；破坏性，只有用户显式打开才会在停止流程里执行）
+        if (switchClearLogcat != null) {
+            RouteStore.saveClearLogcatOnStop(this, switchClearLogcat.isChecked());
+        }
 
         if (switchSystemInject.isChecked()) {
             toast("系统级注入已开启（下次开始生效）\n请确认 LSPosed 已勾选「系统框架」并重启系统");

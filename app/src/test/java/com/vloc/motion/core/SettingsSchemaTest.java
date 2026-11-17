@@ -85,10 +85,27 @@ public class SettingsSchemaTest {
         List<String> required = java.util.Arrays.asList(
                 "system_inject", "providers", "realism", "speed_variance",
                 "attitude_replay", "base_altitude", "accuracy",
-                "auto_stop_on_finish", "random_start");
+                "auto_stop_on_finish", "random_start", "clear_logcat_on_stop");
         for (String key : required) {
             assertNotNull("缺少设置项: " + key, SettingsSchema.find(key));
         }
-        assertEquals(required.size(), SettingsSchema.items().size());
+        assertEquals("设置项总数（新增项必须同步改这里）", 10, SettingsSchema.items().size());
+        assertEquals("required 清单必须与 items() 等长：新增项要加进 required",
+                required.size(), SettingsSchema.items().size());
+    }
+
+    /**
+     * 「停止时清理日志（logcat）」必须在设置清单里登记。
+     *
+     * <p>它是 {@code TraceCleaner.Options.clearLogcat} 的唯一主持久开关（默认关、破坏性：
+     * 清空整个 logcat 缓冲区），此前长期只有 {@code RouteStore} 的读写入口而没有界面入口，
+     * 正是本项目「带了 key 却改不了」那类缺陷，所以单独加一条回归约束。
+     */
+    @Test
+    public void clearLogcatOnStopIsRegisteredAsBehaviorSwitch() {
+        SettingsSchema.Item item = SettingsSchema.find("clear_logcat_on_stop");
+        assertNotNull("停止时清理日志必须出现在设置清单里", item);
+        assertFalse("它是开关，不是数值项", item.numeric);
+        assertEquals(SettingsSchema.Group.BEHAVIOR, item.group);
     }
 }

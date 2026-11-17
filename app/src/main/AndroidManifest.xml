@@ -99,6 +99,12 @@
             android:label="@string/scope_title"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- 使用记录（会话历史）：仅内部页面，不对外暴露 -->
+        <activity
+            android:name=".ui.UsageLogActivity"
+            android:exported="false"
+            android:label="使用记录" />
+
         <!-- 环境快照：仅模拟期间暴露给 LSPosed 模块（无需权限，无数据时返回 0 行） -->
         <provider
             android:name=".service.EnvProvider"

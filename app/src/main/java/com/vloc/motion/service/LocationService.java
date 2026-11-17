@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.location.Location;
@@ -33,6 +34,8 @@ import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RoutePlayer;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.core.TleUpdater;
+import com.vloc.motion.core.TraceCleaner;
+import com.vloc.motion.core.UsageLog;
 import com.vloc.motion.location.GnssCollector;
 import com.vloc.motion.location.LocationSwitch;
 import com.vloc.motion.location.RealLocationProvider;
@@ -85,10 +88,30 @@ public class LocationService extends Service {
     public static final String EXTRA_SPEED_VARIANCE = "speed_variance";
 
     private static final String CHANNEL_ID = "vloc_playback";
+    /**
+     * 前台通知的固定文案（<b>中性化</b>）。
+     *
+     * <p>旧文案会带出坐标（{@code "%.6f, %.6f"}）、路线进度 / 速度
+     * （{@code "运行中 · 12 km/h · 300 m / 5.00 km"}）、以及"临时定位 / 路径播放"
+     * 这类字眼——通知栏在锁屏、下拉栏、车机投屏上都可能被别人看到，
+     * 等于把"正在模拟某个位置"直接摊开。现在只保留应用名 + 一句"服务运行中"，
+     * 具体状态只在应用内展示。
+     */
+    private static final String NOTIFICATION_TITLE = "虚拟运动";
+    /** 通知内容：同样中性，不随会话状态变化（见 {@link #NOTIFICATION_TITLE}）。 */
+    private static final String NOTIFICATION_TEXT = "服务运行中";
     private static final int NOTIFICATION_ID = 1001;
     /** 系统级注入失效告警用独立 id：复用前台通知 id 会把常驻通知顶掉。 */
     private static final int ALERT_NOTIFICATION_ID = 1002;
     private static final long TICK_MS = 100L;
+    /**
+     * 悬浮窗空闲多久后自动隐藏（毫秒）。
+     *
+     * <p>会话停在「待开始 / 已暂停」超过这么久就把窗口从屏幕上摘掉
+     * （见 {@link #updateOverlayIdle}），恢复移动时自动重新显示。60 秒：足够用户看到
+     * "已定位到起点 / 已暂停"的提示，又不至于让窗口在人离开后一直挂着。
+     */
+    private static final long OVERLAY_IDLE_HIDE_MS = 60_000L;
     /**
      * 「GNSS 完全模拟」的卫星表刷新间隔：卫星仰角/方位是慢变量（分钟级才有可感变化），
      * 1 秒足够跟上坐标移动，又避免每帧（100ms）几百次浮点轨道递推。
@@ -203,6 +226,26 @@ public class LocationService extends Service {
      * 也不能跟着每次 notifyChanged / 每帧注入重复出现。在 startRoute/startSpot 重置。
      */
     private boolean partialTakeoverNotified;
+    // ---------------------------------------------------------------- 使用记录（UsageLog）
+    /**
+     * 本会话的开始时刻（墙钟毫秒；0 = 没有待结算的会话）。
+     *
+     * <p>它同时是<b>去重标志</b>：{@link #finishUsageSession} 结算完立刻置 0，
+     * 所以 {@link #stopInternal} 被重复调用（ACTION_STOP + 准备失败 + onDestroy 兜底）
+     * 也只会产生一条记录。
+     */
+    private long usageStartedAtMs;
+    /** 本会话的模式（{@code UsageLog.MODE_ROUTE} / {@code UsageLog.MODE_SPOT}）。 */
+    private String usageMode;
+    /** 本会话的路径点数（临时定位为 0）。 */
+    private int usagePoints;
+    /**
+     * 已经写入、等待 {@code TraceCleaner} 回填清理结果的记录 id（0 = 没有待回填的记录）。
+     *
+     * <p>清理是异步的：停止时先记一条 {@code cleanup=null} 的记录，拿到 id 后由
+     * {@code startTraceCleanup()} 的完成回调按 id 回填，绝不阻塞停止流程。
+     */
+    private long usagePendingId;
     private PowerManager.WakeLock wakeLock;
     private Runnable ticker;
     private float accuracyMeters = 5.0f;
@@ -246,6 +289,17 @@ public class LocationService extends Service {
     private final float[] nativeRotation = new float[4];
     private final float[] nativeMagnetic = new float[3];
     private FloatingWindow floatingWindow;
+    /**
+     * 悬浮窗"空闲自动隐藏"的计时起点（{@link SystemClock#uptimeMillis()}；0 = 没在计时）。
+     *
+     * <p>会话停在「待开始 / 已暂停」时不必一直把窗口挂在屏幕上：它会把"正在跑某个路线"
+     * 直接暴露给同一块屏幕前的人。超过 {@link #OVERLAY_IDLE_HIDE_MS} 就隐藏，
+     * 恢复运行（{@link #resumeMovement()}）时再显示。计时复用现有 ticker，
+     * <b>不新增线程</b>；相关字段只在主线程读写。
+     */
+    private long overlayIdleSinceMs;
+    /** 悬浮窗是否因为空闲被自动隐藏（恢复运行时据此重新显示）。 */
+    private boolean overlayIdleHidden;
 
     /**
      * 准备结果：把 injector 从后台准备线程**通过返回值**传回主线程。
@@ -379,7 +433,7 @@ public class LocationService extends Service {
                 togglePause();
                 break;
             case ACTION_STOP:
-                stopInternal(null);
+                stopInternal(null, StopReason.USER);
                 break;
             case ACTION_SET_SPEED:
                 player.setSpeedKmh(intent.getDoubleExtra(EXTRA_KMH, 18.0));
@@ -409,6 +463,12 @@ public class LocationService extends Service {
 
     @Override
     public void onDestroy() {
+        // 兜底：Service 被外部销毁（系统回收 / 被别的组件 stopService）而没走 stopInternal 时，
+        // 不能把这场会话连同使用记录一起丢掉——按「手动停止」补记一条（正常停止时
+        // usageStartedAtMs 已在 stopInternal 里置 0，这里不会重复记）。
+        if (usageStartedAtMs > 0L) {
+            finishUsageSession(StopReason.USER, null);
+        }
         if (activeInstance == this) {
             activeInstance = null;
         }
@@ -439,6 +499,9 @@ public class LocationService extends Service {
             toast("路径至少需要 2 个点");
             return;
         }
+        // 使用记录：会话从这里开始计时（点数取本次路线点数）。上一场还没结算的会话
+        // （"到达终点后直接重新开始"不经过 stopInternal）会在里面先补记一条。
+        startUsageSession(UsageLog.MODE_ROUTE, route.size());
         accuracyMeters = intent.getFloatExtra(EXTRA_ACCURACY, 5.0f);
         List<String> providers = readProviders(intent);
         configureRealism(true);
@@ -512,7 +575,7 @@ public class LocationService extends Service {
         session.traveledMeters = 0;
         session.notifyChanged();
 
-        startForegroundSafe(buildNotification("准备注入…"));
+        startForegroundSafe(buildNotification());
         acquireWakeLock();
         // 维持真实采集优先：先定格本会话的卫星来源判定，再采一次真实卫星（采不到时由 1Hz 节拍回退合成）
         beginGnssSyntheticSession();
@@ -540,7 +603,7 @@ public class LocationService extends Service {
                     // 失败原因只认本次 preparation 带回的那一份：绝不复用 session.error，
                     // 那个字段可能还留着上一次会话/上一次失败的文案，会把用户引向错的原因。
                     stopInternal(result.error != null ? result.error
-                            : "定位准备被中止，已停止");
+                            : "定位准备被中止，已停止", StopReason.FAILED);
                     return;
                 }
                 injector = result.injector;
@@ -573,6 +636,8 @@ public class LocationService extends Service {
         if (session.isActive()) {
             resetForRestart();
         }
+        // 使用记录：临时定位没有路径点，点数记 0
+        startUsageSession(UsageLog.MODE_SPOT, 0);
         spotLat = intent.getDoubleExtra(EXTRA_LAT, 0.0);
         spotLon = intent.getDoubleExtra(EXTRA_LON, 0.0);
         accuracyMeters = intent.getFloatExtra(EXTRA_ACCURACY, 5.0f);
@@ -596,7 +661,7 @@ public class LocationService extends Service {
         session.totalMeters = 0;
         session.notifyChanged();
 
-        startForegroundSafe(buildNotification("准备注入…"));
+        startForegroundSafe(buildNotification());
         acquireWakeLock();
         // 维持真实采集优先：先定格本会话的卫星来源判定，再采一次真实卫星（采不到时由 1Hz 节拍回退合成）
         beginGnssSyntheticSession();
@@ -620,7 +685,7 @@ public class LocationService extends Service {
                     // 失败原因只认本次 preparation 带回的那一份：绝不复用 session.error，
                     // 那个字段可能还留着上一次会话/上一次失败的文案，会把用户引向错的原因。
                     stopInternal(result.error != null ? result.error
-                            : "定位准备被中止，已停止");
+                            : "定位准备被中止，已停止", StopReason.FAILED);
                     return;
                 }
                 injector = result.injector;
@@ -1222,7 +1287,10 @@ public class LocationService extends Service {
                 if (Session.INSTANCE.mode == Session.Mode.SPOT) {
                     pushSpotLocation();
                     // 「GNSS 完全模拟」：定点坐标不变，卫星仍会随时间升落，照样按 1Hz 刷新
-                    publishSyntheticGnss(SystemClock.uptimeMillis());
+                    long spotNow = SystemClock.uptimeMillis();
+                    publishSyntheticGnss(spotNow);
+                    // 定点模式没有"移动/暂停"，这里只是让空闲计时跟随状态复位
+                    updateOverlayIdle(spotNow);
                     handler.postDelayed(this, 1000L);
                     return;
                 }
@@ -1261,6 +1329,8 @@ public class LocationService extends Service {
                 updateSteps(now);
                 updateNotification();
                 updateOverlay();
+                // 空闲（待开始 / 已暂停）超过阈值就把悬浮窗摘掉，避免长期挂在屏幕上被看到
+                updateOverlayIdle(now);
                 handler.postDelayed(this, TICK_MS + intervalRandom.nextInt(40));
             }
         };
@@ -1273,7 +1343,7 @@ public class LocationService extends Service {
             if (!arrived) {
                 return;   // 期间用户已经手动停止/重新开始
             }
-            stopInternal("已到达目标 · 已自动停止，定位已恢复");
+            stopInternal("已到达目标 · 已自动停止，定位已恢复", StopReason.COMPLETED);
         }
     };
 
@@ -1366,7 +1436,7 @@ public class LocationService extends Service {
     /** 注入失败（provider 被系统移除、appop 被撤销等）：停止并提示，不要让界面假装在跑。 */
     private void failInjection(RuntimeException e) {
         Log.w(TAG, "inject failed", e);
-        stopInternal("定位注入失败，已停止：" + e.getMessage());
+        stopInternal("定位注入失败，已停止：" + e.getMessage(), StopReason.FAILED);
     }
 
     private void updateSessionFromFix(Route.Sample sample, Fix fix) {
@@ -1564,9 +1634,31 @@ public class LocationService extends Service {
         session.notifyChanged();
         updateNotification();
         updateOverlay();
+        // 之前因"空闲太久"被自动隐藏的悬浮窗，恢复移动时重新显示（用户手动关掉的不显示）
+        restoreOverlayAfterIdle();
     }
 
-    private void stopInternal(String message) {
+    /** 会话结束原因（决定使用记录里的 {@code result}）。 */
+    private enum StopReason {
+        /** 用户主动停止（主界面「彻底停止」）。 */
+        USER,
+        /** 正常跑完（到达终点 / 目标，自动停止）。 */
+        COMPLETED,
+        /** 失败（准备失败 / 注入失败 / 注入通道断开）。 */
+        FAILED
+    }
+
+    /**
+     * 停止会话。
+     *
+     * <p><b>使用记录</b>：开头先按 {@code reason} 结算一条 {@link UsageLog} 记录
+     * （此时 {@code session.traveledMeters} / {@code session.error} 还是本会话的值），
+     * 然后才重置运行态；{@code usageStartedAtMs} 结算后立刻归零，所以重复调用本方法
+     * 不会产生第二条记录。
+     */
+    private void stopInternal(String message, StopReason reason) {
+        // ---- 使用记录：必须在下面重置 session 之前结算 ----
+        finishUsageSession(reason, message);
         // 先让仍在后台准备的会话过期：它之后的 post 会被 isStalePrepare 丢弃并自行释放
         ++sessionSeq;
         stopTicker();
@@ -1610,8 +1702,146 @@ public class LocationService extends Service {
         session.goalMode = false;
         session.completedLaps = 0;
         session.notifyChanged();
+        // 本会话结束：空闲自动隐藏状态复位（下一次会话重新计时）
+        overlayIdleSinceMs = 0L;
+        overlayIdleHidden = false;
+        // ---- 落盘痕迹清理：文件 IO + root 全部在后台线程，这里只发出请求 ----
+        // 必须在上面 SnapshotPrefs.INSTANCE.stop() 之后调用：清理线程要删 vloc_snapshot.xml，
+        // 而 stop() 已经写回 active=false，模块此刻已回退；先 stop 再删文件不会影响正在跑的会话
+        // （Options.protectActiveSession 还会拦住"停止后立刻重新开始"的新会话）。
+        startTraceCleanup();
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    // ---------------------------------------------------------------- 使用记录
+
+    /**
+     * 会话开始：记下使用记录需要的上下文（开始时间 / 模式 / 路径点数）。
+     *
+     * <p>如果上一场会话还没结算（"到达终点后点重新开始"直接走 startRoute，不经过
+     * {@link #stopInternal}），先按「手动停止」把它补记一条——那场会话确实发生过，
+     * 不该因为走了另一条代码路径就从记录里消失。
+     */
+    private void startUsageSession(String mode, int points) {
+        if (usageStartedAtMs > 0L) {
+            finishUsageSession(StopReason.USER, null);
+        }
+        usageStartedAtMs = System.currentTimeMillis();
+        usageMode = mode;
+        usagePoints = points;
+        usagePendingId = 0L;
+    }
+
+    /**
+     * 会话结束：写一条使用记录（只写一次，靠 {@link #usageStartedAtMs} 去重）。
+     *
+     * <p>结果判定：
+     * <ul>
+     *   <li>{@link StopReason#COMPLETED} → {@code completed}（到达终点自动停止，
+     *       即使中途出现过"模块不在线"之类的 error 也以完成为准）；</li>
+     *   <li>{@link StopReason#FAILED} → {@code failed}，error 取停止文案 / {@code session.error}；</li>
+     *   <li>{@link StopReason#USER}：如果已经到达终点（默认不自动停止，用户看完再点停止）
+     *       仍记 {@code completed}；否则 {@code session.error} 非空说明本会话中途已经失败过
+     *       （注入失败、模块不在线），记 {@code failed} 并带上那条 error；其余记 {@code stopped}。</li>
+     * </ul>
+     *
+     * <p>写盘失败只记日志：记录是附属功能，绝不能影响停止流程。
+     */
+    private void finishUsageSession(StopReason reason, String message) {
+        final long startedAt = usageStartedAtMs;
+        if (startedAt <= 0L) {
+            // 没有待结算的会话，或已经结算过（重复 stopInternal 走这里直接返回）
+            return;
+        }
+        // 先清标志：即使下面写盘抛异常，也不会重复记第二条
+        usageStartedAtMs = 0L;
+        final String mode = usageMode != null ? usageMode : UsageLog.MODE_SPOT;
+        final int points = usagePoints;
+        usageMode = null;
+        usagePoints = 0;
+        try {
+            Session session = Session.INSTANCE;
+            final long endedAt = System.currentTimeMillis();
+            final long durationSec = Math.max(0L, (endedAt - startedAt) / 1000L);
+            final String sessionError = session.error;
+            String result;
+            String error = null;
+            if (reason == StopReason.COMPLETED) {
+                result = UsageLog.RESULT_COMPLETED;
+            } else if (reason == StopReason.FAILED) {
+                result = UsageLog.RESULT_FAILED;
+                error = firstNonBlank(message, sessionError, "未知错误");
+            } else if (session.arrived) {
+                // 已经到了终点、只是用户随后手动停止（auto_stop_on_finish 默认关闭时就是这样）
+                result = UsageLog.RESULT_COMPLETED;
+            } else if (!isBlank(sessionError)) {
+                result = UsageLog.RESULT_FAILED;
+                error = sessionError;
+            } else {
+                result = UsageLog.RESULT_STOPPED;
+            }
+            UsageLog.Entry entry = new UsageLog.Entry(startedAt, endedAt, mode, points,
+                    session.traveledMeters, durationSec, result);
+            entry.error = error;
+            usagePendingId = UsageLog.record(getApplicationContext(), entry);
+            Log.i(TAG, "usage: mode=" + mode + " result=" + result
+                    + " distance=" + Math.round(session.traveledMeters) + "m"
+                    + " duration=" + durationSec + "s id=" + usagePendingId);
+        } catch (RuntimeException e) {
+            // 记录失败不影响停止流程
+            usagePendingId = 0L;
+            Log.w(TAG, "usage record failed: " + e);
+        }
+    }
+
+    private static boolean isBlank(String text) {
+        return text == null || text.trim().isEmpty();
+    }
+
+    /** 取第一个非空白字符串（都可能为空时返回 null）。 */
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (!isBlank(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 会话结束后清理「注入痕迹」（{@link TraceCleaner}）。
+     *
+     * <p><b>线程模型</b>：本方法只组装选项并起一条 daemon 线程
+     * （{@code "vloc-trace-cleanup"}），立刻返回——主线程的停止流程不会被文件删除、
+     * {@code su}（默认 4s 超时）、prefs 写入拖住。悬浮窗移除这一项由 TraceCleaner
+     * post 回主线程执行（{@code WindowManager} 有线程亲和性），最多等 1s。
+     *
+     * <p>清理结果由 {@link TraceCleaner} 自己按 {@code Log.i("VLocCleanup", "cleanup: ...")}
+     * 逐项打印，同时也通过 {@link TraceCleaner#lastResult()} 留给设置页；本方法还会把
+     * {@link TraceCleaner.Result#summary()} 回填到刚写下的那条使用记录（按 id 定位）。
+     */
+    private void startTraceCleanup() {
+        // 清理是异步的：先把待回填的 id 取出来并清掉，避免回调串到下一条记录上
+        final long recordId = usagePendingId;
+        usagePendingId = 0L;
+        final Context appContext = getApplicationContext();
+        TraceCleaner.Options options = new TraceCleaner.Options();
+        // 前台通知 + 系统级注入告警：stopForeground(REMOVE) 只撤前台那条，告警要单独 cancel
+        options.notificationId = NOTIFICATION_ID;
+        options.alertNotificationId = ALERT_NOTIFICATION_ID;
+        // 复用本服务的实例：hideOverlay() 内部就是 floatingWindow.hide()，自带 shown 判空、幂等；
+        // 绝不能在 TraceCleaner 里 new 一个 FloatingWindow，那样删不掉真正挂在 WindowManager 上的 View
+        options.hideOverlay = this::hideOverlay;
+        // 清 logcat 会清掉整个缓冲区（含其它应用日志），默认关闭，只认用户显式打开的设置
+        options.clearLogcat = RouteStore.loadClearLogcatOnStop(this);
+        TraceCleaner.cleanup(appContext, options, result -> {
+            Log.i(TAG, "trace cleanup: " + result.summary());
+            // 回填使用记录：找不到（记录被删 / 已被挤掉）时静默忽略，不阻塞也不报错
+            if (recordId > 0L) {
+                UsageLog.updateCleanup(appContext, recordId, result.summary());
+            }
+        });
     }
 
     private void releaseInjector() {
@@ -1823,14 +2053,20 @@ public class LocationService extends Service {
         if (nm == null) {
             return;
         }
-        NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "定位播放",
+        NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "运行状态",
                 NotificationManager.IMPORTANCE_LOW);
         channel.setShowBadge(false);
-        channel.setDescription("虚拟定位运行状态");
+        channel.setDescription("虚拟运动运行状态");
         nm.createNotificationChannel(channel);
     }
 
-    private Notification buildNotification(String text) {
+    /**
+     * 构建前台通知：<b>中性文案</b>，保留点击打开 App。
+     *
+     * <p>不再接收动态文案参数——调用方原来会传入坐标 / 速度 / 路线进度，
+     * 那些信息一律不进入通知（见 {@link #NOTIFICATION_TITLE}）。
+     */
+    private Notification buildNotification() {
         Intent openIntent = new Intent(this, MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
         PendingIntent openPending = PendingIntent.getActivity(this, 0, openIntent,
@@ -1846,50 +2082,35 @@ public class LocationService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Session session = Session.INSTANCE;
-        String title = session.mode == Session.Mode.SPOT ? "虚拟运动 · 临时定位" : "虚拟运动 · 路径播放";
+        // 动作文案也不带会话细节：暂停/继续靠状态决定，停止只写"停止"
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setContentTitle(title)
-                .setContentText(text)
+                .setContentTitle(NOTIFICATION_TITLE)
+                .setContentText(NOTIFICATION_TEXT)
                 .setContentIntent(openPending)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .addAction(0, (session.paused || session.held) ? "继续" : "暂停", pausePending)
-                .addAction(0, "彻底停止", stopPending)
+                .addAction(0, "停止", stopPending)
                 .build();
     }
 
+    /**
+     * 刷新前台通知。
+     *
+     * <p>仍保留 1s 节流（{@code notify()} 走 Binder，跟 10Hz 的 ticker 跑没必要），
+     * 但内容固定为中性文案：会话状态变化不再改变通知文本。
+     */
     private void updateNotification() {
         long now = SystemClock.uptimeMillis();
         if (now - lastNotificationMs < 1000L) {
             return;
         }
         lastNotificationMs = now;
-        Session session = Session.INSTANCE;
-        String text;
-        if (session.mode == Session.Mode.SPOT) {
-            text = String.format(java.util.Locale.US, "%.6f, %.6f", session.lat, session.lon);
-        } else {
-            final String phase;
-            if (session.arrived) {
-                phase = com.vloc.motion.core.ArrivalBehavior.notificationLabel(
-                        RouteStore.loadAutoStopOnFinish(this));
-            } else if (session.paused) {
-                phase = "已暂停";
-            } else {
-                phase = "运行中";
-            }
-            text = String.format(java.util.Locale.US, "%s%s · %.0f km/h · %s / %s",
-                    session.goalMode ? "配速 " : "",
-                    phase,
-                    session.speedKmh,
-                    formatDistance(session.traveledMeters),
-                    formatDistance(session.totalMeters));
-        }
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) {
-            nm.notify(NOTIFICATION_ID, buildNotification(text));
+            nm.notify(NOTIFICATION_ID, buildNotification());
         }
     }
 
@@ -1912,7 +2133,7 @@ public class LocationService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification alert = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setContentTitle("虚拟运动 · 系统级注入未生效")
+                .setContentTitle("虚拟运动 · 需要处理")
                 .setContentText(SYSTEM_MODULE_MISSING_MSG)
                 .setStyle(new NotificationCompat.BigTextStyle().bigText(SYSTEM_MODULE_MISSING_MSG))
                 .setContentIntent(openPending)
@@ -1986,6 +2207,10 @@ public class LocationService extends Service {
         }
         floatingWindow.restoreCollapsed();
         floatingWindow.show();
+        // 每次显式显示都重新开始空闲计时：否则「暂停中手动重开悬浮窗」会因为
+        // overlayIdleHidden 仍为 true 而永远不再自动隐藏
+        overlayIdleSinceMs = 0L;
+        overlayIdleHidden = false;
         updateOverlay();
     }
 
@@ -1993,6 +2218,64 @@ public class LocationService extends Service {
         if (floatingWindow != null) {
             floatingWindow.hide();
         }
+    }
+
+    /**
+     * 悬浮窗空闲自动隐藏：会话处于「待开始 / 已暂停」超过 {@link #OVERLAY_IDLE_HIDE_MS}
+     * 时把窗口摘掉。
+     *
+     * <p>为什么需要：暂停 / 待开始时定位仍然保持，但窗口会一直显示"已暂停 / 海拔 / 步数"，
+     * 长时间挂在屏幕上等于把"有人在模拟运动"摊给别人看。恢复运行
+     * （{@link #resumeMovement()}）会把它重新显示出来。
+     *
+     * <p><b>线程模型</b>：只在 ticker（主线程 Handler）里调用，复用现有 100ms 节拍
+     * （SPOT 模式 1s），不新增线程、不加定时器。状态只看
+     * {@code Session.paused / held}——「待开始」在会话语义里就是 {@code held=true}
+     * （见 {@link #updateOverlay()} 的"已定位到起点 · 待开始"分支）；到达终点后
+     * {@code paused=true}，同样按空闲处理。
+     */
+    private void updateOverlayIdle(long now) {
+        Session session = Session.INSTANCE;
+        final boolean idle = session.mode != Session.Mode.IDLE
+                && (session.paused || session.held);
+        if (!idle) {
+            // 运行中：清掉计时，下次暂停重新从 0 开始
+            overlayIdleSinceMs = 0L;
+            overlayIdleHidden = false;
+            return;
+        }
+        if (floatingWindow == null || !floatingWindow.isShown()) {
+            // 窗口本来就不在（没授权 / 用户关掉了）：不用计时
+            overlayIdleSinceMs = 0L;
+            return;
+        }
+        if (overlayIdleSinceMs == 0L) {
+            overlayIdleSinceMs = now;   // 刚开始空闲：记下起点
+            return;
+        }
+        if (!overlayIdleHidden && now - overlayIdleSinceMs >= OVERLAY_IDLE_HIDE_MS) {
+            overlayIdleHidden = true;
+            hideOverlay();
+            Log.i(TAG, "overlay auto-hidden after idle " + (now - overlayIdleSinceMs) + "ms");
+        }
+    }
+
+    /**
+     * 恢复运行时，把「因空闲被自动隐藏」的悬浮窗重新显示。
+     *
+     * <p>只还原"我们自动藏起来的"那一次：用户自己在菜单里关掉悬浮窗
+     * （{@code overlay_enabled=false}）时不会因为这条路径又弹出来。
+     */
+    private void restoreOverlayAfterIdle() {
+        if (!overlayIdleHidden) {
+            return;
+        }
+        overlayIdleHidden = false;
+        overlayIdleSinceMs = 0L;
+        if (!RouteStore.loadOverlayEnabled(this) || !Settings.canDrawOverlays(this)) {
+            return;
+        }
+        showOverlay();
     }
 
     private void updateOverlay() {

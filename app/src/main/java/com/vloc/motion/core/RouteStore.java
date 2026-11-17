@@ -48,6 +48,8 @@ public final class RouteStore {
     private static final String KEY_TARGET_PACKAGES = "target_packages";
     private static final String KEY_OVERLAY_COLLAPSED = "overlay_collapsed";
     private static final String KEY_GNSS_SNAPSHOT = "gnss_snapshot";
+    /** 会话结束后清 logcat（默认关；见 {@link #loadClearLogcatOnStop}）。 */
+    private static final String KEY_CLEAR_LOGCAT_ON_STOP = "clear_logcat_on_stop";
     /** 「GNSS 完全模拟」：不依赖本机真实卫星，用内置星表 + 模拟坐标/时间生成卫星表（默认 false = 自动）。 */
     private static final String KEY_GNSS_SYNTHETIC = "gnss_synthetic";
     /** 上次弹出「GNSS 星表过期」提醒的时间戳（0/缺省＝从未提醒）：同一份星表 7 天内只提醒一次。 */
@@ -325,6 +327,20 @@ public final class RouteStore {
     }
 
     /**
+     * 清掉上次保存的卫星表（会话结束时的痕迹清理，见 {@code TraceCleaner}）。
+     *
+     * <p>为什么不留着复用：这份快照是"上一场会话在那个位置看到的卫星"，
+     * 属于可以直接复现出"当时在哪"的痕迹；而下一场会话本来就会重新采集
+     * （{@code LocationService.collectGnssSnapshot()}），删掉没有功能损失。
+     *
+     * <p>只删这一个 key，不动同一份 prefs 里的路线 / 速度 / 作用域等用户设置；
+     * {@code apply()} 异步落盘，可在主线程调用。
+     */
+    public static void clearGnssSnapshot(Context context) {
+        prefs(context).edit().remove(KEY_GNSS_SNAPSHOT).apply();
+    }
+
+    /**
      * 「GNSS 完全模拟」：<b>不</b>依赖本机真实 GNSS 采集，直接用内置 TLE 星表 +
      * 模拟坐标/时间算出此刻可见卫星并注入。
      *
@@ -393,6 +409,22 @@ public final class RouteStore {
 
     public static void saveAutoStopOnFinish(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_AUTO_STOP_ON_FINISH, enabled).apply();
+    }
+
+    /**
+     * 会话结束后是否顺带清 logcat 缓冲区（**默认关闭**）。
+     *
+     * <p>这是 {@code TraceCleaner.Options.clearLogcat} 的开关：{@code logcat -c} 需要 root，
+     * 且会清掉**整个**缓冲区（含其它应用的日志），属于破坏性操作，必须由用户显式开启。
+     * 未出现在 {@code SettingsSchema} 里（设置面板由另一轮补齐），这里只提供读写入口，
+     * 默认 false 让行为与之前完全一致。
+     */
+    public static boolean loadClearLogcatOnStop(Context context) {
+        return prefs(context).getBoolean(KEY_CLEAR_LOGCAT_ON_STOP, false);
+    }
+
+    public static void saveClearLogcatOnStop(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_CLEAR_LOGCAT_ON_STOP, enabled).apply();
     }
 
     /** 虚拟摄像头总开关（默认关闭）。 */
