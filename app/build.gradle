@@ -16,8 +16,8 @@ android {
         applicationId "com.vloc.motion"
         minSdk 26
         targetSdk 34
-        versionCode 83
-        versionName "0.45.0"
+        versionCode 84
+        versionName "0.46.0"
         resourceConfigurations += ['zh', 'en']
     }
 
@@ -62,6 +62,14 @@ android {
 }
 
 dependencies {
+    // 双 API 兼容骨架用：libxposed API 102 仅编译期需要（运行期由 LSPosed 提供）。
+    compileOnly files('libs/libxposed-api-102.jar')
+    // libxposed「应用侧」服务 API（XposedServiceHelper / XposedService / RemotePreferences）：
+    // 与上面的 api jar 不同，这是运行时也要的类（App 进程内自己跑），所以用 implementation
+    // 打进 APK。来源：/home/hb/隐私跳转防护模块/android/third_party/libxposed-service 的
+    // bundleLibRuntimeToJarRelease/classes.jar（102.0.0，已完成编译产物，sha256
+    // 973cbbac6c6bb34c17058531d241e4d2a64dcf23faf007e20139f070fcea350d）。
+    implementation files('libs/libxposed-service.jar')
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.core:core:1.12.0'
     implementation 'com.google.android.material:material:1.11.0'

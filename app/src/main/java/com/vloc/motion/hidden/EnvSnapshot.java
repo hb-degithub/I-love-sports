@@ -19,8 +19,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 主 App 提供的“基站 / Wi-Fi 环境快照”（v0.4.0 起）。
@@ -38,8 +37,6 @@ import de.robv.android.xposed.XposedHelpers;
  * {@link #QUERY_TIMEOUT_MS} 内；任何异常 / 超时 / 无行 / 解析失败都返回 null，调用方据此透传。
  */
 final class EnvSnapshot {
-
-    private static final String TAG = "[VLocHidden] ";
 
     static final String MODE_HIDE = "hide";
     static final String MODE_REPLAY = "replay";
@@ -309,7 +306,7 @@ final class EnvSnapshot {
     private static Context currentApplication() {
         try {
             final Class<?> activityThread = Class.forName("android.app.ActivityThread");
-            final Object app = XposedHelpers.callStaticMethod(activityThread, "currentApplication");
+            final Object app = Xp.callStaticMethod(activityThread, "currentApplication");
             if (app instanceof Context) {
                 return (Context) app;
             }
@@ -317,10 +314,10 @@ final class EnvSnapshot {
             // 部分进程（isolated / 早期启动）拿不到，退回 AndroidAppHelper
         }
         try {
-            final Class<?> helper = XposedHelpers.findClassIfExists(
+            final Class<?> helper = Xp.findClassIfExists(
                     "android.app.AndroidAppHelper", EnvSnapshot.class.getClassLoader());
             if (helper != null) {
-                final Object app = XposedHelpers.callStaticMethod(helper, "currentApplication");
+                final Object app = Xp.callStaticMethod(helper, "currentApplication");
                 if (app instanceof Context) {
                     return (Context) app;
                 }
@@ -347,7 +344,7 @@ final class EnvSnapshot {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

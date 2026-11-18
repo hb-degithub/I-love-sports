@@ -17,15 +17,14 @@ import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * LSPosed 入口：在目标 App 进程内清除 {@link Location} 上的“模拟位置”标记。
@@ -36,8 +35,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *       空操作，getExtras() 清掉 mock 类 key；</li>
  *   <li><b>Settings 旁证</b>：Secure/System/Global 读取 "mock_location" 时，getInt/getLong 返回 0、
  *       getString 返回 null（Android 6+ 真机该设置不存在），并兜底 hook @hide 的 NameValueCache；</li>
- *   <li><b>AppOps 自查</b>：8 个 checkOp/unsafeCheckOp 系列方法对 mock op 表现为“无权限”
- *       （MODE_ERRORED，throwing 变体抛 SecurityException）；</li>
+ *   <li><b>AppOps 自查</b>：8 个槽位的 checkOp / unsafeCheckOp 家族
+ *       （含 {@code *RawNoThrow} 与 {@code isOpActive} 活动态自查）对 mock op 表现为“无权限”
+ *       （MODE_ERRORED / false，throwing 变体抛 SecurityException）；</li>
  *   <li><b>AppOps 枚举与 noteOp 旁路</b>：getPackagesForOps/getOpsForPackage 把 mock op 从入参剔除，
  *       noteOp/startOp 抛 SecurityException、*NoThrow 返回 MODE_ERRORED、finishOp 空操作；</li>
  *   <li><b>ContentProvider 直查</b>：ContentResolver#query/call 对 settings provider 的
@@ -80,9 +80,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * <p>不参与、也无法解决的检测手段见 InfoActivity 说明页与交付报告。
  */
-public final class HookEntry implements IXposedHookLoadPackage {
-
-    private static final String TAG = "[VLocHidden] ";
+public final class HookEntry {
 
     /** 框架类名，走目标进程的 ClassLoader 取（framework 类由 boot classloader 加载）。 */
     private static final String LOCATION_CLASS_NAME = "android.location.Location";
@@ -137,11 +135,39 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static final String APP_OPS_CLASS_NAME = "android.app.AppOpsManager";
 
-    /** 8 个自查方法（checkOpRaw / checkOpRawNoThrow 在部分版本是 @hide，缺失时自动跳过）。 */
+    /** ContentResolver 直查 settings 的类名（API 1 起就有；走候选日志只是为了统一格式）。 */
+    private static final String CONTENT_RESOLVER_CLASS_NAME = "android.content.ContentResolver";
+
+    /**
+     * 自查方法名（每个名字下的<b>全部重载</b>都会挂上，含 {@code checkOp(String,int,String,String)}
+     * 这类带 message 的变体、以及 {@code (int op,int uid,String pkg)} 的 int 重载）。
+     *
+     * <p><b>为什么删掉了 {@code checkOpRaw}</b>：Android 17 真机 framework.jar 反汇编
+     * （{@code .toolchain/tmp/verify/a17}，dexdump 全量方法表）里 {@code AppOpsManager} 的 check 家族
+     * 只有下面这 7 个名字 —— <b>没有</b> {@code checkOpRaw}（只有 {@code checkOpRawNoThrow}）。
+     * 旧列表里那个名字在任何版本都匹配不到，正是 {@code appops_check=7/8} 的唯一缺口；
+     * 第 8 个槽位改成下面 {@link #APP_OPS_ACTIVE_METHODS} 的“活动态自查”。
+     */
     private static final String[] APP_OPS_CHECK_METHODS = {
-            "checkOp", "checkOpNoThrow", "checkOpRaw", "checkOpRawNoThrow",
+            "checkOp", "checkOpNoThrow", "checkOpRawNoThrow",
             "unsafeCheckOp", "unsafeCheckOpNoThrow", "unsafeCheckOpRaw", "unsafeCheckOpRawNoThrow",
     };
+
+    /**
+     * 第 8 槽：mock op 是否“正在使用”的自查。
+     *
+     * <p>检测库除了 checkOp 家族，还会直接问“这个 op 现在有没有在跑”：
+     * {@code isOpActive(String op,int uid,String pkg)}（API 30+ 公开）与 @hide 的
+     * {@code isOperationActive(int op,int uid,String pkg)}（A17 framework 里确有）。两者命中
+     * mock op 时一律表现为 {@code false}，与 {@code MODE_ERRORED} 的语义一致。
+     *
+     * <p>两个名字彼此独立、任一命中即算该槽位装上（低版本 Android 8~10 上两者都不存在，
+     * 这时日志自然是 {@code 7/8}，属版本差异，不算失败）。
+     */
+    private static final String[] APP_OPS_ACTIVE_METHODS = {"isOpActive", "isOperationActive"};
+
+    /** 自查槽位总数：7 个 check 方法名 + 1 个活动态槽位。 */
+    private static final int APP_OPS_CHECK_SLOTS = 8;
 
     /**
      * 命中 mock_location 之后对外表现出的模式。真机上“没有模拟位置权限”时框架默认就是
@@ -158,14 +184,193 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static boolean sLoggedAppOpsNoteHit;
     private static boolean sLoggedParcelHit;
 
-    @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+    // ------------------------------------------------------------------
+    // 多进程 / 共享 uid 去重
+    // ------------------------------------------------------------------
+
+    /**
+     * 已经装过 hook 的<b>进程</b>（键见 {@link #processKey}）。
+     *
+     * <p>为什么必须去重：LSPosed 对<b>每个</b>包都会回调一次 {@code handleLoadPackage}，而共享 uid
+     * （{@code android:sharedUserId}）或同一进程里先后加载多个包时，同一个进程会收到多次回调；
+     * 落点相同的 {@code Xp.hook} 会被挂两层 —— 定位改写执行两次（精度抖动 ×2、
+     * 快照读取 ×2），心跳也会重复上报。
+     *
+     * <p>hook 是<b>进程级</b>的（框架类来自 boot classloader，与具体 APK 的 ClassLoader 无关），
+     * 所以去重键用 {@code processName}：同一进程只装一次，第 2 次起只记一条日志。
+     * 有界（{@value #MAX_TRACKED_PROCESSES} 条）：进程内见过的进程名远少于这个数，
+     * 万一超了就不再记录（宁可少去重，也不让集合无界增长）。
+     */
+    private static final Set<String> sInstalledProcesses =
+            Collections.synchronizedSet(new LinkedHashSet<String>());
+
+    /** 去重集合上限：只是防无界增长，正常进程（含共享 uid 的几个子进程）远达不到。 */
+    private static final int MAX_TRACKED_PROCESSES = 64;
+
+    /** 去重集合已满（只记一条日志，之后不再记）。 */
+    private static boolean sLoggedProcessTableFull;
+
+    /**
+     * 本进程是否已经装过 hook（第一次调用登记并返回 false，之后返回 true）。
+     *
+     * <p>纯粹的内存判断，不涉及 Context / prefs：即使极早期调用也安全；任何异常都按“没装过”
+     * 处理（宁可重复装一次，也不能让目标 App 漏注入）。
+     */
+    private static boolean alreadyInstalled(String processKey) {
         try {
-            if (lpparam == null || lpparam.packageName == null) {
+            if (processKey == null || processKey.isEmpty()) {
+                return false;
+            }
+            final Set<String> set = sInstalledProcesses;
+            synchronized (set) {
+                if (set.contains(processKey)) {
+                    return true;
+                }
+                if (set.size() >= MAX_TRACKED_PROCESSES) {
+                    if (!sLoggedProcessTableFull) {
+                        sLoggedProcessTableFull = true;
+                        log("process dedupe table full (" + MAX_TRACKED_PROCESSES
+                                + "), further installs are not deduplicated");
+                    }
+                    return false;
+                }
+                set.add(processKey);
+                return false;
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 去重键：优先 {@code processName}（多进程 / 共享 uid 下唯一标识一个进程），
+     * 拿不到才退回 {@code packageName}。{@code isFirstPackage} 不参与键计算——它只表示
+     * “这是本进程第一个加载的包”，同一进程第二个包也有自己的 ClassLoader，但 hook 是进程级的。
+     */
+    private static String processKey(String processName, String packageName) {
+        if (processName != null && !processName.isEmpty()) {
+            return processName;
+        }
+        return packageName;
+    }
+
+    /**
+     * 诊断串：{@code isFirstApplication=…, isFirstPackage=…}。
+     *
+     * <p>只用于日志，<b>不参与</b>任何判定：
+     * <ul>
+     *   <li>{@code isFirstApplication} 是 xposed-api 82 就有的字段，直接读；</li>
+     *   <li>{@code isFirstPackage} 是<b>新版框架</b>（LSPosed 的扩展）才追加的字段，
+     *       本模块编译用的 {@code xposed-api-82.jar} 里<b>没有</b>，只能反射读 ——
+     *       读不到就记 {@code n/a}，不影响去重（去重用 {@link #processKey}）。</li>
+     * </ul>
+     *
+     * <p>参数是 {@link Object}：旧参数对象的类型属于旧 Xposed API，本类迁移后不再引用它，
+     * 只按 public 字段名反射读取（字段名与旧 API 逐字一致）。
+     *
+     * @return 读不到时各项为 {@code ?} / {@code n/a}，绝不影响安装流程
+     */
+    private static String firstFlagsOf(Object lpparam) {
+        String firstApplication = "?";
+        try {
+            final Field field = lpparam == null ? null
+                    : lpparam.getClass().getField("isFirstApplication");
+            if (field != null) {
+                firstApplication = String.valueOf(field.get(lpparam));
+            }
+        } catch (Throwable ignored) {
+            // 字段不可读：保持 "?"
+        }
+        String firstPackage;
+        try {
+            final Field field = lpparam == null ? null : lpparam.getClass().getField("isFirstPackage");
+            firstPackage = field == null ? "n/a" : String.valueOf(field.get(lpparam));
+        } catch (Throwable t) {
+            firstPackage = "n/a";
+        }
+        return "isFirstApplication=" + firstApplication + ", isFirstPackage=" + firstPackage;
+    }
+
+    /** 反射读 public 字段（旧参数对象的 public 字段；读不到返回 null）。 */
+    private static Object fieldValue(Object target, String name) {
+        try {
+            if (target == null) {
+                return null;
+            }
+            return target.getClass().getField(name).get(target);
+        } catch (Throwable t) {
+            return null;   // 字段不可读：按“没有”处理，绝不影响安装流程
+        }
+    }
+
+    /** 反射读 public 字符串字段；不是 String / 读不到都返回 null。 */
+    private static String stringField(Object target, String name) {
+        final Object value = fieldValue(target, name);
+        return value instanceof String ? (String) value : null;
+    }
+
+    /** 反射读 public ClassLoader 字段；类型不符 / 读不到都返回 null。 */
+    private static ClassLoader classLoaderField(Object target) {
+        final Object value = fieldValue(target, "classLoader");
+        return value instanceof ClassLoader ? (ClassLoader) value : null;
+    }
+
+    /**
+     * 旧入口（{@code assets/xposed_init → com.vloc.motion.hidden.HookEntry}）的兼容方法。
+     *
+     * <p><b>为什么参数是 {@link Object}</b>：本类已迁移到 {@link Xp} 门面，不再 import
+     * 旧 Xposed API，因此不能把参数声明成旧 API 的 {@code LoadPackageParam}。
+     * 旧参数对象参与逻辑的只有 3 个 public 字段（{@code packageName / classLoader /
+     * processName}），其余只用于日志，所以这里按字段名反射读取，判定逻辑与迁移前逐字一致。
+     *
+     * <p>真正的 {@code IXposedHookLoadPackage} 实现留在 {@code NewApiEntry} 的嵌套桥接类里
+     * （那个文件允许出现旧 API 类型）：它把参数摊平成
+     * {@link #onPackage(String, ClassLoader, String)} 的 3 个实参后调本类。
+     */
+    public void handleLoadPackage(Object lpparam) {
+        try {
+            if (lpparam == null) {
                 return;
             }
-            final String packageName = lpparam.packageName;
+            final String packageName = stringField(lpparam, "packageName");
+            if (packageName == null) {
+                return;
+            }
+            onPackage(packageName, classLoaderField(lpparam), stringField(lpparam, "processName"),
+                    firstFlagsOf(lpparam));
+        } catch (Throwable t) {
+            // 顶层兜底：模块绝不能因为自身异常影响目标 App 启动
+            logError("handleLoadPackage failed", t);
+        }
+    }
+
+    /**
+     * 包加载入口（<b>框架无关</b>）：旧入口与新入口（libxposed API 102）共用这一份逻辑。
+     *
+     * @param packageName 本次加载的包名（非空）
+     * @param classLoader 该包的 ClassLoader
+     * @param processName 进程名（旧 API 的 {@code LoadPackageParam#processName}）；
+     *                    空 = 退回包名做进程去重
+     */
+    public static void onPackage(String packageName, ClassLoader classLoader, String processName) {
+        onPackage(packageName, classLoader, processName, null);
+    }
+
+    /** @param firstFlags 诊断串，null = 本入口拿不到（只影响日志） */
+    private static void onPackage(String packageName, ClassLoader classLoader, String processName,
+                                  String firstFlags) {
+        try {
+            if (packageName == null) {
+                return;
+            }
             if (MAIN_APP_PACKAGE.equals(packageName) || MODULE_PACKAGE.equals(packageName)) {
+                return;
+            }
+            // 多进程 / 共享 uid 去重：同一进程只装一次（见 sInstalledProcesses 注释）。
+            // 幂等重入（LSPosed 派生进程、同 uid 多包）在此拦下，不再重复挂 hook。
+            final String procKey = processKey(processName, packageName);
+            if (alreadyInstalled(procKey)) {
+                log("skip " + packageName + ": hooks already installed in process " + procKey);
                 return;
             }
             if (SYSTEM_SERVER_PACKAGE.equals(packageName)) {
@@ -173,7 +378,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 // 模块必须被手动加入「系统框架」作用域才会走到这里。
                 // 注意：系统层「只对选定应用生效」在 SystemHooks 内部做（投递时按接收方包名判定），
                 // 这里不能整进程跳过，否则名单里也会全部失效。
-                final int systemHooks = installSystemHooks(lpparam.classLoader);
+                final int systemHooks = new HookEntry().installSystemHooks(classLoader);
                 if (systemHooks >= 0) {
                     // 心跳（每进程一次，由 HookHeartbeat 保证）：让主 App 不依赖
                     // “能否看见 org.lsposed.manager” 也能知道系统层已注入、装上了几个 hook
@@ -188,7 +393,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 log("skip " + packageName + ": not in scope");
                 return;
             }
-            final int appHooks = installHooks(lpparam.classLoader, packageName);
+            // 诊断：多进程/共享 uid 场景下，把真实的 processName 与 isFirstPackage 记一行，
+            // 便于区分“同一进程被回调多次（已去重）”与“不同进程各装一次（正常）”。
+            log("install in process=" + procKey + " pkg=" + packageName + " "
+                    + (firstFlags == null
+                    ? "isFirstApplication=?, isFirstPackage=n/a" : firstFlags));
+            final int appHooks = new HookEntry().installHooks(classLoader, packageName);
             // 心跳：kind 由本进程 uid 判定（系统 uid 段如 com.android.location.fused → system，
             // 普通目标应用 → app），hooks 是下面 installHooks 里各旁路实际安装数的总和
             HookHeartbeat.report(null, packageName, appHooks, HookHeartbeat.kindOfCurrentProcess());
@@ -218,17 +428,47 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /** 单条旁路的安装入口（{@code int install(ClassLoader)}）。 */
+    private interface BypassInstaller {
+        int install(ClassLoader classLoader);
+    }
+
+    /**
+     * <b>缺失即跳过</b>的统一兜底：一条旁路无论因为什么抛出，都只记一条日志并返回 0。
+     *
+     * <p>为什么需要它：各 {@code *Replay.install} 内部已经逐 hook try/catch，但它们自身的
+     * “入口代码”（拿 ClassLoader、算常量、初始化表）也可能在某个 Android 版本上抛出；
+     * 一旦抛出就会把 {@code installHooks} 打断，<b>后面所有旁路都不会安装</b>，
+     * 而且心跳不会上报（被当成“注入失败”）。这里把每条旁路隔离成独立单元。
+     *
+     * @param tag      日志用的旁路名
+     * @param installer 旁路安装函数（可为 null = 本版本没有该旁路）
+     * @return 该类旁路实际安装数；异常 / 缺失一律 0
+     */
+    private static int safeInstall(String tag, BypassInstaller installer, ClassLoader classLoader) {
+        if (installer == null) {
+            return 0;
+        }
+        try {
+            return installer.install(classLoader);
+        } catch (Throwable t) {
+            log("skip " + tag + " hooks (unsupported on this Android): " + t);
+            return 0;
+        }
+    }
+
     /**
      * 安装全部 hook，每个 hook 内部各自兜底，互不影响。
      *
      * @return 本进程实际安装成功的 hook 总数（各旁路安装方法的返回值之和，用于自报心跳）
      */
     private int installHooks(ClassLoader classLoader, String packageName) {
-        final Class<?> locationClass;
-        try {
-            locationClass = XposedHelpers.findClass(LOCATION_CLASS_NAME, classLoader);
-        } catch (Throwable t) {
-            logError("findClass " + LOCATION_CLASS_NAME + " failed, skip process " + packageName, t);
+        // 候选表只有一项（android.location.Location 从 API 1 就存在），但同样走统一解析 +
+        // 统一候选日志：ClassLoader 异常 / 类被裁掉时只记日志并跳过本进程，绝不抛到框架层。
+        final Class<?> locationClass = HookCompat.find(classLoader, LOCATION_CLASS_NAME);
+        if (locationClass == null) {
+            HookCompat.logCandidate(LOCATION_CLASS_NAME, false, 0, null,
+                    "skip process " + packageName);
             return 0;
         }
 
@@ -249,26 +489,29 @@ public final class HookEntry implements IXposedHookLoadPackage {
             installed++;
         }
 
+        // 每条旁路独立 try/catch（见 safeInstall）：任一条在某个 Android 版本上抛出
+        // （类被裁掉、方法签名变了、ClassLoader 变了）都只记一条日志，绝不连累后面的旁路，
+        // 也绝不把异常抛给 Xposed 框架层 / 宿主进程。
         // 旁证 1：Settings 里的 mock_location
-        final int settingsHooks = hookSettings(classLoader);
-        // 旁证 2：AppOpsManager 的 mock_location 自查（8 个 check 方法）
-        final int appOpsHooks = hookAppOps(classLoader);
+        final int settingsHooks = safeInstall("settings", this::hookSettings, classLoader);
+        // 旁证 2：AppOpsManager 的 mock_location 自查（8 个槽位：7 个 check 名字 + 活动态自查）
+        final int appOpsHooks = safeInstall("appops_check", this::hookAppOps, classLoader);
         // 旁路 3：AppOps 枚举 / noteOp / startOp / finishOp
-        final int appOpsExtraHooks = hookAppOpsExtras(classLoader);
+        final int appOpsExtraHooks = safeInstall("appops_extra", this::hookAppOpsExtras, classLoader);
         // 旁路 4：ContentResolver 直查 settings provider
-        final int resolverHooks = hookContentResolver(classLoader);
+        final int resolverHooks = safeInstall("resolver", this::hookContentResolver, classLoader);
         // 旁路 5：Location 序列化时临时清掉 mock 位
-        final int parcelHooks = hookLocationParcel(locationClass);
+        final int parcelHooks = safeInstall("parcel", cl -> hookLocationParcel(locationClass), classLoader);
         // 旁路 6：基站 / Wi-Fi 环境快照回放（v0.4.0）
-        final int envHooks = EnvReplay.install(classLoader);
+        final int envHooks = safeInstall("env", EnvReplay::install, classLoader);
         // 旁路 7：计步传感器回放（v0.4.x）
-        final int stepHooks = StepReplay.install(classLoader);
+        final int stepHooks = safeInstall("step", StepReplay::install, classLoader);
         // 旁路 8：IMU（加速度计 / 线加速度 / 陀螺仪 / 重力）伪造
-        final int imuHooks = ImuReplay.install(classLoader);
+        final int imuHooks = safeInstall("imu", ImuReplay::install, classLoader);
         // 旁路 9：GNSS 卫星状态回放（GnssStatus / 1Hz 回调，v0.18.x）
-        final int gnssHooks = GnssReplay.install(classLoader);
+        final int gnssHooks = safeInstall("gnss", GnssReplay::install, classLoader);
         // 旁路 10：反检测补强（provider 列表 / 时间戳一致性 / 精度抖动 / NMEA，v0.38）
-        final int antiDetectHooks = AntiDetect.install(classLoader);
+        final int antiDetectHooks = safeInstall("anti_detect", AntiDetect::install, classLoader);
 
         // 安装条数随 Android 版本自然变化（如 Android 11 上没有 isMock/setMock，4/5 属正常）
         final int total = installed + settingsHooks + appOpsHooks + appOpsExtraHooks
@@ -276,7 +519,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 + antiDetectHooks;
         log("hooks installed in " + packageName + " (sdk=" + Build.VERSION.SDK_INT
                 + ", location=" + installed + "/5, settings=" + settingsHooks
-                + ", appops_check=" + appOpsHooks + "/8, appops_extra=" + appOpsExtraHooks
+                + ", appops_check=" + appOpsHooks + "/" + APP_OPS_CHECK_SLOTS
+                + ", appops_extra=" + appOpsExtraHooks
                 + ", resolver=" + resolverHooks + "/2, parcel=" + parcelHooks + "/1"
                 + ", env=" + envHooks + "/5, step=" + stepHooks + "/2"
                 + ", imu=" + imuHooks + "/2, gnss=" + gnssHooks + "/15"
@@ -291,15 +535,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** Location#isFromMockProvider() → false（API 18+，Android 12+ 已废弃但大量 App 仍在用）。 */
     private boolean hookIsFromMockProvider(Class<?> locationClass) {
         try {
-            XposedHelpers.findAndHookMethod(locationClass, "isFromMockProvider",
-                    new XC_MethodReplacement() {
+            hookExact(locationClass, "isFromMockProvider", NO_PARAMS,
+                    new Callback() {
                         @Override
-                        protected Object replaceHookedMethod(MethodHookParam param) {
+                        protected void before(Param param) {
                             // 心跳补试（极轻量：两次 volatile 读，未成功且距上次 >2s 才真的去 insert）：
                             // 开机早期主 App 未就绪导致首次心跳失败时，靠这里在既有回调里补上，
                             // 不需要常驻线程或轮询，见 HookHeartbeat#retryIfPending。
                             HookHeartbeat.retryIfPending();
-                            return Boolean.FALSE;
+                            param.setResult(Boolean.FALSE);   // 等价 XC_MethodReplacement：不调原方法
                         }
                     });
             log("hooked Location#isFromMockProvider() -> false");
@@ -314,11 +558,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** Location#isMock() → false（Android 12 / API 31 起新增，Android 8~11 不存在则忽略）。 */
     private boolean hookIsMock(Class<?> locationClass) {
         try {
-            XposedHelpers.findAndHookMethod(locationClass, "isMock",
-                    new XC_MethodReplacement() {
+            hookExact(locationClass, "isMock", NO_PARAMS,
+                    new Callback() {
                         @Override
-                        protected Object replaceHookedMethod(MethodHookParam param) {
-                            return Boolean.FALSE;
+                        protected void before(Param param) {
+                            param.setResult(Boolean.FALSE);   // 等价 XC_MethodReplacement：不调原方法
                         }
                     });
             log("hooked Location#isMock() -> false");
@@ -335,8 +579,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
      */
     private boolean hookMockSetter(Class<?> locationClass, String methodName) {
         try {
-            XposedHelpers.findAndHookMethod(locationClass, methodName, boolean.class,
-                    XC_MethodReplacement.DO_NOTHING);
+            hookExact(locationClass, methodName, new Class<?>[]{boolean.class},
+                    Callback.doNothing());
             log("hooked Location#" + methodName + "(boolean) -> no-op");
             return true;
         } catch (Throwable t) {
@@ -361,9 +605,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      */
     private boolean hookGetExtras(Class<?> locationClass) {
         try {
-            XposedHelpers.findAndHookMethod(locationClass, "getExtras", new XC_MethodHook() {
+            hookExact(locationClass, "getExtras", NO_PARAMS, new Callback() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void after(Param param) {
                     try {
                         // 心跳补试（与 isFromMockProvider 里同一入口，开销仅为两次 volatile 读）：
                         // 目标 App 读 Location 时顺手补一次开机早期失败的心跳。
@@ -414,6 +658,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 && key.toLowerCase(Locale.ROOT).contains(MOCK_EXTRA_KEY_TOKEN);
     }
 
+    /** 无参方法的参数类型表（{@link #hookExact} 用；避免每处都 new 一个空数组）。 */
+    private static final Class<?>[] NO_PARAMS = new Class<?>[0];
+
+    /**
+     * 对应旧 API 的 {@code XposedHelpers.findAndHookMethod(clazz, name, params..., callback)}：
+     * 按<b>精确签名</b>找方法再挂（不遍历其它重载），方法不存在时抛 {@link NoSuchMethodError} ——
+     * 与迁移前一致，调用方的 {@code catch (Throwable)} 会记一条 {@code skip ...} 日志。
+     */
+    private static void hookExact(Class<?> clazz, String name, Class<?>[] parameterTypes,
+                                  Callback callback) {
+        Xp.hookMethodExact(clazz, name, parameterTypes, callback);
+    }
 
     // ==================================================================
     // Settings 旁证：mock_location 读取一律表现为“不允许”(0 / "0")
@@ -423,9 +679,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * Settings 读取拦截回调。全 App 高频调用路径，因此只对 name 命中的那一次改写返回值，
      * 其余 key / 其余参数一律放行；任何异常都静默吞掉，绝不把模块异常抛给目标 App。
      */
-    private static final XC_MethodHook SETTINGS_MOCK_CALLBACK = new XC_MethodHook() {
+    private static final Callback SETTINGS_MOCK_CALLBACK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 2) {
@@ -477,15 +733,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     /** 挂一个 Settings 命名空间（Secure / System / Global）上的全部读取方法。 */
     private int hookSettingsGetters(ClassLoader classLoader, String className) {
-        final Class<?> settingsClass;
-        try {
-            settingsClass = XposedHelpers.findClassIfExists(className, classLoader);
-        } catch (Throwable t) {
-            log("skip " + className + ": " + t);
-            return 0;
-        }
+        final Class<?> settingsClass = HookCompat.find(classLoader, className);
         if (settingsClass == null) {
-            log("skip " + className + " (class not found)");
+            HookCompat.logCandidate(className, false, 0, null, "settings namespace absent");
             return 0;
         }
 
@@ -493,8 +743,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
         for (String methodName : SETTINGS_GETTER_METHODS) {
             try {
                 // hookAllMethods 会覆盖同名重载，且方法不存在时返回空集合而不是抛异常
-                final int overloads = XposedBridge.hookAllMethods(
-                        settingsClass, methodName, SETTINGS_MOCK_CALLBACK).size();
+                final int overloads = Xp.hookAllMethods(
+                        settingsClass, methodName, SETTINGS_MOCK_CALLBACK);
                 if (overloads > 0) {
                     hookedNames++;
                     log("hooked " + className + "#" + methodName + " (" + overloads + " overload(s))");
@@ -503,32 +753,33 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 log("skip " + className + "#" + methodName + ": " + t);
             }
         }
-        if (hookedNames == 0) {
-            log("skip " + className + " (no getter matched)");
-        }
+        // 统一候选日志：hooked=命中的 getter 名字数（0 = 该 ROM 换过读取链，靠 NameValueCache 兜底）
+        HookCompat.logCandidate(className, true, hookedNames,
+                hookedNames > 0 ? "getters=" + hookedNames : null,
+                hookedNames > 0 ? null : "no getter matched");
         return hookedNames;
     }
 
     /** @hide 的 Settings$NameValueCache#getStringForUser，作最后一道兜底。 */
     private int hookSettingsCache(ClassLoader classLoader) {
-        try {
-            final Class<?> cacheClass =
-                    XposedHelpers.findClassIfExists(SETTINGS_CACHE_CLASS_NAME, classLoader);
-            if (cacheClass == null) {
-                log("skip " + SETTINGS_CACHE_CLASS_NAME + " (class not found)");
-                return 0;
-            }
-            final int overloads = XposedBridge.hookAllMethods(
-                    cacheClass, "getStringForUser", SETTINGS_MOCK_CALLBACK).size();
-            if (overloads > 0) {
-                log("hooked " + SETTINGS_CACHE_CLASS_NAME + "#getStringForUser (" + overloads + ")");
-                return 1;
-            }
-            log("skip " + SETTINGS_CACHE_CLASS_NAME + "#getStringForUser (absent)");
-        } catch (Throwable t) {
-            log("skip " + SETTINGS_CACHE_CLASS_NAME + ": " + t);
+        final Class<?> cacheClass = HookCompat.find(classLoader, SETTINGS_CACHE_CLASS_NAME);
+        if (cacheClass == null) {
+            HookCompat.logCandidate(SETTINGS_CACHE_CLASS_NAME, false, 0, null, "cache class absent");
+            return 0;
         }
-        return 0;
+        int overloads = 0;
+        try {
+            overloads = Xp.hookAllMethods(
+                    cacheClass, "getStringForUser", SETTINGS_MOCK_CALLBACK);
+        } catch (Throwable t) {
+            HookCompat.logCandidate(SETTINGS_CACHE_CLASS_NAME, true, 0,
+                    null, "hook failed: " + t);
+            return 0;
+        }
+        HookCompat.logCandidate(SETTINGS_CACHE_CLASS_NAME, true, overloads > 0 ? 1 : 0,
+                overloads > 0 ? "getStringForUser overloads=" + overloads : null,
+                overloads > 0 ? null : "getStringForUser absent");
+        return overloads > 0 ? 1 : 0;
     }
 
     /**
@@ -573,30 +824,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * （真机上“没有 mock 权限”时它们本来就会抛），这样 try/catch 风格的检测库也会得到同样的结论。
      */
     private int hookAppOps(ClassLoader classLoader) {
-        final Class<?> appOpsClass;
-        try {
-            appOpsClass = XposedHelpers.findClassIfExists(APP_OPS_CLASS_NAME, classLoader);
-        } catch (Throwable t) {
-            log("skip " + APP_OPS_CLASS_NAME + ": " + t);
-            return 0;
-        }
+        final Class<?> appOpsClass = HookCompat.find(classLoader, APP_OPS_CLASS_NAME);
         if (appOpsClass == null) {
-            log("skip " + APP_OPS_CLASS_NAME + " (class not found)");
+            // AppOpsManager 从 API 19 起就有：找不到只可能是个别 ROM 裁掉，记日志后跳过
+            HookCompat.logCandidate(APP_OPS_CLASS_NAME, false, 0, null, "class absent");
             return 0;
         }
 
         // 老版本把 op 编码成 int，顺手解出 OP_MOCK_LOCATION 以覆盖 int 重载（解析失败则 -1）
         final int mockOpInt = resolveMockOpInt(appOpsClass);
-        final XC_MethodHook callback = new XC_MethodHook() {
+        final Callback callback = new Callback() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void before(Param param) {
                 try {
                     final Object[] args = param.args;
                     if (args == null || args.length < 1 || !(param.method instanceof Method)) {
                         return;
                     }
                     final Method method = (Method) param.method;
-                    if (method.getReturnType() != int.class) {
+                    final Class<?> returnType = method.getReturnType();
+                    // int：checkOp 家族；boolean：isOpActive / isOperationActive（第 8 槽）
+                    final boolean booleanResult = returnType == boolean.class;
+                    if (returnType != int.class && !booleanResult) {
                         return;
                     }
                     final Object op = args[0];
@@ -617,7 +866,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         logAppOpsSelfExemptOnce(method);
                         return;
                     }
-                    if (isThrowingCheck(method.getName())) {
+                    if (booleanResult) {
+                        // 活动态自查：mock op 表现为“没有在使用”，与 MODE_ERRORED 的语义一致
+                        param.setResult(Boolean.FALSE);
+                    } else if (isThrowingCheck(method.getName())) {
                         // 与真机“没有 mock 权限”一致：抛 SecurityException 而不是返回
                         param.setThrowable(new SecurityException(
                                 APP_OPS_CLASS_NAME + "." + method.getName()
@@ -635,19 +887,54 @@ public final class HookEntry implements IXposedHookLoadPackage {
         int hooked = 0;
         for (String methodName : APP_OPS_CHECK_METHODS) {
             try {
-                final int overloads = XposedBridge.hookAllMethods(appOpsClass, methodName, callback).size();
+                final int overloads = Xp.hookAllMethods(appOpsClass, methodName, callback);
                 if (overloads > 0) {
                     hooked++;
-                    log("hooked " + APP_OPS_CLASS_NAME + "#" + methodName + " (" + overloads + ")");
+                    HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                            true, overloads, "overloads=" + overloads, null);
                 } else {
-                    log("skip " + APP_OPS_CLASS_NAME + "#" + methodName + " (absent on this Android)");
+                    HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                            false, 0, null, "absent on this Android");
                 }
             } catch (Throwable t) {
-                log("skip " + APP_OPS_CLASS_NAME + "#" + methodName + ": " + t);
+                HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                        true, 0, null, "hook failed: " + t);
             }
         }
-        log("appops hooks=" + hooked + "/8 (mock_location -> MODE_ERRORED)");
-        return hooked;
+        // 第 8 槽：活动态自查（任一名字命中即算装上）
+        final int activeSlot = hookAppOpsActiveState(appOpsClass, callback);
+        final int slots = hooked + activeSlot;
+        log("appops hooks=" + slots + "/" + APP_OPS_CHECK_SLOTS
+                + " (mock_location -> MODE_ERRORED"
+                + (activeSlot > 0 ? "; active-state self-check included" : "")
+                + ")");
+        return slots;
+    }
+
+    /**
+     * 第 8 槽：挂 {@code isOpActive} / {@code isOperationActive}（命中 mock op → {@code false}）。
+     *
+     * @return 1 = 至少一个名字挂上了；0 = 本版本两个都没有（Android 8~10 正常）
+     */
+    private int hookAppOpsActiveState(Class<?> appOpsClass, Callback callback) {
+        int matched = 0;
+        for (String methodName : APP_OPS_ACTIVE_METHODS) {
+            try {
+                final int overloads = Xp.hookAllMethods(appOpsClass, methodName, callback);
+                if (overloads > 0) {
+                    matched++;
+                    HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                            true, overloads, "overloads=" + overloads, null);
+                } else {
+                    HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                            false, 0, null, "absent on this Android");
+                }
+            } catch (Throwable t) {
+                HookCompat.logCandidate(APP_OPS_CLASS_NAME + "#" + methodName,
+                        true, 0, null, "hook failed: " + t);
+            }
+        }
+        return matched > 0 ? 1 : 0;
     }
 
     /** checkOp / unsafeCheckOp 在 MODE_ERRORED 时本来就会抛 SecurityException，需保持一致。 */
@@ -658,7 +945,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** 解出 @hide 的 AppOpsManager.OP_MOCK_LOCATION，用于兼容以 int op 调用自查的老代码。 */
     private static int resolveMockOpInt(Class<?> appOpsClass) {
         try {
-            final Field field = XposedHelpers.findFieldIfExists(appOpsClass, "OP_MOCK_LOCATION");
+            final Field field = Xp.findFieldIfExists(appOpsClass, "OP_MOCK_LOCATION");
             if (field == null) {
                 return -1;
             }
@@ -699,9 +986,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * 且条件（selection / selectionArgs / Bundle 查询参数）里点名 mock_location 的查询。
      * 做法是把条件改成恒假 "0" 并清空参数，让 provider 自然返回空 Cursor（等价于“该设置不存在”）。
      */
-    private static final XC_MethodHook QUERY_HOOK = new XC_MethodHook() {
+    private static final Callback QUERY_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 3 || !(args[0] instanceof Uri)) {
@@ -756,9 +1043,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * ContentResolver#call 拦截：settings provider 的 GET_* 且参数是 mock_location 时返回 null
      * （真机缺该设置时 provider 无值可取）。
      */
-    private static final XC_MethodHook CALL_HOOK = new XC_MethodHook() {
+    private static final Callback CALL_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 3) {
@@ -798,16 +1085,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     /** 安装 ContentResolver 的 query / call hook。 */
     private int hookContentResolver(ClassLoader classLoader) {
-        final Class<?> resolverClass;
-        try {
-            resolverClass = XposedHelpers.findClass("android.content.ContentResolver", classLoader);
-        } catch (Throwable t) {
-            log("skip ContentResolver: " + t);
+        final Class<?> resolverClass = HookCompat.find(classLoader, CONTENT_RESOLVER_CLASS_NAME);
+        if (resolverClass == null) {
+            HookCompat.logCandidate(CONTENT_RESOLVER_CLASS_NAME, false, 0, null, "class absent");
             return 0;
         }
         int hooked = 0;
         try {
-            final int queryOverloads = XposedBridge.hookAllMethods(resolverClass, "query", QUERY_HOOK).size();
+            final int queryOverloads = Xp.hookAllMethods(resolverClass, "query", QUERY_HOOK);
             if (queryOverloads > 0) {
                 hooked++;
                 log("hooked ContentResolver#query (" + queryOverloads + " overload(s))");
@@ -816,7 +1101,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("skip ContentResolver#query: " + t);
         }
         try {
-            final int callOverloads = XposedBridge.hookAllMethods(resolverClass, "call", CALL_HOOK).size();
+            final int callOverloads = Xp.hookAllMethods(resolverClass, "call", CALL_HOOK);
             if (callOverloads > 0) {
                 hooked++;
                 log("hooked ContentResolver#call (" + callOverloads + " overload(s))");
@@ -929,9 +1214,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * @return 成功 hook 到的方法名数量
      */
     private int hookAppOpsEnumeration(Class<?> appOpsClass, int mockOpInt) {
-        final XC_MethodHook hook = new XC_MethodHook() {
+        final Callback hook = new Callback() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void before(Param param) {
                 try {
                     final Object[] args = param.args;
                     if (args == null || args.length == 0) {
@@ -1014,7 +1299,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         int hooked = 0;
         for (String methodName : APP_OPS_ENUM_METHODS) {
             try {
-                final int overloads = XposedBridge.hookAllMethods(appOpsClass, methodName, hook).size();
+                final int overloads = Xp.hookAllMethods(appOpsClass, methodName, hook);
                 if (overloads > 0) {
                     hooked++;
                     log("hooked " + APP_OPS_CLASS_NAME + "#" + methodName + " (" + overloads + ")");
@@ -1040,9 +1325,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * @return 成功 hook 到的方法名数量
      */
     private int hookAppOpsNoteAndStart(Class<?> appOpsClass, int mockOpInt) {
-        final XC_MethodHook hook = new XC_MethodHook() {
+        final Callback hook = new Callback() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
+            protected void before(Param param) {
                 try {
                     final Object[] args = param.args;
                     if (args == null || args.length == 0 || !(param.method instanceof Method)) {
@@ -1078,7 +1363,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         int hooked = 0;
         for (String methodName : APP_OPS_NOTE_METHODS) {
             try {
-                final int overloads = XposedBridge.hookAllMethods(appOpsClass, methodName, hook).size();
+                final int overloads = Xp.hookAllMethods(appOpsClass, methodName, hook);
                 if (overloads > 0) {
                     hooked++;
                     log("hooked " + APP_OPS_CLASS_NAME + "#" + methodName + " (" + overloads + ")");
@@ -1095,15 +1380,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     /** 安装 AppOps 的枚举与 noteOp 旁路（与 8 个 check hook 分开安装，互不影响）。 */
     private int hookAppOpsExtras(ClassLoader classLoader) {
-        final Class<?> appOpsClass;
-        try {
-            appOpsClass = XposedHelpers.findClassIfExists(APP_OPS_CLASS_NAME, classLoader);
-        } catch (Throwable t) {
-            log("skip " + APP_OPS_CLASS_NAME + " extras: " + t);
-            return 0;
-        }
+        final Class<?> appOpsClass = HookCompat.find(classLoader, APP_OPS_CLASS_NAME);
         if (appOpsClass == null) {
-            log("skip " + APP_OPS_CLASS_NAME + " extras (class not found)");
+            HookCompat.logCandidate(APP_OPS_CLASS_NAME, false, 0, "extras", "class absent");
             return 0;
         }
         final int mockOpInt = resolveMockOpInt(appOpsClass);
@@ -1274,7 +1553,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private int hookLocationParcel(Class<?> locationClass) {
         Field maskField = null;
         try {
-            maskField = XposedHelpers.findFieldIfExists(locationClass, PARCEL_MASK_FIELD);
+            maskField = Xp.findFieldIfExists(locationClass, PARCEL_MASK_FIELD);
             if (maskField != null) {
                 maskField.setAccessible(true);
             }
@@ -1283,7 +1562,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         Field legacyField = null;
         try {
-            legacyField = XposedHelpers.findFieldIfExists(locationClass, PARCEL_LEGACY_MOCK_FIELD);
+            legacyField = Xp.findFieldIfExists(locationClass, PARCEL_LEGACY_MOCK_FIELD);
             if (legacyField != null) {
                 legacyField.setAccessible(true);
             }
@@ -1299,10 +1578,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final Field fLegacy = legacyField;
         final int mockMask = resolveMockMask(locationClass);
         try {
-            XposedHelpers.findAndHookMethod(locationClass, "writeToParcel", Parcel.class, int.class,
-                    new XC_MethodHook() {
+            hookExact(locationClass, "writeToParcel", new Class<?>[]{Parcel.class, int.class},
+                    new Callback() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
+                        protected void before(Param param) {
                             try {
                                 final Object location = param.thisObject;
                                 if (location == null) {
@@ -1329,7 +1608,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         }
 
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void after(Param param) {
                             final Boolean maskWasSet = PARCEL_MASK_WAS_SET.get();
                             PARCEL_MASK_WAS_SET.remove();
                             final Boolean legacyWasSet = PARCEL_LEGACY_WAS_SET.get();
@@ -1364,7 +1643,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static int resolveMockMask(Class<?> locationClass) {
         try {
-            final Field field = XposedHelpers.findFieldIfExists(locationClass, "HAS_MOCK_PROVIDER_MASK");
+            final Field field = Xp.findFieldIfExists(locationClass, "HAS_MOCK_PROVIDER_MASK");
             if (field != null) {
                 field.setAccessible(true);
                 return field.getInt(null);
@@ -1387,9 +1666,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
     // 日志
     // ==================================================================
 
+    /** 统一日志：{@code [VLocHidden] } 前缀由 {@link Xp} 后端统一加。 */
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // 日志通道异常时不能影响目标 App
         }
@@ -1398,7 +1678,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static void logError(String message, Throwable t) {
         log(message + ": " + t);
         try {
-            XposedBridge.log(t);
+            Xp.log(t);
         } catch (Throwable ignored) {
             // ignore
         }

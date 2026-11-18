@@ -6,12 +6,17 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 
+import com.vloc.motion.core.RemotePrefs;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.core.VLog;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -50,6 +55,17 @@ import java.util.Set;
  *   <li>{@code targets}：1s 检查一次，<b>只在名单变化时</b>写。</li>
  * </ul>
  * 所有写入都走 {@link SharedPreferences.Editor#apply()}（异步落盘），绝不阻塞主线程。
+ *
+ * <p><b>双写（新 API 后端）</b>：world-readable prefs 只有<b>旧</b> LSPosed 的
+ * New XSharedPreferences 读得到；新 API 后端下模块读的是
+ * {@code module.getRemotePreferences("vloc_snapshot")}，那份数据只能由应用侧通过
+ * libxposed 的 {@code XposedService} 写入。所以上面每一个 key 在写 world-readable 的
+ * <b>同时</b>也会写一份到 {@link RemotePrefs}：同一份字符串、同一个节流判断、同一个
+ * 定时器（{@link #onTick()} 里 dirty 才发、{@link #publishSocketName} 里随名字一起写、
+ * {@link #stop()} 里收尾）。
+ *
+ * <p>两条通道<b>互相独立</b>：任一条打不开都不影响另一条，也都不影响定位主流程
+ * （{@link RemotePrefs} 全程 try/catch，不可用时静默返回 false）。
  *
  * <p><b>降级</b>：LSPosed 未启用该机制（旧版本 / 模块元数据不足）时，
  * {@code getSharedPreferences(..., MODE_WORLD_READABLE)} 会抛 {@code SecurityException}：
@@ -152,8 +168,10 @@ public final class SnapshotPrefs {
     /**
      * 会话启动：打开 world-readable prefs 并开始按节流写快照（幂等）。
      *
-     * <p>打不开（LSPosed 未启用该机制 / 旧版不认 {@code MODE_WORLD_READABLE}）时<b>什么都不做</b>：
-     * 不排定时器、不抛异常，模块照旧走套接字 / ContentProvider。
+     * <p>world-readable 打不开（LSPosed 未启用该机制 / 旧版不认 {@code MODE_WORLD_READABLE}）时
+     * 本会话就<b>不写 prefs</b>；但只要已经绑上 libxposed 框架服务（新 API 后端的
+     * {@link RemotePrefs} 通道），定时器仍然会排起来——那正是新后端唯一能拿到快照的途径。
+     * 两条通道都没有时保持原行为：不排定时器、不抛异常，模块照旧走套接字 / ContentProvider。
      *
      * @param context 任意 Context（内部取 application context，只用于 prefs 与作用域配置）
      */
@@ -169,8 +187,11 @@ public final class SnapshotPrefs {
                 if (running) {
                     return;   // 已在运行：重复 start 安全（"重新开始"不会重复排定时器）
                 }
-                if (!openLocked()) {
-                    return;   // 不可用：本会话不写 prefs，回退通道继续工作
+                // openLocked() 失败时不再直接返回：新 API 后端的远程通道可能仍然可用，
+                // 定时器要继续为它产出数据（见 onTick()）。
+                final boolean opened = openLocked();
+                if (!opened && !remoteBound()) {
+                    return;   // 两条通道都没有：本会话什么都不写，回退通道继续工作
                 }
                 lastLocAt = 0L;
                 lastGnssAt = 0L;
@@ -212,8 +233,19 @@ public final class SnapshotPrefs {
                     target = prefs;
                 }
             }
+            // 远程通道的收尾与新 API 后端对应：一次提交写完
+            // loc=active=false、删 gnss、删 socket。
+            // 放在 world-readable 判断<b>之前</b>：新 API 环境下 world-readable 大概率打不开，
+            // 而这条通道恰恰是那边唯一可用的，不能被前面的 return 跳过。
+            try {
+                RemotePrefs.write(
+                        Collections.singletonMap(KEY_LOC, INACTIVE_LOC_JSON),
+                        Arrays.asList(KEY_GNSS, KEY_SOCKET));
+            } catch (Throwable ignored) {
+                // RemotePrefs 内部已全包 Throwable；这里只是双保险，收尾失败不影响会话停止
+            }
             if (target == null) {
-                return;   // 从没打开成功：没有东西要清（模块本来就走回退通道）
+                return;   // 从没打开成功：没有东西要清（world-readable 侧本来就不写）
             }
             // 清掉卫星表：下一次会话会重新采集，避免把上一场的卫星表继续喂给模块。
             // loc 覆盖成 active=false：模块解析出"未激活"立刻透传真实定位。
@@ -232,17 +264,34 @@ public final class SnapshotPrefs {
     }
 
     /**
-     * 是否处于"会话中、正在按节流写快照"的状态。
+     * 是否处于"会话中、正在按节流写<b>world-readable</b> prefs"的状态。
      *
      * <p>供 {@code TraceCleaner} 判断能否安全删除 {@code shared_prefs/vloc_snapshot.xml}：
      * {@link #stop()} 之后是 false，新会话 {@link #start(Context)} 之后立刻变 true。
      * 删除动作是异步的（后台线程 + root 调用可能很慢），用户"停止后立刻重新开始"时
      * 必须靠这个标记避免把新会话正在写的文件删掉。
      *
-     * @return true = 正在写快照（此时不要动 prefs 文件）
+     * <p>注意这里只反映 <b>world-readable 文件</b>：prefs 没打开成功时（即使定时器
+     * 还在为 {@link RemotePrefs} 通道产出数据）返回 false —— 那时本来就没有文件被写，
+     * 语义与改动前一致。
+     *
+     * @return true = 正在写 prefs 文件（此时不要动 prefs 文件）
      */
     public boolean isRunning() {
-        return running;
+        return running && available;
+    }
+
+    /**
+     * 新 API 后端的远程通道是否已绑上框架服务（只读 volatile，零 IPC）。
+     *
+     * <p>用于决定"world-readable 打不开时还要不要排定时器"。
+     */
+    private static boolean remoteBound() {
+        try {
+            return RemotePrefs.isBound();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------- 套接字名（会话级随机）
@@ -270,6 +319,14 @@ public final class SnapshotPrefs {
     public boolean publishSocketName(Context context, String name) {
         if (name == null || name.isEmpty()) {
             return false;
+        }
+        // 远程通道先写（与新 API 后端对应），<b>不</b>受下面 world-readable 是否可用的影响：
+        // 新 API 环境里 world-readable 多半打不开，这条是唯一能把名字送到模块的通道。
+        // put 只入队不阻塞（本方法由 SnapshotServer 的守护线程调用，代价可忽略）。
+        try {
+            RemotePrefs.put(KEY_SOCKET, name);
+        } catch (Throwable ignored) {
+            // 双保险：远程通道失败绝不能影响下面的 world-readable 发布
         }
         final SharedPreferences opened;
         try {
@@ -318,38 +375,38 @@ public final class SnapshotPrefs {
     }
 
     /**
-     * 按节流把三类快照写进 prefs；不是会话中 / prefs 不可用时立即返回。
+     * 按节流把三类快照写进 prefs，<b>同时</b>双写一份到新 API 后端的
+     * {@link RemotePrefs}（同一份字符串、同一个节流判断）；不是会话中 / 两条通道都不可用时立即返回。
      *
      * <p>由 {@link #start(Context)} 排的主线程定时器每 250ms 调用一次，
      * 也可以外部直接调用（自带节流，重复调用不会多写）。
      */
     public void onTick() {
-        if (!available || !running) {
+        if (!running) {
             return;
         }
-        final SharedPreferences opened = prefs;
-        if (opened == null) {
+        final SharedPreferences opened = available ? prefs : null;
+        // world-readable 没打开时，只有远程通道还能送数据出去；两条都没有就什么都不做
+        if (opened == null && !remoteBound()) {
             return;
         }
         try {
             final long now = SystemClock.elapsedRealtime();
-            final SharedPreferences.Editor editor = opened.edit();
-            boolean dirty = false;
+            // 变化项先收集成一份，world-readable 与 remote 用的是<b>同一份</b>字符串
+            final Map<String, String> changed = new LinkedHashMap<>();
 
             if (now - lastLocAt >= LOC_INTERVAL_MS) {
                 lastLocAt = now;
                 // 与 /location 完全同源：模块侧复用同一份解析代码
-                editor.putString(KEY_LOC, LocationSession.INSTANCE.toJson());
-                dirty = true;
+                changed.put(KEY_LOC, LocationSession.INSTANCE.toJson());
             }
 
             if (now - lastGnssAt >= GNSS_INTERVAL_MS) {
                 lastGnssAt = now;
                 final String gnss = GnssSession.INSTANCE.json;
                 if (gnss != null && !gnss.isEmpty() && !gnss.equals(lastGnssJson)) {
-                    editor.putString(KEY_GNSS, gnss);
+                    changed.put(KEY_GNSS, gnss);
                     lastGnssJson = gnss;
-                    dirty = true;
                 }
             }
 
@@ -358,16 +415,27 @@ public final class SnapshotPrefs {
                 lastTargetsAt = now;
                 final String targets = targetsJson(context);
                 if (!targets.equals(lastTargetsJson)) {
-                    editor.putString(KEY_TARGETS, targets);
+                    changed.put(KEY_TARGETS, targets);
                     lastTargetsJson = targets;
-                    dirty = true;
                 }
             }
 
-            if (dirty) {
+            if (changed.isEmpty()) {
+                return;
+            }
+
+            if (opened != null) {
+                final SharedPreferences.Editor editor = opened.edit();
+                for (Map.Entry<String, String> entry : changed.entrySet()) {
+                    editor.putString(entry.getKey(), entry.getValue());
+                }
                 // apply() 异步落盘：主线程只做一次编辑器提交，不碰磁盘
                 editor.apply();
             }
+
+            // 双写：新 API 后端读的是框架维护的远程偏好处。RemotePrefs 只做
+            // volatile 检查 + 入队（真正的 binder 在它自己的后台线程上），主线程不阻塞。
+            RemotePrefs.write(changed, null);
         } catch (Throwable ignored) {
             // prefs 被删 / 编辑器失效 / 序列化异常：一律静默，绝不影响会话
         }

@@ -16,8 +16,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 作用域名单：把「系统级注入对所有 App 生效」收窄成「只对用户选定的 App 生效」。
@@ -48,8 +47,6 @@ import de.robv.android.xposed.XposedHelpers;
  * {@code volatile + 双检锁}，uid→包名表用一把小锁保护。
  */
 final class TargetScope {
-
-    private static final String TAG = "[VLocHidden] ";
 
     /** 主 App 的下发内容 URI（另一列是 {@code json}）。 */
     private static final String TARGETS_URI = "content://com.vloc.motion.env/targets";
@@ -355,9 +352,9 @@ final class TargetScope {
         if (context == null) {
             try {
                 final Class<?> activityThread = Class.forName("android.app.ActivityThread");
-                final Object thread = XposedHelpers.callStaticMethod(activityThread, "currentActivityThread");
+                final Object thread = Xp.callStaticMethod(activityThread, "currentActivityThread");
                 if (thread != null) {
-                    final Object value = XposedHelpers.callMethod(thread, "getSystemContext");
+                    final Object value = Xp.callMethod(thread, "getSystemContext");
                     if (value instanceof Context) {
                         context = (Context) value;
                     }
@@ -374,12 +371,12 @@ final class TargetScope {
 
     private static Context callStaticContext(String className, String methodName) {
         try {
-            final Class<?> clazz = XposedHelpers.findClassIfExists(className,
+            final Class<?> clazz = Xp.findClassIfExists(className,
                     TargetScope.class.getClassLoader());
             if (clazz == null) {
                 return null;
             }
-            final Object value = XposedHelpers.callStaticMethod(clazz, methodName);
+            final Object value = Xp.callStaticMethod(clazz, methodName);
             return value instanceof Context ? (Context) value : null;
         } catch (Throwable ignored) {
             return null;
@@ -404,9 +401,9 @@ final class TargetScope {
         String[] result = null;
         try {
             final Class<?> appGlobals = Class.forName("android.app.AppGlobals");
-            final Object packageManager = XposedHelpers.callStaticMethod(appGlobals, "getPackageManager");
+            final Object packageManager = Xp.callStaticMethod(appGlobals, "getPackageManager");
             if (packageManager != null) {
-                final Object value = XposedHelpers.callMethod(packageManager, "getPackagesForUid", uid);
+                final Object value = Xp.callMethod(packageManager, "getPackagesForUid", uid);
                 if (value instanceof String[]) {
                     result = (String[]) value;
                 }
@@ -465,9 +462,10 @@ final class TargetScope {
         log("target scope: cannot resolve packages for uid " + uid + ", applying globally");
     }
 
+    /** 统一日志：{@code [VLocHidden] } 前缀由 {@link Xp} 后端统一加。 */
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

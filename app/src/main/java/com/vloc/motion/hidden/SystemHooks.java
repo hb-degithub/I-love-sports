@@ -26,9 +26,9 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 系统级注入：在 <b>system_server</b>（LSPosed 作用域「系统框架 / android」）内改写定位与 GNSS。
@@ -77,8 +77,6 @@ import de.robv.android.xposed.XposedHelpers;
  * 绝不阻断系统服务（套接字总超时 ≤300ms、带缓存，见 {@link #currentLocation()}）。
  */
 final class SystemHooks {
-
-    private static final String TAG = "[VLocHidden] ";
 
     private static final String LOCATION_URI = "content://com.vloc.motion.env/location";
     private static final String GNSS_URI = "content://com.vloc.motion.env/gnss";
@@ -295,14 +293,19 @@ final class SystemHooks {
      * 的形状挂载；将来签名再变也只是退化成“查不到 → 放行”，不会让系统服务出错。
      */
     private static int hookRegistrationTargets(ClassLoader classLoader) {
-        try {
-            sManagerClass = XposedHelpers.findClass(LOCATION_PROVIDER_MANAGER, classLoader);
-            sIdentityClass = XposedHelpers.findClass(CALLER_IDENTITY_CLASS, classLoader);
-            sTransportClass = XposedHelpers.findClass(
-                    LOCATION_PROVIDER_MANAGER + "$LocationTransport", classLoader);
-            sListenerClass = XposedHelpers.findClassIfExists(LOCATION_LISTENER_CLASS, classLoader);
-        } catch (Throwable t) {
-            log("scope: registration map unavailable (" + t + "), delivery applies globally");
+        // 支撑类（不是 hook 目标，只做“参数类型判定”用）：缺任何一个都只降级为
+        // “作用域按全局生效”，绝不影响投递链本身（投递 hook 见 hookLocationDelivery）。
+        // 统一走 HookCompat.find：类名写错 / 被 ROM 裁掉都只返回 null，不抛异常。
+        sManagerClass = HookCompat.find(classLoader, LOCATION_PROVIDER_MANAGER);
+        sIdentityClass = HookCompat.find(classLoader, CALLER_IDENTITY_CLASS);
+        sTransportClass = HookCompat.find(
+                classLoader, LOCATION_PROVIDER_MANAGER + "$LocationTransport");
+        sListenerClass = HookCompat.find(classLoader, LOCATION_LISTENER_CLASS);
+        if (sManagerClass == null || sIdentityClass == null || sTransportClass == null) {
+            log("scope: registration map unavailable (manager=" + (sManagerClass != null)
+                    + ", identity=" + (sIdentityClass != null)
+                    + ", transport=" + (sTransportClass != null)
+                    + "), delivery applies globally");
             return 0;
         }
 
@@ -311,12 +314,14 @@ final class SystemHooks {
         // 再扫一遍 LocationProviderManager 的全部嵌套类兜住 OEM 改名。
         final Set<Class<?>> candidates = new LinkedHashSet<>();
         for (String simpleName : REGISTRATION_CLASS_NAMES) {
-            try {
-                candidates.add(XposedHelpers.findClass(
-                        LOCATION_PROVIDER_MANAGER + "$" + simpleName, classLoader));
-            } catch (Throwable ignored) {
-                // 个别类在 OEM ROM 上不存在属正常
+            final String fqcn = LOCATION_PROVIDER_MANAGER + "$" + simpleName;
+            final Class<?> resolved = HookCompat.find(classLoader, fqcn);
+            if (resolved == null) {
+                // 个别注册类在 OEM ROM 上不存在属正常：只记一条候选日志，继续下一个
+                HookCompat.logCandidate(fqcn, false, 0, null, "registration class absent");
+                continue;
             }
+            candidates.add(resolved);   // 命中：挂完构造器后由下面统一记 hooked 数
         }
         candidates.add(sManagerClass);
         try {
@@ -337,6 +342,7 @@ final class SystemHooks {
             if (simpleName == null || !simpleName.endsWith("Registration")) {
                 continue;
             }
+            int classHooked = 0;
             for (Constructor<?> constructor : clazz.getDeclaredConstructors()) {
                 if (!hasParameter(constructor.getParameterTypes(), sIdentityClass)) {
                     continue;
@@ -345,12 +351,18 @@ final class SystemHooks {
                     continue;
                 }
                 try {
-                    XposedBridge.hookMethod(constructor, REGISTRATION_HOOK);
-                    hooked++;
+                    Xp.hook(constructor, REGISTRATION_HOOK);
+                    classHooked++;
                 } catch (Throwable t) {
                     log("scope: hook " + simpleName + ".<init> failed: " + t);
                 }
             }
+            hooked += classHooked;
+            // 统一候选日志：found=true / hooked=构造器个数（0 = 该 ROM 的注册构造器签名不含
+            // CallerIdentity+LocationTransport，作用域按“查不到 → 放行”降级）
+            HookCompat.logCandidate(clazz.getName(), true, classHooked,
+                    classHooked > 0 ? "methods=[<init>]" : null,
+                    classHooked > 0 ? null : "no <init>(…CallerIdentity…LocationTransport…)");
         }
 
         // 兜底：注册方法上同时有 CallerIdentity 与 ILocationListener → 记 binder → 包名
@@ -366,7 +378,7 @@ final class SystemHooks {
                     continue;
                 }
                 try {
-                    XposedBridge.hookMethod(method, LISTENER_REGISTER_HOOK);
+                    Xp.hook(method, LISTENER_REGISTER_HOOK);
                     hooked++;
                 } catch (Throwable t) {
                     log("scope: hook registerLocationRequest failed: " + t);
@@ -391,9 +403,9 @@ final class SystemHooks {
     }
 
     /** 注册时：从参数里认出 CallerIdentity + LocationTransport，绑定 transport / binder → 接收方身份。 */
-    private static final XC_MethodHook REGISTRATION_HOOK = new XC_MethodHook() {
+    private static final Callback REGISTRATION_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null) {
@@ -431,9 +443,9 @@ final class SystemHooks {
     };
 
     /** 兜底：{@code registerLocationRequest(Request, CallerIdentity, int, ILocationListener)}。 */
-    private static final XC_MethodHook LISTENER_REGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback LISTENER_REGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null) {
@@ -479,7 +491,7 @@ final class SystemHooks {
     /** CallerIdentity#getPackageName()（d2.txt:40e5d4 实测调用点）。 */
     private static String packageOf(Object identity) {
         try {
-            final Object value = XposedHelpers.callMethod(identity, "getPackageName");
+            final Object value = Xp.callMethod(identity, "getPackageName");
             if (value instanceof String) {
                 final String pkg = (String) value;
                 return pkg.isEmpty() ? null : pkg;
@@ -493,7 +505,7 @@ final class SystemHooks {
     /** CallerIdentity#getUid()（@SystemApi）；解析不到返回 -1。 */
     private static int uidOf(Object identity) {
         try {
-            final Object value = XposedHelpers.callMethod(identity, "getUid");
+            final Object value = Xp.callMethod(identity, "getUid");
             if (value instanceof Integer) {
                 return (Integer) value;
             }
@@ -648,7 +660,7 @@ final class SystemHooks {
     private static final AtomicBoolean sLoggedPrefsStale = new AtomicBoolean();
 
     /** 日志用「方法名 args=参数个数」；任何异常都退化成占位，绝不影响 hook。 */
-    private static String describeCall(XC_MethodHook.MethodHookParam param) {
+    private static String describeCall(Param param) {
         String name = "?";
         int args = 0;
         try {
@@ -667,7 +679,7 @@ final class SystemHooks {
     }
 
     /** 投递 hook 首次被调用：每进程一行；{@code path} 非空时用来区分同步兜底路径。 */
-    private static void logHookFiredOnce(AtomicBoolean flag, XC_MethodHook.MethodHookParam param,
+    private static void logHookFiredOnce(AtomicBoolean flag, Param param,
                                          String path) {
         try {
             if (flag.compareAndSet(false, true)) {
@@ -743,57 +755,27 @@ final class SystemHooks {
     /**
      * 在候选类上挂载「方法名命中」的 hook，逐类记一行日志（成功几个 / 类不存在也记）。
      *
-     * <p>每行格式：{@code hook candidate <fqcn>: found=<bool> hooked=<n> (methods=[...]) (失败原因)}，
-     * 装完直接能看出某个方法（如 {@code deliverOnLocationChanged}）到底挂上了几处。
+     * <p>实现收敛到 {@link HookCompat#hookFirst}（各版本共用同一份候选表 + 同一套日志），
+     * 每行格式：{@code hook candidate <fqcn>: found=<bool> hooked=<n> (methods=[...]) (失败原因)}，
+     * 装完直接能看出某个方法（如 {@code deliverOnLocationChanged}）到底挂上了几处；
+     * 类不存在时是 {@code found=false hooked=0}，只记日志、绝不抛异常。
      *
      * @param stopOnFirst 命中一个类就停（旧版本优先，避免同一条投递链被挂两层）
      * @return 实际挂上的方法数
      */
     private static int hookCandidates(ClassLoader classLoader, String[] classes, List<String> methodNames,
-                                      XC_MethodHook hook, String tag, boolean stopOnFirst) {
-        int total = 0;
-        for (String name : classes) {
-            int hooked = 0;
-            int matched = 0;
-            boolean found = false;
-            String reason = null;
-            final List<String> matchedNames = new ArrayList<>();
-            try {
-                final Class<?> clazz = XposedHelpers.findClass(name, classLoader);
-                found = true;
-                // 逐个重载挂：既兼容 (Location)，也兼容 (LocationResult)
-                for (Method method : clazz.getDeclaredMethods()) {
-                    if (!methodNames.contains(method.getName())) {
-                        continue;
-                    }
-                    matched++;
-                    matchedNames.add(method.getName());
-                    try {
-                        XposedBridge.hookMethod(method, hook);
-                        hooked++;
-                    } catch (Throwable t) {
-                        if (reason == null) {
-                            reason = tag + " hook failed " + method.getName() + ": " + t;
-                        }
-                    }
-                }
-            } catch (Throwable notFound) {
-                reason = tag + " class not found: " + notFound;
-            }
-            if (reason == null && matched == 0) {
-                reason = tag + " no method match " + methodNames;
-            }
-            // 每个候选类固定一行：found=类是否解析到，hooked=真正挂上的方法数，
-            // 这样能直接看出 deliverOnLocationChanged 到底挂上了几个。
-            log("hook candidate " + name + ": found=" + found + " hooked=" + hooked
-                    + (matched > 0 ? " (methods=" + matchedNames + ")" : "")
-                    + (reason == null ? "" : " (" + reason + ")"));
-            total += hooked;
-            if (stopOnFirst && hooked > 0) {
-                break;
-            }
+                                      Callback hook, String tag, boolean stopOnFirst) {
+        if (classes == null || classes.length == 0 || methodNames == null) {
+            return 0;
         }
-        return total;
+        try {
+            return HookCompat.hookFirst(classLoader, tag, classes,
+                    methodNames.toArray(new String[0]), hook, null, stopOnFirst);
+        } catch (Throwable t) {
+            // 候选表逻辑本身异常：退化为“本版本没有这些入口”，绝不影响其它 hook
+            log("hook candidates failed (" + tag + "): " + t);
+            return 0;
+        }
     }
 
     // ============================================================== 替换诊断（每进程每类一条）
@@ -828,9 +810,9 @@ final class SystemHooks {
      * （d2.txt:409570、4098d2），所以改同一批 Location 对象对投递必然可见；反射新建
      * LocationResult 只作为“取不到列表”时的兜底，并且成功/失败都会留下日志。
      */
-    private static final XC_MethodHook LOCATION_HOOK = new XC_MethodHook() {
+    private static final Callback LOCATION_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 // 诊断：先证明 hook 到底有没有被调用（每进程一行），再谈快照
                 logHookFiredOnce(sLoggedDeliveryFired, param, null);
@@ -911,93 +893,78 @@ final class SystemHooks {
         }
     };
 
-    /** getLastLocation / getCurrentLocation 的返回值也换掉（App 冷启动常先读 last known）。 */
+    /**
+     * 候选类表：A17 之前同步入口在 {@code LocationManagerService}（及其 {@code LocalService}），
+     * A17 搬到 {@code com.android.server.location.*.LocationProviderManager}。
+     *
+     * <p>只认返回 {@link Location} 的重载——同名方法在该类里还有返回 {@code Address} /
+     * {@code LocationAvailability} 的变体，误挂会把返回值改成 Location 让宿主 ClassCastException。
+     * 全部候选都缺失时 {@link HookCompat#hookFirst} 只记 {@code found=false hooked=0} 日志并返回 0，
+     * 由投递链（{@code deliverOnLocationChanged}）独立承担改写，两者互不依赖。
+     */
     private static int hookLastLocation(ClassLoader classLoader) {
-        final String[] classes = {
-                "com.android.server.location.LocationManagerService",
-                "com.android.server.location.provider.LocationProviderManager",
-                "com.android.server.location.LocationManagerService$LocalService"
-        };
-        int count = 0;
-        for (String name : classes) {
-            int classHooked = 0;
-            boolean found = false;
-            String reason = null;
-            final List<String> matchedNames = new ArrayList<>();
-            try {
-                final Class<?> clazz = XposedHelpers.findClass(name, classLoader);
-                found = true;
-                for (Method method : clazz.getDeclaredMethods()) {
-                    final String methodName = method.getName();
-                    if (!"getLastLocation".equals(methodName) && !"getCurrentLocation".equals(methodName)) {
-                        continue;
-                    }
-                    if (method.getReturnType() != Location.class) {
-                        continue;
-                    }
-                    matchedNames.add(methodName);
-                    try {
-                        XposedBridge.hookMethod(method, new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                try {
-                                    // 诊断：先证明这条同步兜底路径有没有被调用（每进程一行）
-                                    logHookFiredOnce(sLoggedLastLocationFired, param, "last-location");
-                                    // 作用域门控：这类同步方法没有 transport 可查，
-                                    // 用 Binder.getCallingUid() 反查调用方包名（见 TargetScope）。
-                                    if (!TargetScope.allowsCaller()) {
-                                        // 名单未命中 → 再确认是不是系统/框架身份（uid 1000 /
-                                        // android / fused / providers.*）：这类身份代表不了最终
-                                        // App，按名单过滤必然误杀，按契约退化为全局生效。
-                                        final String systemCaller = systemCallerPackage();
-                                        if (systemCaller == null) {
-                                            if (!sLoggedFirstCallerSkip) {
-                                                sLoggedFirstCallerSkip = true;
-                                                log("skip getLastLocation: caller not in scope");
-                                            }
-                                            return;
-                                        }
-                                        logSystemIdentityOnce(systemCaller);
-                                    }
-                                    final Snapshot snapshot = currentLocation();
-                                    if (snapshot == null) {
-                                        // 诊断：hook 触发了但读不到快照（每进程一行）
-                                        logNoSnapshotOnce(sLoggedLastLocationNoSnapshot, "last-location");
-                                        return;
-                                    }
-                                    final Object result = param.getResult();
-                                    final String provider = result instanceof Location
-                                            ? ((Location) result).getProvider() : "gps";
-                                    param.setResult(buildLocation(snapshot, provider));
-                                } catch (Throwable t) {
-                                    // 保留真实结果
-                                }
-                            }
-                        });
-                        classHooked++;
-                    } catch (Throwable t) {
-                        if (reason == null) {
-                            reason = "hook failed " + methodName + ": " + t;
-                        }
-                    }
-                }
-            } catch (Throwable notFound) {
-                reason = "class not found: " + notFound;
-            }
-            if (reason == null && matchedNames.isEmpty()) {
-                reason = "no getLastLocation/getCurrentLocation(Location) match";
-            }
-            // 每个候选类一行，格式与投递链一致
-            log("hook candidate " + name + ": found=" + found + " hooked=" + classHooked
-                    + (matchedNames.isEmpty() ? "" : " (methods=" + matchedNames + ")")
-                    + (reason == null ? "" : " (" + reason + ")"));
-            count += classHooked;
+        final int count;
+        try {
+            count = HookCompat.hookFirst(classLoader, "last-location", LAST_LOCATION_CLASSES,
+                    LAST_LOCATION_METHODS, LAST_LOCATION_HOOK, Location.class, false);
+        } catch (Throwable t) {
+            log("skip getLastLocation/getCurrentLocation: " + t);
+            return 0;
         }
         if (count > 0) {
             log("hooked getLastLocation/getCurrentLocation x" + count);
         }
         return 0;   // 不单独计数，避免日志夸大
     }
+
+    /** getLastLocation / getCurrentLocation 的候选类（旧版本在前，互相独立、全部尝试）。 */
+    private static final String[] LAST_LOCATION_CLASSES = {
+            "com.android.server.location.LocationManagerService",
+            "com.android.server.location.provider.LocationProviderManager",
+            "com.android.server.location.LocationManagerService$LocalService"
+    };
+
+    /** 同步取位置的方法名（{@code getLastLocation} 读缓存，{@code getCurrentLocation} 单次请求）。 */
+    private static final String[] LAST_LOCATION_METHODS = {"getLastLocation", "getCurrentLocation"};
+
+    /** 同步兜底路径的改写器（无状态，可跨方法/跨类复用）。 */
+    private static final Callback LAST_LOCATION_HOOK = new Callback() {
+        @Override
+        protected void after(Param param) {
+            try {
+                // 诊断：先证明这条同步兜底路径有没有被调用（每进程一行）
+                logHookFiredOnce(sLoggedLastLocationFired, param, "last-location");
+                // 作用域门控：这类同步方法没有 transport 可查，
+                // 用 Binder.getCallingUid() 反查调用方包名（见 TargetScope）。
+                if (!TargetScope.allowsCaller()) {
+                    // 名单未命中 → 再确认是不是系统/框架身份（uid 1000 /
+                    // android / fused / providers.*）：这类身份代表不了最终
+                    // App，按名单过滤必然误杀，按契约退化为全局生效。
+                    final String systemCaller = systemCallerPackage();
+                    if (systemCaller == null) {
+                        if (!sLoggedFirstCallerSkip) {
+                            sLoggedFirstCallerSkip = true;
+                            log("skip getLastLocation: caller not in scope");
+                        }
+                        return;
+                    }
+                    logSystemIdentityOnce(systemCaller);
+                }
+                final Snapshot snapshot = currentLocation();
+                if (snapshot == null) {
+                    // 诊断：hook 触发了但读不到快照（每进程一行）
+                    logNoSnapshotOnce(sLoggedLastLocationNoSnapshot, "last-location");
+                    return;
+                }
+                final Object result = param.getResult();
+                final String provider = result instanceof Location
+                        ? ((Location) result).getProvider() : "gps";
+                param.setResult(buildLocation(snapshot, provider));
+            } catch (Throwable t) {
+                // 保留真实结果
+            }
+        }
+    };
 
     // ============================================================== LocationResult 原地替换
 
@@ -1366,12 +1333,12 @@ final class SystemHooks {
         Throwable last = null;
         for (String factory : new String[]{"create", "wrap"}) {
             try {
-                return XposedHelpers.callStaticMethod(clazz, factory, (Object) array);
+                return Xp.callStaticMethod(clazz, factory, (Object) array);
             } catch (Throwable t) {
                 last = unwrapReflective(t);
             }
             try {
-                return XposedHelpers.callStaticMethod(clazz, factory, (Object) copy);
+                return Xp.callStaticMethod(clazz, factory, (Object) copy);
             } catch (Throwable t) {
                 last = unwrapReflective(t);
             }
@@ -1454,7 +1421,7 @@ final class SystemHooks {
         }
     }
 
-    private static String methodNameOf(XC_MethodHook.MethodHookParam param) {
+    private static String methodNameOf(Param param) {
         try {
             if (param != null && param.method instanceof Method) {
                 return ((Method) param.method).getName();
@@ -1531,9 +1498,9 @@ final class SystemHooks {
                 GNSS_HOOK, "gnss", true);
     }
 
-    private static final XC_MethodHook GNSS_HOOK = new XC_MethodHook() {
+    private static final Callback GNSS_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 if (currentLocation() == null) {
                     return;   // 未在模拟：透传真实卫星
@@ -1561,18 +1528,27 @@ final class SystemHooks {
         }
     };
 
+    /** {@code GnssStatus$Builder}：API 30+ 才公开，缺失时整段返回 null（透传真实卫星）。 */
+    private static final String GNSS_STATUS_BUILDER_CLASS = "android.location.GnssStatus$Builder";
+
     /** 用反射的 GnssStatus$Builder 造一套与主 App 一致的卫星（API 30+）。 */
     private static GnssStatus buildGnssStatus(List<Satellite> satellites) {
         try {
-            final Class<?> builderClass = XposedHelpers.findClass(
-                    "android.location.GnssStatus$Builder", GnssStatus.class.getClassLoader());
-            final Object builder = XposedHelpers.newInstance(builderClass);
+            final Class<?> builderClass =
+                    HookCompat.find(GnssStatus.class.getClassLoader(), GNSS_STATUS_BUILDER_CLASS);
+            if (builderClass == null) {
+                // Android 11 以下没有公开的 Builder：不造卫星（回调里保持真实值），只记一条日志
+                HookCompat.logCandidate(GNSS_STATUS_BUILDER_CLASS, false, 0, "system-gnss",
+                        "absent before API 30");
+                return null;
+            }
+            final Object builder = Xp.newInstance(builderClass);
             for (Satellite sat : satellites) {
-                XposedHelpers.callMethod(builder, "addSatellite",
+                Xp.callMethod(builder, "addSatellite",
                         sat.svid, sat.constellation, sat.cn0, sat.elevation, sat.azimuth,
                         sat.carrierHz, sat.usedInFix, sat.hasAlmanac, sat.hasEphemeris);
             }
-            return (GnssStatus) XposedHelpers.callMethod(builder, "build");
+            return (GnssStatus) Xp.callMethod(builder, "build");
         } catch (Throwable t) {
             return null;
         }
@@ -1921,12 +1897,12 @@ final class SystemHooks {
         }
         try {
             final Class<?> activityThread = Class.forName("android.app.ActivityThread");
-            Object thread = XposedHelpers.callStaticMethod(activityThread, "systemMain");
+            Object thread = Xp.callStaticMethod(activityThread, "systemMain");
             if (thread == null) {
-                thread = XposedHelpers.callStaticMethod(activityThread, "currentActivityThread");
+                thread = Xp.callStaticMethod(activityThread, "currentActivityThread");
             }
             if (thread != null) {
-                context = (Context) XposedHelpers.callMethod(thread, "getSystemContext");
+                context = (Context) Xp.callMethod(thread, "getSystemContext");
             }
         } catch (Throwable ignored) {
             // ignore
@@ -1948,7 +1924,7 @@ final class SystemHooks {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

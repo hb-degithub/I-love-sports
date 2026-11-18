@@ -19,9 +19,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * GNSS 卫星状态回放（v0.18.x）：让目标 App 从 {@code GnssStatus} / {@code LocationManager} 看到的
@@ -61,8 +61,6 @@ import de.robv.android.xposed.XposedHelpers;
  * NMEA、GnssNavigationMessage、system_server / HAL 层卫星状态、真实射频信号强度等）。
  */
 final class GnssReplay {
-
-    private static final String TAG = "[VLocHidden] ";
 
     // ------------------------------------------------------------------
     // JSON 契约（主 App 写入 steps 快照的 json 列，version=2）
@@ -172,8 +170,8 @@ final class GnssReplay {
 
         // ---- 回调注册 / 注销 ----
         try {
-            final int count = XposedBridge.hookAllMethods(
-                    LocationManager.class, "registerGnssStatusCallback", REGISTER_HOOK).size();
+            final int count = Xp.hookAllMethods(
+                    LocationManager.class, "registerGnssStatusCallback", REGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked LocationManager#registerGnssStatusCallback (" + count + " overload(s))");
@@ -182,8 +180,8 @@ final class GnssReplay {
             log("skip LocationManager#registerGnssStatusCallback: " + t);
         }
         try {
-            final int count = XposedBridge.hookAllMethods(
-                    LocationManager.class, "unregisterGnssStatusCallback", UNREGISTER_HOOK).size();
+            final int count = Xp.hookAllMethods(
+                    LocationManager.class, "unregisterGnssStatusCallback", UNREGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked LocationManager#unregisterGnssStatusCallback (" + count + " overload(s))");
@@ -203,11 +201,11 @@ final class GnssReplay {
 
     private static boolean hookGetter(String name, int kind, int field) {
         try {
-            final XC_MethodHook hook = new GetterHook(kind, field);
+            final Callback hook = new GetterHook(kind, field);
             if (kind == KIND_COUNT) {
-                XposedHelpers.findAndHookMethod(GnssStatus.class, name, hook);
+                Xp.hook(Xp.findMethodExact(GnssStatus.class, name), hook);
             } else {
-                XposedHelpers.findAndHookMethod(GnssStatus.class, name, int.class, hook);
+                Xp.hook(Xp.findMethodExact(GnssStatus.class, name, int.class), hook);
             }
             return true;
         } catch (Throwable t) {
@@ -221,7 +219,7 @@ final class GnssReplay {
      * 只有在原实现抛异常（例如真实 GnssStatus 的内部数组比我们声明的卫星数短）时才回落 0/false，
      * 保证“越界不崩”。
      */
-    private static final class GetterHook extends XC_MethodHook {
+    private static final class GetterHook extends Callback {
 
         private final int kind;
         private final int field;
@@ -232,7 +230,7 @@ final class GnssReplay {
         }
 
         @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        protected void after(Param param) {
             try {
                 final List<Satellite> satellites = activeSatellites();
                 if (satellites == null || satellites.isEmpty()) {
@@ -504,9 +502,9 @@ final class GnssReplay {
     // LocationManager#registerGnssStatusCallback / unregisterGnssStatusCallback
     // ==================================================================
 
-    private static final XC_MethodHook REGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback REGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 if (!(param.thisObject instanceof LocationManager)) {
                     return;
@@ -542,7 +540,7 @@ final class GnssReplay {
         }
 
         @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        protected void after(Param param) {
             try {
                 // 框架内部常见实现：registerGnssStatusCallback(callback) 会再调用带 handler /
                 // packageName 的重载。内层看到的是我们的 wrapper，不会再包一层；这里通过 wrapper
@@ -568,9 +566,9 @@ final class GnssReplay {
         }
     };
 
-    private static final XC_MethodHook UNREGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback UNREGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final GnssStatus.Callback target = findCallback(param.args);
                 if (target == null || target instanceof CallbackWrapper) {
@@ -1212,7 +1210,7 @@ final class GnssReplay {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

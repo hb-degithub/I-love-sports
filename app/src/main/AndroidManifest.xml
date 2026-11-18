@@ -112,6 +112,14 @@
             android:label="使用记录" />
 
         <!-- 环境快照：仅模拟期间暴露给 LSPosed 模块（无需权限，无数据时返回 0 行） -->
+        <!-- libxposed service 通道：LSPosed 通过 content://com.vloc.motion.XposedService
+             送 binder，应用侧才能拿到 remote preferences（新 API 后端下唯一的快照通道）。
+             缺这个 Provider 时 registerListener 永不回调、远程偏好恒不可用。 -->
+        <provider
+            android:name="io.github.libxposed.service.XposedProvider"
+            android:authorities="com.vloc.motion.XposedService"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
         <provider
             android:name=".service.EnvProvider"
             android:authorities="com.vloc.motion.env"

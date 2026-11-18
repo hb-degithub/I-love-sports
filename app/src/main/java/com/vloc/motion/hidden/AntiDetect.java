@@ -11,9 +11,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 反检测补强（v0.38.0）：补齐 {@link HookEntry} 之外几类常见「模拟位置指纹」。
@@ -34,7 +34,9 @@ import de.robv.android.xposed.XposedHelpers;
  */
 final class AntiDetect {
 
-    private static final String TAG = "[VLocHidden] ";
+    /** 本类要挂的两个框架类；都在 boot classloader，走 {@link HookCompat} 统一解析 + 候选日志。 */
+    private static final String LOCATION_CLASS = "android.location.Location";
+    private static final String LOCATION_MANAGER_CLASS = "android.location.LocationManager";
 
     private static volatile boolean sLoggedProviders;
     private static volatile boolean sLoggedNmea;
@@ -70,8 +72,10 @@ final class AntiDetect {
      */
     private static int hookProviderList(ClassLoader classLoader) {
         try {
-            Class<?> manager = XposedHelpers.findClass(
-                    "android.location.LocationManager", classLoader);
+            final Class<?> manager = locationManagerClass(classLoader);
+            if (manager == null) {
+                return 0;   // 类缺失：只记了候选日志，跳过本条 hook
+            }
             int count = 0;
             for (Method method : manager.getDeclaredMethods()) {
                 String name = method.getName();
@@ -84,9 +88,9 @@ final class AntiDetect {
                     continue;
                 }
                 try {
-                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    Xp.hook(method, new Callback() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void after(Param param) {
                             try {
                                 if (!StepReplay.snapshotActive()) {
                                     return;
@@ -142,13 +146,16 @@ final class AntiDetect {
      */
     private static int hookTimestampConsistency(ClassLoader classLoader) {
         try {
-            Class<?> location = XposedHelpers.findClass("android.location.Location", classLoader);
+            final Class<?> location = locationClass(classLoader);
+            if (location == null) {
+                return 0;   // 类缺失：只记了候选日志，跳过本条 hook
+            }
             int count = 0;
             for (String getter : new String[]{"getElapsedRealtimeNanos", "getElapsedRealtimeUncertaintyNanos"}) {
                 try {
-                    XposedHelpers.findAndHookMethod(location, getter, new XC_MethodHook() {
+                    Xp.hook(Xp.findMethodExact(location, getter), new Callback() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void after(Param param) {
                             try {
                                 if (!StepReplay.snapshotActive()) {
                                     return;
@@ -201,10 +208,13 @@ final class AntiDetect {
      */
     private static int hookAccuracyJitter(ClassLoader classLoader) {
         try {
-            Class<?> location = XposedHelpers.findClass("android.location.Location", classLoader);
-            XposedHelpers.findAndHookMethod(location, "getAccuracy", new XC_MethodHook() {
+            final Class<?> location = locationClass(classLoader);
+            if (location == null) {
+                return 0;   // 类缺失：只记了候选日志，跳过本条 hook
+            }
+            Xp.hook(Xp.findMethodExact(location, "getAccuracy"), new Callback() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                protected void after(Param param) {
                     try {
                         if (!StepReplay.snapshotActive()) {
                             return;
@@ -249,8 +259,10 @@ final class AntiDetect {
      */
     private static int hookNmea(ClassLoader classLoader) {
         try {
-            Class<?> manager = XposedHelpers.findClass(
-                    "android.location.LocationManager", classLoader);
+            final Class<?> manager = locationManagerClass(classLoader);
+            if (manager == null) {
+                return 0;   // 类缺失：只记了候选日志，跳过本条 hook
+            }
             // GpsStatus.NmeaListener（旧接口）与 OnNmeaMessageListener（API 24+）
             int count = 0;
             for (Method method : manager.getDeclaredMethods()) {
@@ -258,9 +270,9 @@ final class AntiDetect {
                     continue;
                 }
                 try {
-                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    Xp.hook(method, new Callback() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
+                        protected void after(Param param) {
                             try {
                                 if (!StepReplay.snapshotActive() || param.args == null) {
                                     return;
@@ -351,7 +363,7 @@ final class AntiDetect {
                 return;
             }
             // 旧接口 android.location.GpsStatus$NmeaListener
-            XposedHelpers.callMethod(listener, "onNmeaReceived", 0L, sentence);
+            Xp.callMethod(listener, "onNmeaReceived", 0L, sentence);
         } catch (Throwable t) {
             log("deliverNmea failed: " + t);
         }
@@ -366,9 +378,32 @@ final class AntiDetect {
     
     /** 加 {@code $} 前缀与 XOR 校验和，组成完整 NMEA 句子。 */
     
+    /**
+     * 解析 {@code android.location.Location}；缺失返回 null。
+     *
+     * <p>候选表只有一项（API 1 起就存在），仍统一走 {@link HookCompat#find}：任何 Throwable
+     * 都只变成一条 {@code hook candidate … found=false} 日志 + 本条 hook 跳过，绝不抛到框架层。
+     */
+    private static Class<?> locationClass(ClassLoader classLoader) {
+        final Class<?> clazz = HookCompat.find(classLoader, LOCATION_CLASS);
+        if (clazz == null) {
+            HookCompat.logCandidate(LOCATION_CLASS, false, 0, "anti-detect", "class absent");
+        }
+        return clazz;
+    }
+
+    /** 解析 {@code android.location.LocationManager}；缺失返回 null（同上）。 */
+    private static Class<?> locationManagerClass(ClassLoader classLoader) {
+        final Class<?> clazz = HookCompat.find(classLoader, LOCATION_MANAGER_CLASS);
+        if (clazz == null) {
+            HookCompat.logCandidate(LOCATION_MANAGER_CLASS, false, 0, "anti-detect", "class absent");
+        }
+        return clazz;
+    }
+
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }
