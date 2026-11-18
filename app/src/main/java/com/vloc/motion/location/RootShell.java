@@ -1,6 +1,6 @@
 package com.vloc.motion.location;
 
-import android.util.Log;
+import com.vloc.motion.core.VLog;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -70,7 +70,7 @@ public final class RootShell {
                 lastError = e;
             }
         }
-        Log.w(TAG, "su unavailable: " + (lastError == null ? "unknown" : lastError.getMessage()));
+        VLog.w(TAG, "su unavailable: " + (lastError == null ? "unknown" : lastError.getMessage()));
         return new Result(-1, "", lastError == null ? "su not found" : lastError.getMessage(), false);
     }
 

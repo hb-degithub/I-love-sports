@@ -26,7 +26,7 @@ import de.robv.android.xposed.XposedHelpers;
  * {@code service/SnapshotPrefs#KEY_TARGETS}）：
  * <pre>
  * world-readable prefs（{@code vloc_snapshot} 的 {@code targets} 键）     或
- * 套接字（Unix 抽象 {@code com.vloc.motion.snapshot}，请求 {@code TARGETS}）  或
+ * 套接字（Unix 抽象，名字见 prefs 的 {@code socket} key，请求 {@code TARGETS}）  或
  * content://com.vloc.motion.env/targets  →  单列 {@code json}、单行
  * {"enabled":true,"packages":["com.a","com.b"]}
  * </pre>

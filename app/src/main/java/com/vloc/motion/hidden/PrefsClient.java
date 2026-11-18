@@ -34,6 +34,7 @@ import de.robv.android.xposed.XposedBridge;
  *   loc       {"active":bool,"lat":..,"lon":..,...}   （与 /location 同款）
  *   gnss      [{"svid":..,"const":..,...}]            （与 /gnss 同款）
  *   targets   {"enabled":bool,"packages":["pkg1",...]}（与 /targets 同款）
+ *   socket    vloc-<16 hex>                             （本会话抽象套接字名，每次会话随机）
  * </pre>
  * 解析<b>不在</b>这里做：调用方复用既有的 {@code parseLocationJson} /
  * {@code parseSatellitesJson} / {@code TargetScope.parse()}，保证三条通道语义完全一致。
@@ -74,6 +75,14 @@ final class PrefsClient {
 
     /** key：作用域配置（与 {@code /targets} 相同的 {@code {"enabled":..,"packages":[..]}}）。 */
     static final String KEY_TARGETS = "targets";
+
+    /**
+     * key：本会话的抽象套接字名（{@code vloc-<16 hex>}，纯字符串、无坐标）。
+     *
+     * <p>必须与 {@code service/SnapshotPrefs.KEY_SOCKET} 逐字一致。{@code SnapshotClient}
+     * 用它连接主 App：名字每次会话随机，所以不能写死在代码里。
+     */
+    static final String KEY_SOCKET = "socket";
 
     /** 实例失效后的重建退避：既不错过主 App 之后才写出的文件，也不会每次读都重建。 */
     private static final long RESOLVE_RETRY_MS = 5_000L;

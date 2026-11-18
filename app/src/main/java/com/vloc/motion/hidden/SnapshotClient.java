@@ -4,6 +4,8 @@ import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.SystemClock;
 
+import com.vloc.motion.core.VLog;
+
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -14,6 +16,7 @@ import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -25,6 +28,13 @@ import de.robv.android.xposed.XposedBridge;
  * （logcat 另有 {@code Isolated process not allowed to call getContentProvider}），
  * 系统级定位替换因此拿不到快照。抽象套接字不经过 Provider 的权限校验，
  * 也不受调用方 uid 的限制，是更稳的通道。
+ *
+ * <p><b>连哪个名字</b>：主 App 现在<b>每次会话随机生成</b> {@code vloc-<16 hex>} 的抽象名
+ * （固定名 {@code com.vloc.motion.snapshot} 会暴露在 {@code /proc/net/unix} 里），
+ * 并把名字写进 world-readable prefs 的 {@code socket} key。所以本类每次连接前
+ * <b>先读 prefs</b>（{@link PrefsClient#read(String)}），读到就用；读不到 / 为空 /
+ * 值非法 → 回退旧固定名 {@link #LEGACY_SOCKET_NAME}（兼容旧版本主 App）。名字本身
+ * 在任何日志里都只出现前 6 个字符（{@link VLog#mask(String)}）。
  *
  * <p><b>协议</b>（与主 App 侧严格一致，<b>单次连接一次请求即关闭</b>）：
  * <pre>
@@ -58,8 +68,13 @@ import de.robv.android.xposed.XposedBridge;
  */
 final class SnapshotClient {
 
-    /** 抽象命名空间名称（主 App 侧 {@code LocalServerSocket} 同名；不带前导 '@'）。 */
-    static final String SOCKET_NAME = "com.vloc.motion.snapshot";
+    /**
+     * 旧版本主 App 用过的固定抽象名：prefs 里读不到本会话名字时回退到它（<b>兼容旧版本</b>）。
+     *
+     * <p>新版主 App 每次会话都会生成 {@code vloc-<16 hex>} 的随机名并写进
+     * world-readable prefs（key {@link PrefsClient#KEY_SOCKET}），本类每次连接前先读它。
+     */
+    static final String LEGACY_SOCKET_NAME = "com.vloc.motion.snapshot";
 
     /** 请求行（契约固定，一行一个请求）。 */
     static final String REQ_LOCATION = "LOC";
@@ -71,6 +86,13 @@ final class SnapshotClient {
 
     /** 一行响应的上限；超过即截断（正常响应只有几十到几百字节）。 */
     private static final int MAX_LINE_BYTES = 8 * 1024;
+
+    /** 合法套接字名的最大长度（Linux {@code sun_path} 上限 108，这里留足余量并按字节算）。 */
+    private static final int MAX_SOCKET_NAME_CHARS = 64;
+
+    /** 合法套接字名的字符集：只认 {@code [A-Za-z0-9._-]}，脏 prefs 值一律当"没有名字"。 */
+    private static final Pattern SOCKET_NAME_PATTERN =
+            Pattern.compile("[A-Za-z0-9._-]{1," + MAX_SOCKET_NAME_CHARS + "}");
 
     /** 失败日志最多记几种异常类（每种一条），防止极端情况下刷屏。 */
     private static final int MAX_ERROR_KINDS = 16;
@@ -84,6 +106,10 @@ final class SnapshotClient {
     /** 第一次“套接字失败 → 回退 Provider”的原因，每进程只记一条。 */
     private static final AtomicBoolean sLoggedFallback = new AtomicBoolean();
 
+    /** 名字来源日志（每进程各一条）：从 prefs 读到随机名 / 回退旧固定名。 */
+    private static final AtomicBoolean sLoggedNameFromPrefs = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedNameFallback = new AtomicBoolean();
+
     /** “首成功一次”日志标记（按请求各一条，最多 3 条/进程）。 */
     private static final AtomicBoolean sLoggedLocationOk = new AtomicBoolean();
     private static final AtomicBoolean sLoggedGnssOk = new AtomicBoolean();
@@ -95,6 +121,11 @@ final class SnapshotClient {
     /**
      * 连接抽象套接字 → 发一行请求 → 读一行响应 → 关闭。
      *
+     * <p><b>连哪个名字</b>：先按 {@link #socketNames()} 取候选——prefs 里本会话的随机名
+     * 优先，读不到再回退旧固定名 {@link #LEGACY_SOCKET_NAME}（兼容旧版本主 App）。
+     * 一个名字连不上（名字没人监听 → {@code connect} 立刻失败，几乎不耗预算）就换下一个；
+     * 连上了但读写失败则<b>不</b>再换名重试（服务就在那儿，只是这次交换失败了）。
+     *
      * @param request   请求行内容（{@link #REQ_LOCATION} / {@link #REQ_GNSS} / {@link #REQ_TARGETS}）
      * @param timeoutMs 整次交换的超时上限；≤0 时用 {@link #DEFAULT_TIMEOUT_MS}
      * @return 非空 = 一行响应；{@code ""} = 主 App 回空行（无数据）；{@code null} = 失败（调用方回退）
@@ -105,30 +136,99 @@ final class SnapshotClient {
         }
         final int timeout = timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
         final long startedAt = SystemClock.elapsedRealtime();
-        LocalSocket socket = null;
-        try {
-            socket = new LocalSocket();
-            socket.connect(new LocalSocketAddress(SOCKET_NAME,
-                    LocalSocketAddress.Namespace.ABSTRACT));
-            // 读超时只约束 read/write：扣掉 connect 已花掉的时间，整次交换仍 ≤ timeout。
-            // 若 connect 已吃满预算，这里只剩 1ms，read 会立刻抛 SocketTimeoutException。
+        Throwable lastError = null;
+        for (String name : socketNames()) {
             final long spent = SystemClock.elapsedRealtime() - startedAt;
-            socket.setSoTimeout((int) Math.max(1L, timeout - spent));
-            final OutputStream out = socket.getOutputStream();
-            if (out == null) {
-                return null;   // 不会发生，兜底避免 NPE
+            if (spent >= timeout) {
+                break;   // 预算用完：不再尝试下一个候选名
             }
-            out.write((request + "\n").getBytes(StandardCharsets.US_ASCII));
-            out.flush();
-            final String line = readOneLine(socket.getInputStream());
-            noteSuccess(request);
-            return line;
+            LocalSocket socket = null;
+            try {
+                socket = new LocalSocket();
+                socket.connect(new LocalSocketAddress(name,
+                        LocalSocketAddress.Namespace.ABSTRACT));
+            } catch (Throwable t) {
+                // 这个名字没人监听（旧版本 / 会话已停 / prefs 里是过期名）：换下一个候选
+                closeQuietly(socket);
+                lastError = t;
+                continue;
+            }
+            try {
+                // 读超时只约束 read/write：扣掉 connect 已花掉的时间，整次交换仍 ≤ timeout。
+                // 若 connect 已吃满预算，这里只剩 1ms，read 会立刻抛 SocketTimeoutException。
+                final long spentNow = SystemClock.elapsedRealtime() - startedAt;
+                socket.setSoTimeout((int) Math.max(1L, timeout - spentNow));
+                final OutputStream out = socket.getOutputStream();
+                if (out == null) {
+                    return null;   // 不会发生，兜底避免 NPE
+                }
+                out.write((request + "\n").getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                final String line = readOneLine(socket.getInputStream());
+                noteSuccess(request);
+                return line;
+            } catch (Throwable t) {
+                // 连上了却读写失败：失败一律静默，只记一条低频日志，返回 null 让调用方回退
+                noteFailure(request, t);
+                return null;
+            } finally {
+                closeQuietly(socket);
+            }
+        }
+        noteFailure(request, lastError != null ? lastError
+                : new IllegalStateException("no usable socket name"));
+        return null;
+    }
+
+    // ================================================================ 套接字名（prefs → 旧固定名）
+
+    /**
+     * 本次连接要尝试的名字，按优先级排列（去重，至少有一个旧固定名兜底）。
+     *
+     * <p>顺序：world-readable prefs 里的 {@code socket}（本会话随机名）→
+     * {@link #LEGACY_SOCKET_NAME}（旧版本主 App / prefs 不可用时唯一能连上的名字）。
+     */
+    private static String[] socketNames() {
+        final String fromPrefs = socketNameFromPrefs();
+        if (fromPrefs == null) {
+            return new String[]{LEGACY_SOCKET_NAME};
+        }
+        if (fromPrefs.equals(LEGACY_SOCKET_NAME)) {
+            return new String[]{fromPrefs};   // 不重复尝试同一个名字
+        }
+        return new String[]{fromPrefs, LEGACY_SOCKET_NAME};
+    }
+
+    /**
+     * 从 world-readable prefs 读本会话的随机名。
+     *
+     * <p>每次连接都读（{@link PrefsClient#read} 只做一次 {@code reload()} 的 stat，很便宜）：
+     * 名字<b>每次会话都会变</b>，缓存下来会在"停止后重新开始"时连到上一场的死名字。
+     *
+     * <p>读不到（旧版本主 App 没写 / LSPosed 的 New XSharedPreferences 没启用 / 文件不可读）
+     * → 返回 {@code null}，调用方回退旧固定名。值不合法（空、超长、非法字符，例如脏 prefs）
+     * 同样当"没有"处理，绝不把垃圾字符串丢进 {@link LocalSocketAddress}。
+     *
+     * @return 合法名字；{@code null} = 拿不到
+     */
+    private static String socketNameFromPrefs() {
+        try {
+            final String value = PrefsClient.read(PrefsClient.KEY_SOCKET);
+            if (value == null) {
+                noteNameFallback();
+                return null;
+            }
+            final String name = value.trim();
+            if (name.isEmpty() || !SOCKET_NAME_PATTERN.matcher(name).matches()) {
+                noteNameFallback();
+                return null;
+            }
+            noteNameFromPrefs(name);
+            return name;
         } catch (Throwable t) {
-            // 失败一律静默：只记一条低频日志，返回 null 让调用方回退 Provider
-            noteFailure(request, t);
+            // 读 prefs 绝不影响调用方：按"没有名字"处理
+            noteNameFallback();
             return null;
-        } finally {
-            closeQuietly(socket);
         }
     }
 
@@ -214,6 +314,35 @@ final class SnapshotClient {
             return sLoggedTargetsOk;
         }
         return null;
+    }
+
+    /**
+     * 首次从 prefs 读到本会话随机名：一行，便于现场确认"随机名通道生效"
+     * （名字<b>脱敏</b>，日志里不出现完整名字）。
+     */
+    private static void noteNameFromPrefs(String name) {
+        try {
+            if (sLoggedNameFromPrefs.compareAndSet(false, true)) {
+                log("socket name from prefs: " + VLog.mask(name));
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /**
+     * 首次读不到名字（旧版本主 App / prefs 不可用）：一行，说明改用旧固定名。
+     * 名字同样脱敏。
+     */
+    private static void noteNameFallback() {
+        try {
+            if (sLoggedNameFallback.compareAndSet(false, true)) {
+                log("socket name missing in prefs, fallback to legacy "
+                        + VLog.mask(LEGACY_SOCKET_NAME));
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
     }
 
     private static void log(String message) {

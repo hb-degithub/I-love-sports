@@ -1,5 +1,6 @@
 package com.vloc.motion.service;
 
+import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
@@ -8,6 +9,7 @@ import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Process;
+import android.util.Log;
 
 import com.vloc.motion.core.RouteStore;
 
@@ -72,6 +74,13 @@ public final class EnvProvider extends ContentProvider {
     public boolean onCreate() {
         return true;
     }
+
+    // ---------------------------------------------------------------- 组件开关（空闲期不暴露）
+    // 说明：本 Provider 在 manifest 里是 exported=true（无权限），空闲期也保持启用。
+    // 曾尝试「只在会话期间启用、空闲期禁用组件」以降低可发现性，但同一 authority 还承载
+    // 模块心跳（hookbeat）与作用域名单（targets）：禁用会让模块开机加载时上报失败、
+    // 作用域在 prefs/套接字都不可用时静默失效。收益（隐藏一个 authority，而包名本身仍可见）
+    // 远小于代价，故保持常驻启用；快照路径本身在非会话期返回 0 行。
 
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,

@@ -8,9 +8,9 @@ import android.location.Location;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.SystemClock;
-import android.util.Log;
 
 import com.vloc.motion.core.Fix;
+import com.vloc.motion.core.VLog;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -166,20 +166,20 @@ public final class TestProviderInjector {
         // 注意：不清 addedProviders——prepare() 之前若已注册过 Provider，release() 仍要移除它们
 
         if (!LocationSwitch.isSystemLocationEnabled(context)) {
-            Log.w(TAG, "system location switch is off, skip test provider takeover");
+            VLog.w(TAG, "system location switch is off, skip test provider takeover");
             throw new SecurityException(LocationSwitch.DISABLED_MSG);
         }
         for (String provider : providers) {
             if (takeOver(provider)) {
                 preparedProviders.add(provider);
-                Log.d(TAG, "test provider ready: " + provider);
+                VLog.d(TAG, "test provider ready: " + provider);
             }
         }
         prepared = !preparedProviders.isEmpty();
         if (!prepared) {
             throw new SecurityException(describe());
         }
-        Log.i(TAG, "test providers: " + describe());
+        VLog.i(TAG, "test providers: " + describe());
     }
 
     /**
@@ -259,9 +259,9 @@ public final class TestProviderInjector {
             String message = e.getMessage();
             detail = reason + "（" + e.getClass().getSimpleName()
                     + (message == null ? "" : ": " + message) + "）";
-            Log.w(TAG, "test provider failed: " + provider + " - " + detail, e);
+            VLog.w(TAG, "test provider failed: " + provider + " - " + detail, e);
         } else {
-            Log.w(TAG, "test provider failed: " + provider + " - " + detail);
+            VLog.w(TAG, "test provider failed: " + provider + " - " + detail);
         }
         failedProviders.add(provider);
         failureReasons.put(provider, detail);
@@ -270,7 +270,7 @@ public final class TestProviderInjector {
     /** 记录"系统里已有这条 test provider"：只有它才能让 release() 真正清干净。 */
     private void markAdded(String provider) {
         if (addedProviders.add(provider)) {
-            Log.d(TAG, "test provider registered, release() will remove it: " + provider);
+            VLog.d(TAG, "test provider registered, release() will remove it: " + provider);
         }
     }
 
@@ -321,13 +321,13 @@ public final class TestProviderInjector {
             } catch (SecurityException e) {
                 // 运行中被系统收回（appop 被撤销 / provider 被替换）：只放弃这一个，
                 // 其余仍可用的 Provider 继续注入——否则会重演"一个失败废掉全部"。
-                Log.w(TAG, "push rejected for " + provider + ", giving it up", e);
+                VLog.w(TAG, "push rejected for " + provider + ", giving it up", e);
                 if (lost == null) {
                     lost = new ArrayList<>();
                 }
                 lost.add(provider);
             } catch (Exception e) {
-                Log.w(TAG, "push failed for " + provider + ": " + e);
+                VLog.w(TAG, "push failed for " + provider + ": " + e);
             }
         }
         if (lost != null) {
@@ -343,7 +343,7 @@ public final class TestProviderInjector {
                 prepared = false;
                 throw new SecurityException("所有测试 Provider 都已失效：" + describe());
             }
-            Log.w(TAG, "test providers now: " + describe());
+            VLog.w(TAG, "test providers now: " + describe());
         }
     }
 
@@ -356,7 +356,7 @@ public final class TestProviderInjector {
         for (String name : providerNames) {
             try {
                 lm.removeTestProvider(name);
-                Log.i(TAG, "cleaned leftover test provider: " + name);
+                VLog.i(TAG, "cleaned leftover test provider: " + name);
             } catch (Exception ignored) {
                 // 不是测试 Provider 或权限不足：忽略
             }
@@ -394,7 +394,7 @@ public final class TestProviderInjector {
             try {
                 locationManager.removeTestProvider(provider);
             } catch (Exception e) {
-                Log.w(TAG, "remove test provider failed: " + provider + " " + e);
+                VLog.w(TAG, "remove test provider failed: " + provider + " " + e);
             }
         }
         addedProviders.clear();
@@ -412,7 +412,7 @@ public final class TestProviderInjector {
         try {
             DIAG_EXECUTOR.execute(this::logPassiveResidual);
         } catch (RejectedExecutionException e) {
-            Log.w(TAG, "skip passive residual check: executor rejected", e);
+            VLog.w(TAG, "skip passive residual check: executor rejected", e);
         }
     }
 
@@ -430,7 +430,7 @@ public final class TestProviderInjector {
         try {
             Location passive = locationManager.getLastKnownLocation("passive");
             if (passive != null && passive.isFromMockProvider()) {
-                Log.i(TAG, "passive still holds the last mock location "
+                VLog.i(TAG, "passive still holds the last mock location "
                         + "(system-level mirror, not removable via test-provider APIs)");
             }
         } catch (RuntimeException ignored) {

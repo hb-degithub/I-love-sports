@@ -5,14 +5,19 @@ plugins {
 android {
     namespace 'com.vloc.motion'
     compileSdk 35
+
+    // VLog 依赖 BuildConfig.DEBUG 区分 debug/release；AGP 8 默认不生成该类，必须显式打开。
+    buildFeatures {
+        buildConfig true
+    }
     buildToolsVersion '35.0.0'
 
     defaultConfig {
         applicationId "com.vloc.motion"
         minSdk 26
         targetSdk 34
-        versionCode 82
-        versionName "0.44.0"
+        versionCode 83
+        versionName "0.45.0"
         resourceConfigurations += ['zh', 'en']
     }
 

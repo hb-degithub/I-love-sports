@@ -4,7 +4,6 @@ import android.app.NotificationManager;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import com.vloc.motion.location.RootShell;
 import com.vloc.motion.service.SnapshotPrefs;
@@ -43,7 +42,7 @@ import java.util.concurrent.TimeUnit;
  *       {@code "snapshot_xml=ok gnss_snapshot=ok overlay=ok notification=ok appop=ok
  *       logcat=skipped(disabled) tmp_files=skipped(no root)"}，
  *       供「使用记录」与「设置页状态」直接展示，也用于日志
- *       {@code Log.i("VLocCleanup", "cleanup: ...")}。</li>
+ *       {@code VLog.i("VLocCleanup", "cleanup: ...")}。</li>
  * </ol>
  *
  * <p><b>调用时机</b>：{@code LocationService.stopInternal()} 的收尾阶段（会话已经停下、
@@ -325,7 +324,7 @@ public final class TraceCleaner {
             thread.start();
         } catch (Throwable t) {
             // 线程起不来（极端情况）：退化成同步执行，至少别把痕迹留着
-            Log.w(TAG, "cleanup thread start failed, run inline: " + t);
+            VLog.w(TAG, "cleanup thread start failed, run inline: " + t);
             Result result = cleanupBlocking(app, options);
             if (callback != null) {
                 callback.onFinished(result);
@@ -360,10 +359,10 @@ public final class TraceCleaner {
         lastResult = result;
         lastFinishedAtMs = finished;
         // 停止流程里唯一的一条清理日志：项=结果 逐项列出，事后可从 logcat 复盘
-        Log.i(TAG, "cleanup: " + result.summary());
+        VLog.i(TAG, "cleanup: " + result.summary());
         for (Item item : result.items) {
             if (item.status == Status.FAILED) {
-                Log.w(TAG, "cleanup item failed: " + item);
+                VLog.w(TAG, "cleanup item failed: " + item);
             }
         }
         return result;
@@ -612,7 +611,7 @@ public final class TraceCleaner {
         try {
             return RootShell.su(command, Math.max(1000L, opts.rootTimeoutMs));
         } catch (Throwable t) {
-            Log.w(TAG, "su threw: " + t);
+            VLog.w(TAG, "su threw: " + t);
             return null;
         }
     }
@@ -703,7 +702,7 @@ public final class TraceCleaner {
                 }
             });
         } catch (Throwable t) {
-            Log.w(TAG, "post to main failed, run inline: " + t);
+            VLog.w(TAG, "post to main failed, run inline: " + t);
             action.run();
             return true;
         }

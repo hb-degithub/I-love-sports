@@ -42,9 +42,15 @@
         </intent>
     </queries>
 
+    <!-- 备份加固：备份/迁移会带出路线库、使用记录、作用域名单、快照名等落盘痕迹。
+         allowBackup=false 关掉自动备份；fullBackupContent="false" 是 API<31 的另写法
+         （部分 ROM / 旧框架只看这一条）；dataExtractionRules 是 API 31+ 的正式规则，
+         两份规则文件里一个 include 都没有，等价于"任何数据都不备份、不迁移"。 -->
     <application
         android:name=".App"
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
         android:icon="@drawable/ic_app"
         android:label="@string/app_name"
         android:supportsRtl="true"

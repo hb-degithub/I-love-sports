@@ -665,7 +665,7 @@ final class HookHeartbeat {
      *
      * <p>第一行仍是原有摘要 {@code heartbeat failed: <简单类名>}（老日志的匹配口径不变）；
      * 第二行起是 message 与前 {@value #STACK_FRAME_LIMIT} 层堆栈，信息量与
-     * {@code Log.w(TAG, msg, throwable)} 等价。这里仍走 {@link XposedBridge#log(String)}，
+     * {@code android.util.Log.w(TAG, msg, throwable)} 等价。这里仍走 {@link XposedBridge#log(String)}，
      * 因为真机证据（{@code [VLocHidden] heartbeat failed: ...}）就来自这条通道。
      */
     private static void logThrowableOnce(Throwable t) {

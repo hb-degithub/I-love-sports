@@ -5,9 +5,9 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.util.Log;
 
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.VLog;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -39,6 +39,7 @@ import java.util.Set;
  *             "acc":..,"satellites":..,"updatedAt":..}   ← {@link LocationSession#toJson()} 原样
  *   gnss     [{"svid":..,"const":..,...}, ...]            ← {@link GnssSession#json} 原样
  *   targets  {"enabled":bool,"packages":["pkg1",...]}     ← 与 /targets 同款
+ *   socket   vloc-&lt;16 hex&gt;                                ← 本会话的抽象套接字名（每次随机）
  * </pre>
  *
  * <p><b>写入节流</b>：
@@ -52,7 +53,7 @@ import java.util.Set;
  *
  * <p><b>降级</b>：LSPosed 未启用该机制（旧版本 / 模块元数据不足）时，
  * {@code getSharedPreferences(..., MODE_WORLD_READABLE)} 会抛 {@code SecurityException}：
- * 这里只记一条 {@code Log.w("VLocPrefs", "world-readable prefs unavailable: ...")}、
+ * 这里只记一条 {@code VLog.w("VLocPrefs", "world-readable prefs unavailable: ...")}、
  * 置 {@code available=false} 并<b>不再尝试</b>，模块照旧走套接字 / ContentProvider 回退。
  *
  * <p><b>生命周期</b>：{@link LocationService} 在会话启动处 {@link #start(Context)}、
@@ -76,6 +77,16 @@ public final class SnapshotPrefs {
 
     /** key：作用域配置（与 {@code /targets} 相同的 {@code {"enabled":..,"packages":[..]}}）。 */
     public static final String KEY_TARGETS = "targets";
+
+    /**
+     * key：本会话的 Unix 抽象套接字名（纯字符串，<b>不含</b>任何坐标）。
+     *
+     * <p>值的格式是 {@code vloc-<16 hex>}，每次会话随机（见 {@link SnapshotServer}）。
+     * 模块侧 {@code hidden/PrefsClient} 读它，{@code hidden/SnapshotClient} 用它连接：
+     * 名字不再写死在代码里，{@code /proc/net/unix} 里也就看不到
+     * {@code com.vloc.motion.snapshot} 这种可识别字符串。
+     */
+    public static final String KEY_SOCKET = "socket";
 
     /** 唯一实例：与 {@link LocationSession}、{@link GnssSession} 等通道单例并列。 */
     public static final SnapshotPrefs INSTANCE = new SnapshotPrefs();
@@ -180,7 +191,7 @@ public final class SnapshotPrefs {
             }
         } catch (Throwable t) {
             // 打开 / 排程失败都不能影响会话启动
-            Log.w(TAG, "start failed: " + t);
+            VLog.w(TAG, "start failed: " + t);
         }
     }
 
@@ -206,14 +217,17 @@ public final class SnapshotPrefs {
             }
             // 清掉卫星表：下一次会话会重新采集，避免把上一场的卫星表继续喂给模块。
             // loc 覆盖成 active=false：模块解析出"未激活"立刻透传真实定位。
+            // socket 也一并删掉：会话结束后那份随机名已经指向没人监听的 socket，
+            // 留着只会让模块白连一次（连不上再走 ContentProvider，功能不坏但多绕一圈）。
             target.edit()
                     .putString(KEY_LOC, INACTIVE_LOC_JSON)
                     .remove(KEY_GNSS)
+                    .remove(KEY_SOCKET)
                     .apply();
             lastGnssJson = null;
         } catch (Throwable t) {
             // 收尾失败不影响会话停止（模块还有陈旧守卫兜底）
-            Log.w(TAG, "stop failed: " + t);
+            VLog.w(TAG, "stop failed: " + t);
         }
     }
 
@@ -229,6 +243,60 @@ public final class SnapshotPrefs {
      */
     public boolean isRunning() {
         return running;
+    }
+
+    // ---------------------------------------------------------------- 套接字名（会话级随机）
+
+    /**
+     * 发布本会话的 Unix 抽象套接字名，供模块侧 {@code hidden/SnapshotClient} 连接。
+     *
+     * <p><b>时序契约</b>：{@link SnapshotServer} 先随机会话名、再调本方法、<b>最后</b>才
+     * {@code LocalServerSocket} 绑定——名字先落到 prefs，模块一读就知道该连哪儿；
+     * 反过来（先绑定再写名字）会让模块在最开始的几百毫秒里读不到名字、白白回退。
+     *
+     * <p><b>为什么这里用 {@link SharedPreferences.Editor#commit()} 而不是 {@code apply()}</b>：
+     * {@code apply()} 异步落盘，模块可能在新值落地前就读（它每次连接都读），读到旧值就会
+     * 连错名字。这个名字只有 21 字节，一次同步写的代价可以忽略；而且本方法只由
+     * {@link SnapshotServer} 的守护线程调用（<b>不在主线程</b>），不会拖住 UI。
+     *
+     * <p><b>降级</b>：LSPosed 的 New XSharedPreferences 没启用时打不开 world-readable
+     * prefs，返回 false——套接字仍按随机名绑定，只是模块读不到名字，只能走
+     * ContentProvider 回退（调用方会记一条日志说明这一点）。
+     *
+     * @param context 任意 Context（只在首次打开 prefs 时用到）
+     * @param name    本会话的抽象套接字名
+     * @return true = 已写进 prefs；false = prefs 不可用（降级）
+     */
+    public boolean publishSocketName(Context context, String name) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        final SharedPreferences opened;
+        try {
+            synchronized (lock) {
+                if (context != null && appContext == null) {
+                    final Context app = context.getApplicationContext();
+                    appContext = app != null ? app : context;
+                }
+                if (!openLocked()) {
+                    return false;   // 打不开：模块只能走 ContentProvider 回退
+                }
+                opened = prefs;
+            }
+        } catch (Throwable t) {
+            VLog.w(TAG, "publish socket name failed: " + t);
+            return false;
+        }
+        if (opened == null) {
+            return false;
+        }
+        try {
+            // 同步落盘：写在这里而不是持锁写，避免主线程恰好调 start()/stop() 时被磁盘 I/O 卡住
+            return opened.edit().putString(KEY_SOCKET, name).commit();
+        } catch (Throwable t) {
+            VLog.w(TAG, "publish socket name failed: " + t);
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------- 定时写入
@@ -312,7 +380,7 @@ public final class SnapshotPrefs {
      *
      * <p><b>降级契约</b>：{@code SecurityException} 说明 LSPosed 的 New XSharedPreferences
      * 未启用（{@code xposedminversion<93} / {@code xposedsharedprefs} 缺失 / 模块没重新注册），
-     * 记一条 {@code Log.w} 后把 {@code available} 置 false、{@code unavailable} 置 true，
+     * 记一条 {@code VLog.w} 后把 {@code available} 置 false、{@code unavailable} 置 true，
      * 本次进程内<b>不再尝试</b>——模块的套接字 / Provider 回退照常工作。
      *
      * @return true = 可写；false = 本进程不写 prefs
@@ -338,12 +406,12 @@ public final class SnapshotPrefs {
                 unavailable = true;
                 prefs = null;
                 available = false;
-                Log.w(TAG, "world-readable prefs unavailable: getSharedPreferences returned null");
+                VLog.w(TAG, "world-readable prefs unavailable: getSharedPreferences returned null");
                 return false;
             }
             prefs = opened;
             available = true;
-            Log.i(TAG, "world-readable prefs ready: " + PREFS_NAME
+            VLog.i(TAG, "world-readable prefs ready: " + PREFS_NAME
                     + " (LSPosed New XSharedPreferences)");
             return true;
         } catch (SecurityException e) {
@@ -351,14 +419,14 @@ public final class SnapshotPrefs {
             prefs = null;
             available = false;
             // 这条日志是现场判定"机制没启用"的唯一线索
-            Log.w(TAG, "world-readable prefs unavailable: " + e);
+            VLog.w(TAG, "world-readable prefs unavailable: " + e);
             return false;
         } catch (Throwable t) {
             // 兜底：任何异常都按"不可用"处理，绝不影响会话
             unavailable = true;
             prefs = null;
             available = false;
-            Log.w(TAG, "world-readable prefs unavailable: " + t);
+            VLog.w(TAG, "world-readable prefs unavailable: " + t);
             return false;
         }
     }

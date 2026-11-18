@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 12（API 31）起的备份 / 设备迁移规则。
+
+    本应用不备份、不迁移任何数据：
+      - 没有 <include>，且每个可备份 domain 都用 <exclude path="."/> 全量排除；
+        （Android 的规则是"没被 include 的一律不备份"，两个方向都写明，
+        避免个别 ROM 对"空规则"的解析差异）
+      - <cloud-backup> 与 <device-transfer> 各自独立，云备份与换机迁移都不带出数据；
+      - disableIfNoEncryptionCapabilities 在这里无意义（本来就什么都不备份），不写。
+
+    为什么必须这么严：shared_prefs 里有路线库、使用记录（会话历史）、作用域目标包名、
+    环境快照名与最后一次坐标；files/databases 里还有星表与缓存。云备份 / 换机迁移会把
+    这些原样搬到另一台设备（或云端），等同于把使用痕迹带出本机。
+
+    注意与 manifest 的配合（两条路径都要管）：
+      - API 31+ ：android:dataExtractionRules="@xml/data_extraction_rules"（本文件）；
+      - API <31：android:fullBackupContent="false" + android:allowBackup="false"
+                  （见 app/src/main/AndroidManifest.xml 的 <application>）。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>

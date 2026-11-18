@@ -43,8 +43,9 @@ import de.robv.android.xposed.XposedHelpers;
  *         <li><b>world-readable prefs</b>（首选，LSPosed 官方 New XSharedPreferences）：
  *             主 App 写 {@code vloc_snapshot} prefs，这里用 {@link PrefsClient} 读，
  *             不经过 Provider 权限模型、也不需要 SELinux 放行 connectto；</li>
- *         <li>主 App 的 Unix 抽象套接字 {@code com.vloc.motion.snapshot}
- *             （{@link SnapshotClient}），请求 {@code LOC} / {@code GNSS}；</li>
+ *         <li>主 App 的 Unix 抽象套接字（{@link SnapshotClient}），名字每次会话随机、
+ *             从 prefs 的 {@code socket} key 读（旧版本才用固定名
+ *             {@code com.vloc.motion.snapshot}），请求 {@code LOC} / {@code GNSS}；</li>
  *         <li>ContentProvider {@code content://com.vloc.motion.env/location}（定位）与
  *             {@code /gnss}（卫星）——Android 17 的 system_server（uid 1000）读 Provider 会抛
  *             {@code SecurityException}（{@code Isolated process not allowed to call getContentProvider}），

@@ -6,9 +6,9 @@ import android.location.LocationManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.VLog;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -64,11 +64,11 @@ public final class GnssCollector {
         try {
             lm.registerGnssStatusCallback(statusCallback, handler);
         } catch (SecurityException e) {
-            Log.w(TAG, "registerGnssStatusCallback denied", e);
+            VLog.w(TAG, "registerGnssStatusCallback denied", e);
             callback.onSnapshot(loadSaved(context));
             return;
         } catch (RuntimeException e) {
-            Log.w(TAG, "registerGnssStatusCallback failed", e);
+            VLog.w(TAG, "registerGnssStatusCallback failed", e);
             callback.onSnapshot(loadSaved(context));
             return;
         }

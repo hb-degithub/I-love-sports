@@ -6,9 +6,9 @@ import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.Process;
-import android.util.Log;
 
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.VLog;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.Locale;
 
 /**
@@ -48,17 +49,36 @@ import java.util.Locale;
  * <p><b>生命周期</b>：{@link LocationService} 在会话启动时 {@link #start(Context)}、
  * 在 {@code stopInternal} 收尾时 {@link #stop()}；进程被杀时 socket 随进程一起释放，
  * 不需要额外处理。{@link #start(Context)} / {@link #stop()} 都是幂等的。
+ *
+ * <p><b>套接字名</b>：<b>不再</b>使用固定名 {@code com.vloc.motion.snapshot}——每次会话
+ * 现生成一个 {@code vloc-<16 hex>}（16 个十六进制字符，64 bit 熵，来自 {@link SecureRandom}），
+ * 会话结束即丢弃。原因：抽象套接字在会话期间常驻，{@code /proc/net/unix} 对整机可读，
+ * 固定名里的 {@code vloc} 是一眼可认的指纹。名字的传递走已有的 world-readable prefs
+ * （{@link SnapshotPrefs#KEY_SOCKET}），时序固定为
+ * <b>生成名 → 写 prefs → 绑定</b>（见 {@link #acceptLoop(int, String)}）：
+ * 模块每次连接前先读 prefs 拿名字，读到就用，读不到退回旧固定名（兼容旧版本）。
  */
 public final class SnapshotServer {
 
     /**
-     * 抽象命名空间套接字名。
+     * 旧版本用过的固定抽象名，<b>只</b>留给模块侧
+     * （{@code hidden/SnapshotClient#LEGACY_SOCKET_NAME}）做兼容回退。
      *
-     * <p><b>契约</b>：模块侧必须用
-     * {@code new LocalSocketAddress("com.vloc.motion.snapshot", Namespace.ABSTRACT)}
-     * 连接；改名等于换协议。
+     * <p>服务端<b>不再</b>绑定这个名字：prefs 里读不到本会话随机名时，模块能连上的
+     * 只有"上一版主 App"，那种情况下旧名才是有意义的候选。
      */
-    public static final String SOCKET_NAME = "com.vloc.motion.snapshot";
+    public static final String LEGACY_SOCKET_NAME = "com.vloc.motion.snapshot";
+
+    /** 随机名前缀：{@code vloc-<16 hex>}（前缀只标明归属，真正不可猜的是那 16 位十六进制）。 */
+    private static final String SOCKET_PREFIX = "vloc-";
+
+    /** 随机名里的十六进制字符数（16 × 4bit = 64 bit 熵，会话内不可猜、跨会话不可关联）。 */
+    private static final int SOCKET_HEX_CHARS = 16;
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
+    /** 名字随机源：{@link SecureRandom} 不可预测（{@link java.util.Random} 会被同机进程按种子推算）。 */
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     /** 唯一实例：与 {@link LocationSession}、{@link GnssSession} 等通道单例并列。 */
     public static final SnapshotServer INSTANCE = new SnapshotServer();
@@ -87,7 +107,7 @@ public final class SnapshotServer {
     private final Object lock = new Object();
 
     /** 仅用于 {@code /targets} 的 SharedPreferences 读取；{@link #start(Context)} 时换成 application context。 */
-    private Context appContext;
+    private volatile Context appContext;
 
     /** 启动代次：每次 start / stop 自增，守护线程只认自己启动时拿到的那一代（受 {@link #lock} 保护）。 */
     private volatile int epoch;
@@ -95,6 +115,14 @@ public final class SnapshotServer {
     private boolean running;
     private LocalServerSocket server;
     private Thread worker;
+
+    /**
+     * 本次会话的抽象套接字名（{@code vloc-<16 hex>}，受 {@link #lock} 保护）。
+     *
+     * <p>{@link #stop()} 时置 {@code null}：停止后不再保留、也不允许任何代码路径
+     * 拿着旧名字去连接 / 记录日志。
+     */
+    private String socketName;
 
     /** 正在处理的那条连接：{@link #stop()} 关掉它，让阻塞中的 {@code read} 立刻返回。 */
     private volatile LocalSocket current;
@@ -107,10 +135,11 @@ public final class SnapshotServer {
     /**
      * 启动快照套接字（幂等）。
      *
-     * <p>只做"置标记 + 起守护线程"：真正的绑定发生在守护线程里，主线程不会阻塞在
-     * socket / bind 上；绑定失败也不影响会话（见 {@link #acceptLoop(int)}）。
+     * <p>只做"置标记 + {@linkplain #newSocketName() 生成会话随机名} + 起守护线程"：
+     * 真正的"写 prefs、绑定"发生在守护线程里，主线程不会阻塞在 socket / bind 上；
+     * 绑定失败也不影响会话（见 {@link #acceptLoop(int, String)}）。
      *
-     * @param context 任意 Context（内部取 application context，只用于读作用域配置）
+     * @param context 任意 Context（内部取 application context，供读作用域配置与写 prefs）
      */
     public void start(Context context) {
         final Context app = context == null ? null : context.getApplicationContext();
@@ -124,7 +153,10 @@ public final class SnapshotServer {
             }
             final int myEpoch = ++epoch;
             running = true;
-            thread = new Thread(() -> acceptLoop(myEpoch), "vloc-snapshot");
+            // 生成名（第 1 步）：每次会话一个新名字，旧名字不再复用
+            final String name = newSocketName();
+            socketName = name;
+            thread = new Thread(() -> acceptLoop(myEpoch, name), "vloc-snapshot");
             thread.setDaemon(true);   // 守护线程：应用退出时不会因为它残留
             worker = thread;
         }
@@ -133,7 +165,7 @@ public final class SnapshotServer {
 
     /**
      * 停止快照套接字（幂等）：打断当前连接、叫醒 {@code accept()}、关闭 server socket、
-     * 有界等待守护线程退出。
+     * 有界等待守护线程退出，最后丢掉本次会话的随机名。
      *
      * <p>能在主线程调用：关闭 socket 后 {@code read()} 会立刻抛 {@link IOException}，
      * {@code join} 还有 {@link #STOP_JOIN_MS} 上限，最坏只停 500ms。
@@ -142,6 +174,7 @@ public final class SnapshotServer {
         final LocalServerSocket serverToClose;
         final LocalSocket clientToClose;
         final Thread thread;
+        final String name;
         synchronized (lock) {
             if (!running && server == null && worker == null) {
                 return;   // 未启动 / 已停止：重复 stop 安全
@@ -154,9 +187,12 @@ public final class SnapshotServer {
             current = null;
             thread = worker;
             worker = null;
+            // 清理引用：先取出名字给 wakeAccept 用，再立刻置 null（停止后没人能再读它）
+            name = socketName;
+            socketName = null;
         }
         closeQuietly(clientToClose);   // 先打断正在处理的那条连接（阻塞在 read 上）
-        wakeAccept();                  // 再叫醒可能卡在 accept() 的线程（必须在 close 之前）
+        wakeAccept(name);              // 再叫醒可能卡在 accept() 的线程（必须在 close 之前）
         closeQuietly(serverToClose);   // 关闭监听 socket：不再接受任何新连接
         if (thread != null && thread != Thread.currentThread()) {
             try {
@@ -176,12 +212,17 @@ public final class SnapshotServer {
      * 就直接关闭并退出，<b>不会</b>进入 {@link #serve}（不会多等一次读超时）。
      *
      * <p>失败（未绑定 / 已关闭 / 权限不足）静默忽略，随后的 close 仍是主要退出手段。
+     *
+     * @param name 本会话的随机名（{@code null} = 本次没生成过名字，直接跳过）
      */
-    private static void wakeAccept() {
+    private static void wakeAccept(String name) {
+        if (name == null || name.isEmpty()) {
+            return;
+        }
         LocalSocket wake = null;
         try {
             wake = new LocalSocket();
-            wake.connect(new LocalSocketAddress(SOCKET_NAME,
+            wake.connect(new LocalSocketAddress(name,
                     LocalSocketAddress.Namespace.ABSTRACT));
         } catch (Throwable ignored) {
             // 没有监听者时 connect 直接失败：无需唤醒
@@ -190,27 +231,85 @@ public final class SnapshotServer {
         }
     }
 
+    // ---------------------------------------------------------------- 套接字名
+
+    /**
+     * 生成会话随机名 {@code vloc-<16 hex>}（{@link SecureRandom} + 小写十六进制）。
+     *
+     * <p>16 个十六进制字符 = 64 bit 熵：同机会话之间无法预测、无法按名字关联，
+     * 扫 {@code /proc/net/unix} 也只能看到一堆互不相同的 {@code vloc-xxxxxxxxxxxxxxxx}。
+     */
+    private static String newSocketName() {
+        final byte[] raw = new byte[SOCKET_HEX_CHARS / 2];
+        RANDOM.nextBytes(raw);
+        final StringBuilder out = new StringBuilder(SOCKET_PREFIX.length() + SOCKET_HEX_CHARS);
+        out.append(SOCKET_PREFIX);
+        for (byte value : raw) {
+            out.append(HEX_DIGITS[(value >> 4) & 0x0F]).append(HEX_DIGITS[value & 0x0F]);
+        }
+        return out.toString();
+    }
+
+    /**
+     * 把本会话随机名写进 world-readable prefs（模块侧读 {@code socket} key 拿名字）。
+     *
+     * <p><b>降级</b>：prefs 打不开（LSPosed 的 New XSharedPreferences 没启用 / 旧版模块元数据）
+     * 时<b>只降级、不算失败</b>——随机名照样绑定，模块读不到名字、只能走 ContentProvider
+     * 回退；日志里留一条（脱敏）说明，方便现场判断是哪条通道在起作用。
+     *
+     * @param name 本会话的随机名
+     * @return true = 已写进 prefs；false = 降级（名字没发布出去）
+     */
+    private boolean publishSocketName(String name) {
+        final boolean published;
+        try {
+            published = SnapshotPrefs.INSTANCE.publishSocketName(appContext, name);
+        } catch (Throwable t) {
+            VLog.w(TAG, "publish socket name failed: " + t);
+            return false;
+        }
+        if (published) {
+            VLog.i(TAG, "socket name published to prefs: " + VLog.mask(name));
+            return true;
+        }
+        VLog.w(TAG, "socket name not published (world-readable prefs unavailable), bound anyway: "
+                + VLog.mask(name) + " — module falls back to ContentProvider");
+        return false;
+    }
+
     // ---------------------------------------------------------------- 守护线程
 
     /**
-     * {@code accept()} 循环：绑定抽象名称 → 串行服务每条连接。
+     * {@code accept()} 循环：<b>写 prefs（名字）→ 绑定抽象名</b> → 串行服务每条连接。
+     *
+     * <p><b>顺序是本类最重要的契约</b>（见类注释）：名字先进 world-readable prefs，
+     * 再 {@code bind}。这样模块一读到名字，那个名字一定已经可以连接；反过来会让模块
+     * 在最开始的几百毫秒里读到名字却连不上（或连上旧名字）。
      *
      * @param myEpoch 本次启动的代次；与当前代次不一致（已被 {@link #stop()} 或下一次
      *                {@link #start(Context)} 取代）时立即退出且不碰共享状态
+     * @param name    本次会话的随机名（{@link #newSocketName()} 生成，绑定前先发布）
      */
-    private void acceptLoop(int myEpoch) {
+    private void acceptLoop(int myEpoch, String name) {
         final LocalServerSocket socket;
         synchronized (lock) {
             if (epoch != myEpoch) {
                 return;   // 启动后立刻被 stop()：什么都不用做
             }
+        }
+        // 第 2 步：发布名字（写 prefs）。在守护线程做，主线程不碰磁盘
+        final boolean published = publishSocketName(name);
+        synchronized (lock) {
+            if (epoch != myEpoch) {
+                return;   // 发布期间被 stop()：不必再绑定
+            }
             try {
-                // LocalServerSocket(String) 绑定的就是抽象命名空间（Namespace.ABSTRACT）
-                socket = new LocalServerSocket(SOCKET_NAME);
+                // 第 3 步：绑定。LocalServerSocket(String) 绑定的就是抽象命名空间（ABSTRACT）
+                socket = new LocalServerSocket(name);
             } catch (Throwable t) {
-                // 绑定失败（名称被占用 / SELinux 拒绝 / 其它 IO 错误）：只记一次 Log.w，
+                // 绑定失败（名称被占用 / SELinux 拒绝 / 其它 IO 错误）：只记一次 VLog.w，
                 // 会话继续跑，模块会回退到 ContentProvider（EnvProvider 行为不变）
-                Log.w(TAG, "bind abstract socket " + SOCKET_NAME + " failed: " + t
+                VLog.w(TAG, "bind abstract socket " + VLog.mask(name) + " failed: " + t
                         + " (snapshot socket disabled for this session)");
                 if (epoch == myEpoch) {
                     running = false;
@@ -224,7 +323,9 @@ public final class SnapshotServer {
             }
             server = socket;
         }
-        Log.i(TAG, "snapshot socket ready: " + SOCKET_NAME + " (abstract)");
+        // 日志里只出现脱敏名：拿到日志也拼不出可连接的完整名字
+        VLog.i(TAG, "snapshot socket ready: " + VLog.mask(name) + " (abstract)"
+                + (published ? "" : " [name not in prefs: world-readable prefs unavailable]"));
         try {
             while (true) {
                 final LocalSocket client;
@@ -385,7 +486,7 @@ public final class SnapshotServer {
             }
         } catch (Throwable t) {
             // 组包失败（脏数据 / prefs 损坏）：回空行，绝不让模块拿到半截 JSON
-            Log.w(TAG, "build reply for " + request + " failed: " + t);
+            VLog.w(TAG, "build reply for " + request + " failed: " + t);
             return "";
         }
     }

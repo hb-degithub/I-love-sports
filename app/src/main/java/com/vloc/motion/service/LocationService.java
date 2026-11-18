@@ -23,19 +23,20 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 
 import com.vloc.motion.core.Fix;
-import com.vloc.motion.core.PacePlan;
-import com.vloc.motion.core.StepEngine;
 import com.vloc.motion.core.GaitAttitude;
 import com.vloc.motion.core.GnssSky;
 import com.vloc.motion.core.GnssTle;
 import com.vloc.motion.core.ImuWaveform;
+import com.vloc.motion.core.PacePlan;
 import com.vloc.motion.core.RealismEngine;
 import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RoutePlayer;
 import com.vloc.motion.core.RouteStore;
+import com.vloc.motion.core.StepEngine;
 import com.vloc.motion.core.TleUpdater;
 import com.vloc.motion.core.TraceCleaner;
 import com.vloc.motion.core.UsageLog;
+import com.vloc.motion.core.VLog;
 import com.vloc.motion.location.GnssCollector;
 import com.vloc.motion.location.LocationSwitch;
 import com.vloc.motion.location.RealLocationProvider;
@@ -246,6 +247,12 @@ public class LocationService extends Service {
      * {@code startTraceCleanup()} 的完成回调按 id 回填，绝不阻塞停止流程。
      */
     private long usagePendingId;
+    /**
+     * 退出兜底清理是否已经发起（{@link #onTaskRemoved} 与 {@link #onDestroy} 可能连着来）。
+     *
+     * <p>只在主线程读写；新会话开始时复位（见 {@link #startRoute} / {@link #startSpot}）。
+     */
+    private boolean exitCleanupRequested;
     private PowerManager.WakeLock wakeLock;
     private Runnable ticker;
     private float accuracyMeters = 5.0f;
@@ -366,18 +373,18 @@ public class LocationService extends Service {
         final TleUpdater.Catalog catalog = TleUpdater.load(this);
         if (catalog.text == null) {
             resetTleSnapshot();
-            Log.w(TAG, "gnss catalog missing: 不产出卫星数据");
+            VLog.w(TAG, "gnss catalog missing: 不产出卫星数据");
             return;
         }
         realism.setTleData(catalog.text);
         tleSource = catalog.source;
         tleAgeDays = catalog.ageDays;
         if (catalog.ageDays > TleUpdater.STALE_DAYS) {
-            Log.w(TAG, "gnss tle stale: " + catalog.ageDays + " 天未更新（>" + TleUpdater.STALE_DAYS
+            VLog.w(TAG, "gnss tle stale: " + catalog.ageDays + " 天未更新（>" + TleUpdater.STALE_DAYS
                     + "），仰角/方位角误差会变大；可在设置里点「检查更新」或运行"
                     + " scripts/update_gnss_tle.py 刷新");
         }
-        Log.i(TAG, "gnss catalog=" + realism.gnssCatalogSize()
+        VLog.i(TAG, "gnss catalog=" + realism.gnssCatalogSize()
                 + " source=" + catalog.source
                 + " sats=" + catalog.satCount
                 + " tleAgeDays=" + catalog.ageDays);
@@ -405,7 +412,7 @@ public class LocationService extends Service {
             // 服务没在跑：清掉"最近一次加载"快照，让设置界面回落到现场读盘，
             // 否则更新后的文件会被旧的"内置 · 过期 N 天"盖住。
             resetTleSnapshot();
-            Log.i(TAG, "gnss tle reload skipped: service not running（下次启动自动加载）");
+            VLog.i(TAG, "gnss tle reload skipped: service not running（下次启动自动加载）");
             return;
         }
         new Thread(service::loadGnssCatalog, "vloc-tle-reload").start();
@@ -476,7 +483,29 @@ public class LocationService extends Service {
         releaseInjector();
         hideOverlay();
         releaseWakeLock();
+        // 空闲期收尾：没有运行中的会话才做（运行中被销毁是异常路径，不能删正在用的快照）
+        if (Session.INSTANCE.mode == Session.Mode.IDLE) {
+            startExitTraceCleanup("destroy");
+        }
         super.onDestroy();
+    }
+
+    /**
+     * 任务被移除（用户从最近任务列表把应用划掉）。
+     *
+     * <p>这是"应用退出"最常见的一种：Activity 全没了、进程可能被系统随时回收，但
+     * {@link #stopInternal} 不一定走（用户没点停止）。此时按空闲与否分两种：
+     * <ul>
+     *   <li><b>会话仍在跑</b>（{@code mode != IDLE}）：什么都不动。前台服务和快照都还在用，
+     *       清掉 {@code vloc_snapshot.xml} 会让模块回退真实值、删除正在用的星表快照；</li>
+     *   <li><b>空闲</b>：补一次 {@link TraceCleaner} 清理（选项与 {@code stopInternal} 完全一致）。
+     *       与 {@link #onDestroy} 之间用 {@link #exitCleanupRequested} 去重，只清一次。</li>
+     * </ul>
+     */
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        startExitTraceCleanup("task_removed");
+        super.onTaskRemoved(rootIntent);
     }
 
     // ---------------------------------------------------------------- 启动
@@ -582,8 +611,9 @@ public class LocationService extends Service {
         collectGnssSnapshot();
         // 先开快照套接字再准备注入：模块（system_server）在 Android 17 上读不了
         // ContentProvider（SecurityException），只能从抽象套接字拿快照；
-        // 绑定失败只记一条 Log.w，不影响会话（见 SnapshotServer）。
+        // 绑定失败只记一条 VLog.w，不影响会话（见 SnapshotServer）。
         SnapshotServer.INSTANCE.start(this);
+        exitCleanupRequested = false;   // 新会话：允许下次退出时再做一次兜底清理
         // 同一份快照再写进 world-readable prefs（LSPosed New XSharedPreferences）：
         // 抽象套接字在 system_server 侧会被 SELinux 拒（avc: denied { connectto }），
         // prefs 是 Android 11+ 唯一稳定的通道；打不开时它自己降级，不影响下面任何流程。
@@ -668,6 +698,7 @@ public class LocationService extends Service {
         collectGnssSnapshot();
         // 临时定位会话同样要发布快照套接字（与 startRoute 一致，start() 幂等）
         SnapshotServer.INSTANCE.start(this);
+        exitCleanupRequested = false;   // 新会话：允许下次退出时再做一次兜底清理
         // prefs 通道同上：start() 幂等，打不开时自行降级（模块回退套接字 / Provider）
         SnapshotPrefs.INSTANCE.start(this);
 
@@ -792,7 +823,7 @@ public class LocationService extends Service {
             logGnssSource("synthetic");
         } catch (Throwable t) {
             // 合成失败绝不能影响注入主流程
-            Log.w(TAG, "publish synthetic gnss failed", t);
+            VLog.w(TAG, "publish synthetic gnss failed", t);
         }
     }
 
@@ -935,7 +966,7 @@ public class LocationService extends Service {
             return;
         }
         gnssSourceLogged = source;
-        Log.i("VLocService", "gnss source: " + source);
+        VLog.i("VLocService", "gnss source: " + source);
     }
 
     /** 读取并应用"拟真模式 / 海拔 / 起步缓动"配置。 */
@@ -967,7 +998,7 @@ public class LocationService extends Service {
             // 定位总开关关着时目标 App 的定位请求可能根本到不了模块，日志会表现为
             // "模块无活动"，排查时不要误以为 LSPosed 作用域没勾。
             if (!LocationSwitch.isSystemLocationEnabled(this)) {
-                Log.w(TAG, "system inject: system location switch is off; "
+                VLog.w(TAG, "system inject: system location switch is off; "
                         + "module reads may never arrive");
             }
             return prepareSystemInject(session);
@@ -986,7 +1017,7 @@ public class LocationService extends Service {
         // 真实原因只是"没开定位"，不是 appop 被拒——这里直接给出可操作提示并停止，
         // 不再走接管流程，避免用户看到误导性的"接管被拒绝"。
         if (!LocationSwitch.isSystemLocationEnabled(this)) {
-            Log.w(TAG, "system location switch is off, abort before test provider takeover");
+            VLog.w(TAG, "system location switch is off, abort before test provider takeover");
             return PrepareResult.failed(session, LocationSwitch.DISABLED_MSG);
         }
 
@@ -998,7 +1029,7 @@ public class LocationService extends Service {
         // 回收线程在写 appop 前会复查代次并放弃本次回收；留痕标记也保证下一次停止重试。
         final boolean locked = tryLockMockAppop();
         if (!locked) {
-            Log.w(TAG, "appop revoke still holds the lock after " + MOCK_APPOP_LOCK_WAIT_MS
+            VLog.w(TAG, "appop revoke still holds the lock after " + MOCK_APPOP_LOCK_WAIT_MS
                     + "ms; continue without it (revoke side re-checks the session epoch)");
         }
         try {
@@ -1023,7 +1054,7 @@ public class LocationService extends Service {
                         return PrepareResult.failed(session,
                                 "模拟位置权限未生效（appops：" + current.combined() + "）");
                     }
-                    Log.w(TAG, "mock_location appop lost right after grant, retry once: "
+                    VLog.w(TAG, "mock_location appop lost right after grant, retry once: "
                             + current.combined());
                 }
             }
@@ -1036,7 +1067,7 @@ public class LocationService extends Service {
         // 拿 root / 授权 appop 期间用户可能已经点了「彻底停止」：这时不要再接管
         // 测试 Provider，直接返回失败让上层 stopInternal 回收刚授出的 appop。
         if (Session.INSTANCE.mode == Session.Mode.IDLE && mockSessionEpoch.get() == myEpoch) {
-            Log.i(TAG, "session stopped during prepare, abort provider takeover");
+            VLog.i(TAG, "session stopped during prepare, abort provider takeover");
             // 会话已被停止/取代：结果会被 isStalePrepare 丢弃，不要再写 session.error，
             // 否则这条"放弃接管"的文案会粘到下一次会话的界面上。
             return PrepareResult.aborted();
@@ -1054,7 +1085,7 @@ public class LocationService extends Service {
             String detail = newInjector.describe();
             releaseQuietly(newInjector);
             if (!LocationSwitch.isSystemLocationEnabled(this)) {
-                Log.w(TAG, "take over aborted: system location switch was disabled | "
+                VLog.w(TAG, "take over aborted: system location switch was disabled | "
                         + detail, e);
                 return PrepareResult.failed(session, LocationSwitch.DISABLED_MSG);
             }
@@ -1071,7 +1102,7 @@ public class LocationService extends Service {
         // 持有、第三方接管被拒是常态，gps 往往仍可用，不能因此停掉整场模拟。
         String partialNotice = null;
         if (!newInjector.getFailedProviders().isEmpty()) {
-            Log.w(TAG, "test provider partially prepared: " + newInjector.describe());
+            VLog.w(TAG, "test provider partially prepared: " + newInjector.describe());
             // 仅 logcat 用户看不到：把"哪些 Provider 没接管成功 + 会导致部分 App 不生效"
             // 带回主线程，由 notifyPartialTakeover 每会话提示一次（不停止会话）。
             // 只放 Provider 名（异常细节已在上面进了 logcat），避免 toast 过长被截断。
@@ -1092,7 +1123,7 @@ public class LocationService extends Service {
             return;
         }
         partialTakeoverNotified = true;
-        Log.w(TAG, "partial takeover told to user: " + notice);
+        VLog.w(TAG, "partial takeover told to user: " + notice);
         toast(notice);
     }
 
@@ -1129,7 +1160,7 @@ public class LocationService extends Service {
     private PrepareResult prepareSystemInject(Session session) {
         session.rootOk = RootShell.isRooted();
         if (isSystemModuleOnline()) {
-            Log.i(TAG, "system inject ready: " + describeSystemModuleEvidence());
+            VLog.i(TAG, "system inject ready: " + describeSystemModuleEvidence());
             return new PrepareResult(true, null);
         }
         // 没有既有痕迹：主动触发一次定位读取，逼 system_server 里的模块回读快照
@@ -1137,13 +1168,13 @@ public class LocationService extends Service {
         final long deadline = SystemClock.elapsedRealtime() + SYSTEM_MODULE_PROBE_WAIT_MS;
         while (SystemClock.elapsedRealtime() < deadline) {
             if (isSystemModuleOnline()) {
-                Log.i(TAG, "system inject ready after probe");
+                VLog.i(TAG, "system inject ready after probe");
                 return new PrepareResult(true, null);
             }
             SystemClock.sleep(SYSTEM_MODULE_PROBE_POLL_MS);
         }
         // 仍无痕迹：绝不再"假成功"，走与 root 失败相同的失败路径
-        Log.w(TAG, "system inject enabled but no module evidence: no snapshot read within "
+        VLog.w(TAG, "system inject enabled but no module evidence: no snapshot read within "
                 + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS
                 + "ms) and no system heartbeat within " + SYSTEM_MODULE_HEARTBEAT_MS + "ms");
         return PrepareResult.failed(session, SYSTEM_MODULE_MISSING_MSG);
@@ -1259,7 +1290,7 @@ public class LocationService extends Service {
                 // 同上
             }
         } catch (Throwable t) {
-            Log.w(TAG, "probe system module failed", t);
+            VLog.w(TAG, "probe system module failed", t);
         }
     }
 
@@ -1435,7 +1466,7 @@ public class LocationService extends Service {
 
     /** 注入失败（provider 被系统移除、appop 被撤销等）：停止并提示，不要让界面假装在跑。 */
     private void failInjection(RuntimeException e) {
-        Log.w(TAG, "inject failed", e);
+        VLog.w(TAG, "inject failed", e);
         stopInternal("定位注入失败，已停止：" + e.getMessage(), StopReason.FAILED);
     }
 
@@ -1785,13 +1816,15 @@ public class LocationService extends Service {
                     session.traveledMeters, durationSec, result);
             entry.error = error;
             usagePendingId = UsageLog.record(getApplicationContext(), entry);
-            Log.i(TAG, "usage: mode=" + mode + " result=" + result
+            // 这条日志是"这一局跑了多远"的汇总：数值由坐标推导，统一过 VLog.sanitize()——
+            // 将来若有人把坐标 / 精度（带小数）加进来，也不会原样写进 logcat
+            VLog.i(TAG, VLog.sanitize("usage: mode=" + mode + " result=" + result
                     + " distance=" + Math.round(session.traveledMeters) + "m"
-                    + " duration=" + durationSec + "s id=" + usagePendingId);
+                    + " duration=" + durationSec + "s id=" + usagePendingId));
         } catch (RuntimeException e) {
             // 记录失败不影响停止流程
             usagePendingId = 0L;
-            Log.w(TAG, "usage record failed: " + e);
+            VLog.w(TAG, "usage record failed: " + e);
         }
     }
 
@@ -1817,7 +1850,7 @@ public class LocationService extends Service {
      * {@code su}（默认 4s 超时）、prefs 写入拖住。悬浮窗移除这一项由 TraceCleaner
      * post 回主线程执行（{@code WindowManager} 有线程亲和性），最多等 1s。
      *
-     * <p>清理结果由 {@link TraceCleaner} 自己按 {@code Log.i("VLocCleanup", "cleanup: ...")}
+     * <p>清理结果由 {@link TraceCleaner} 自己按 {@code VLog.i("VLocCleanup", "cleanup: ...")}
      * 逐项打印，同时也通过 {@link TraceCleaner#lastResult()} 留给设置页；本方法还会把
      * {@link TraceCleaner.Result#summary()} 回填到刚写下的那条使用记录（按 id 定位）。
      */
@@ -1825,7 +1858,28 @@ public class LocationService extends Service {
         // 清理是异步的：先把待回填的 id 取出来并清掉，避免回调串到下一条记录上
         final long recordId = usagePendingId;
         usagePendingId = 0L;
+        // 停止路径已经清理过一次：之后的 onTaskRemoved / onDestroy 兜底不必再来一遍
+        // （文件已删、prefs 已清，重复执行只会多几次 su 调用）。
+        exitCleanupRequested = true;
         final Context appContext = getApplicationContext();
+        TraceCleaner.Options options = newTraceCleanupOptions();
+        TraceCleaner.cleanup(appContext, options, result -> {
+            VLog.i(TAG, "trace cleanup: " + result.summary());
+            // 回填使用记录：找不到（记录被删 / 已被挤掉）时静默忽略，不阻塞也不报错
+            if (recordId > 0L) {
+                UsageLog.updateCleanup(appContext, recordId, result.summary());
+            }
+        });
+    }
+
+    /**
+     * 清理选项：<b>停止路径与退出兜底路径共用同一份</b>，避免两条路各写一套导致行为漂移
+     * （例如退出时忘了撤告警通知、或把 logcat 开关读错）。
+     *
+     * <p>不是会话状态的快照，可以重复构造；{@code hideOverlay} 复用本服务实例，
+     * 服务销毁后 {@code this} 仍然可达，且 {@code hideOverlay()} 自身幂等。
+     */
+    private TraceCleaner.Options newTraceCleanupOptions() {
         TraceCleaner.Options options = new TraceCleaner.Options();
         // 前台通知 + 系统级注入告警：stopForeground(REMOVE) 只撤前台那条，告警要单独 cancel
         options.notificationId = NOTIFICATION_ID;
@@ -1835,13 +1889,40 @@ public class LocationService extends Service {
         options.hideOverlay = this::hideOverlay;
         // 清 logcat 会清掉整个缓冲区（含其它应用日志），默认关闭，只认用户显式打开的设置
         options.clearLogcat = RouteStore.loadClearLogcatOnStop(this);
-        TraceCleaner.cleanup(appContext, options, result -> {
-            Log.i(TAG, "trace cleanup: " + result.summary());
-            // 回填使用记录：找不到（记录被删 / 已被挤掉）时静默忽略，不阻塞也不报错
-            if (recordId > 0L) {
-                UsageLog.updateCleanup(appContext, recordId, result.summary());
-            }
-        });
+        return options;
+    }
+
+    /**
+     * 退出兜底清理（{@link #onTaskRemoved} / {@link #onDestroy}）：<b>仅在没有运行中的会话时</b>
+     * 做一次 {@link TraceCleaner}，挡住"用户没点停止就把应用划掉"留下的落盘痕迹
+     * （{@code vloc_snapshot.xml} 的最后一次坐标、{@code gnss_snapshot}、{@code /data/local/tmp/vloc*}、
+     * logcat）。选项与 {@link #startTraceCleanup()} 完全一致。
+     *
+     * <p>三个保护：
+     * <ul>
+     *   <li>{@code Session.mode != IDLE} 直接跳过——运行中删掉快照会打断模块正在用的通道；</li>
+     *   <li>{@link #exitCleanupRequested} 去重：{@code onTaskRemoved} 之后系统往往紧接着
+     *       {@code onDestroy}，两次调用只清理一次；</li>
+     *   <li>清理在 daemon 线程，失败只记日志，绝不阻塞销毁流程。</li>
+     * </ul>
+     *
+     * <p>{@code TraceCleaner.Options.protectActiveSession} 默认开：万一用户"划掉后立刻重开"，
+     * 新会话的 {@code SnapshotPrefs.start()} 已经先跑了，清理线程会跳过 prefs 两项。
+     */
+    private void startExitTraceCleanup(String where) {
+        final Session session = Session.INSTANCE;
+        if (session.mode != Session.Mode.IDLE) {
+            // 运行中：不清（快照正在用），也不打 warn——这属于正常的"划掉但还在跑"
+            VLog.i(TAG, "exit trace cleanup skipped (" + where + "): session active");
+            return;
+        }
+        if (exitCleanupRequested) {
+            return;   // onTaskRemoved + onDestroy 连着来：只清一次
+        }
+        exitCleanupRequested = true;
+        final Context appContext = getApplicationContext();
+        TraceCleaner.cleanup(appContext, newTraceCleanupOptions(),
+                result -> VLog.i(TAG, "exit trace cleanup (" + where + "): " + result.summary()));
     }
 
     private void releaseInjector() {
@@ -1849,7 +1930,7 @@ public class LocationService extends Service {
             try {
                 injector.release();
             } catch (RuntimeException e) {
-                Log.w(TAG, "release injector failed", e);
+                VLog.w(TAG, "release injector failed", e);
             }
             injector = null;
         }
@@ -1869,7 +1950,7 @@ public class LocationService extends Service {
 
     /** 丢弃一份已过期的准备结果：释放它自带的 injector，避免留下常驻 mock provider。 */
     private void discardStalePrepare(PrepareResult result) {
-        Log.i(TAG, "discard prepare result: session is no longer current");
+        VLog.i(TAG, "discard prepare result: session is no longer current");
         releaseQuietly(result == null ? null : result.injector);
     }
 
@@ -1881,7 +1962,7 @@ public class LocationService extends Service {
         try {
             target.release();
         } catch (RuntimeException e) {
-            Log.w(TAG, "release discarded injector failed", e);
+            VLog.w(TAG, "release discarded injector failed", e);
         }
     }
 
@@ -1921,7 +2002,7 @@ public class LocationService extends Service {
             try {
                 revokeMockAppopLocked(epoch, pkg);
             } catch (Throwable t) {
-                Log.w(TAG, "revoke mock_location appop failed", t);
+                VLog.w(TAG, "revoke mock_location appop failed", t);
             } finally {
                 MOCK_APPOP_LOCK.unlock();
             }
@@ -1940,7 +2021,7 @@ public class LocationService extends Service {
     private void revokeMockAppopLocked(long epoch, String pkg) {
         if (isAppopRevokeSuperseded(epoch)) {
             // 已经重新开始模拟：权限留给新会话，由新会话停止时回收
-            Log.i(TAG, "skip appop revoke: a newer session has started");
+            VLog.i(TAG, "skip appop revoke: a newer session has started");
             return;
         }
         if (RouteStore.loadMockAppopGrantedByApp(this) <= 0L) {
@@ -1949,38 +2030,38 @@ public class LocationService extends Service {
         RootShell.Result current = RootShell.getMockAppop(pkg);
         if (isAppopRevokeSuperseded(epoch)) {
             // 查询期间新会话已经开始（它可能刚授出 allow）：不要再写 appop
-            Log.i(TAG, "skip appop revoke: a newer session started during query");
+            VLog.i(TAG, "skip appop revoke: a newer session started during query");
             return;
         }
         if (!current.ok()) {
             // su / appops 不可用：无法判断当前状态，保留留痕下次再试，
             // 不能凭"查不到"就当作已回收。
-            Log.w(TAG, "query mock_location appop failed, keep grant mark: " + current);
+            VLog.w(TAG, "query mock_location appop failed, keep grant mark: " + current);
             return;
         }
         if (!RootShell.isMockAppopAllowed(current)) {
             // 用户/系统已经改回不允许：没有要回收的 allow，只清自己的留痕
             RouteStore.clearMockAppopGrantedByApp(this);
-            Log.i(TAG, "mock_location appop already not allowed, grant mark cleared");
+            VLog.i(TAG, "mock_location appop already not allowed, grant mark cleared");
             return;
         }
         RootShell.Result revoke = RootShell.revokeMockAppop(pkg);
         if (!revoke.ok()) {
-            Log.w(TAG, "revoke mock_location appop failed: " + revoke);
+            VLog.w(TAG, "revoke mock_location appop failed: " + revoke);
             return;   // 保留标记，下次彻底停止再试
         }
         RootShell.Result after = RootShell.getMockAppop(pkg);
         if (isAppopRevokeSuperseded(epoch)) {
             // 复核期间新会话可能刚好重新授权：留痕不清，交给下一次停止核对
-            Log.i(TAG, "keep grant mark: a newer session started during revoke");
+            VLog.i(TAG, "keep grant mark: a newer session started during revoke");
             return;
         }
         if (!after.ok() || RootShell.isMockAppopAllowed(after)) {
-            Log.w(TAG, "mock_location appop still allowed after revoke: " + after);
+            VLog.w(TAG, "mock_location appop still allowed after revoke: " + after);
             return;   // 保留标记，下次彻底停止再试
         }
         RouteStore.clearMockAppopGrantedByApp(this);
-        Log.i(TAG, "revoked mock_location appop granted by this app");
+        VLog.i(TAG, "revoked mock_location appop granted by this app");
     }
 
     /** 回收线程：本次停止之后是否已经开始了新会话（新会话可能正在/已经重新授权 appop）。 */
@@ -2005,19 +2086,19 @@ public class LocationService extends Service {
         }
         passiveRefreshStarted = true;
         if (!RealLocationProvider.hasPermission(this)) {
-            Log.i(TAG, "passive best-effort skipped: no location permission");
+            VLog.i(TAG, "passive best-effort skipped: no location permission");
             return;
         }
         RealLocationProvider.requestFresh(this, new RealLocationProvider.Callback() {
             @Override
             public void onLocation(Location location) {
-                Log.i(TAG, "passive best-effort: " + location.getProvider()
+                VLog.i(TAG, "passive best-effort: " + location.getProvider()
                         + " fix received (mock=" + location.isFromMockProvider() + ")");
             }
 
             @Override
             public void onError(String message) {
-                Log.i(TAG, "passive best-effort: no real fix (" + message
+                VLog.i(TAG, "passive best-effort: no real fix (" + message
                         + "); passive may keep the last mock location until next real fix");
             }
         });
@@ -2256,7 +2337,7 @@ public class LocationService extends Service {
         if (!overlayIdleHidden && now - overlayIdleSinceMs >= OVERLAY_IDLE_HIDE_MS) {
             overlayIdleHidden = true;
             hideOverlay();
-            Log.i(TAG, "overlay auto-hidden after idle " + (now - overlayIdleSinceMs) + "ms");
+            VLog.i(TAG, "overlay auto-hidden after idle " + (now - overlayIdleSinceMs) + "ms");
         }
     }
 
