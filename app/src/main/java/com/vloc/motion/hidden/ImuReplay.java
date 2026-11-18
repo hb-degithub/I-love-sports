@@ -16,8 +16,9 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * IMU 伪造（v0.4.x）：让目标 App 用加速度计 / 陀螺仪自己算步频时，也与虚拟路线一致。
@@ -64,8 +65,6 @@ final class ImuReplay {
         sUprightMode = upright;
     }
 
-
-    private static final String TAG = "[VLocHidden] ";
 
     /** 50Hz 合成。 */
     private static final long TICK_MS = 20L;
@@ -117,7 +116,7 @@ final class ImuReplay {
         final Class<?> sensorManager = SensorManager.class;
         try {
             final int count =
-                    XposedBridge.hookAllMethods(sensorManager, "registerListener", REGISTER_HOOK).size();
+                    Xp.hookAllMethods(sensorManager, "registerListener", REGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked SensorManager#registerListener (imu) (" + count + " overload(s))");
@@ -127,7 +126,7 @@ final class ImuReplay {
         }
         try {
             final int count =
-                    XposedBridge.hookAllMethods(sensorManager, "unregisterListener", UNREGISTER_HOOK).size();
+                    Xp.hookAllMethods(sensorManager, "unregisterListener", UNREGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked SensorManager#unregisterListener (imu) (" + count + " overload(s))");
@@ -171,9 +170,9 @@ final class ImuReplay {
     // register / unregister 翻译
     // ==================================================================
 
-    private static final XC_MethodHook REGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback REGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 3) {
@@ -219,7 +218,7 @@ final class ImuReplay {
         }
 
         @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        protected void after(Param param) {
             final Registration registration = sPendingRegistration.get();
             sPendingRegistration.remove();
             if (registration == null) {
@@ -236,9 +235,9 @@ final class ImuReplay {
         }
     };
 
-    private static final XC_MethodHook UNREGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback UNREGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 1 || !(args[0] instanceof SensorEventListener)) {
@@ -783,7 +782,7 @@ final class ImuReplay {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

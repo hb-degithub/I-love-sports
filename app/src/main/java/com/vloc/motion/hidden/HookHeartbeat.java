@@ -15,8 +15,7 @@ import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 自报心跳：模块在被注入的每个进程里，主动向主 App 写一条“我在这里装上了 N 个 hook”。
@@ -59,8 +58,6 @@ import de.robv.android.xposed.XposedHelpers;
  * → 心跳永久丢失，主 App 只能退回“旧版心跳，无进程详情”的结论。
  */
 final class HookHeartbeat {
-
-    private static final String TAG = "[VLocHidden] ";
 
     /** 主 App 的心跳接收 URI（主 App 侧 EnvProvider 的 {@code hookbeat} 路径）。 */
     private static final String HEARTBEAT_URI = "content://com.vloc.motion.env/hookbeat";
@@ -379,11 +376,11 @@ final class HookHeartbeat {
             return processName;
         }
         try {
-            final Class<?> activityThread = XposedHelpers.findClassIfExists(
+            final Class<?> activityThread = Xp.findClassIfExists(
                     "android.app.ActivityThread", HookHeartbeat.class.getClassLoader());
             if (activityThread != null) {
                 final Object value =
-                        XposedHelpers.callStaticMethod(activityThread, "currentPackageName");
+                        Xp.callStaticMethod(activityThread, "currentPackageName");
                 if (value instanceof String && !((String) value).isEmpty()) {
                     return (String) value;
                 }
@@ -665,7 +662,7 @@ final class HookHeartbeat {
      *
      * <p>第一行仍是原有摘要 {@code heartbeat failed: <简单类名>}（老日志的匹配口径不变）；
      * 第二行起是 message 与前 {@value #STACK_FRAME_LIMIT} 层堆栈，信息量与
-     * {@code android.util.Log.w(TAG, msg, throwable)} 等价。这里仍走 {@link XposedBridge#log(String)}，
+     * {@code android.util.Log.w(TAG, msg, throwable)} 等价。这里仍走 {@link Xp#log(String)}，
      * 因为真机证据（{@code [VLocHidden] heartbeat failed: ...}）就来自这条通道。
      */
     private static void logThrowableOnce(Throwable t) {
@@ -722,9 +719,10 @@ final class HookHeartbeat {
         }
     }
 
+    /** 统一日志：{@code [VLocHidden] } 前缀由 {@link Xp} 后端统一加。 */
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // 日志通道异常时不能影响宿主进程
         }

@@ -18,7 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
-import de.robv.android.xposed.XposedBridge;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 快照通道客户端：读主 App 的 <b>Unix 抽象套接字</b>。
@@ -96,8 +96,6 @@ final class SnapshotClient {
 
     /** 失败日志最多记几种异常类（每种一条），防止极端情况下刷屏。 */
     private static final int MAX_ERROR_KINDS = 16;
-
-    private static final String TAG = "[VLocHidden] ";
 
     /** 已记过日志的异常类名（每进程每类错误一条）。 */
     private static final Set<String> sLoggedErrors =
@@ -347,7 +345,7 @@ final class SnapshotClient {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

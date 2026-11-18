@@ -6,6 +6,7 @@ import android.preference.PreferenceManager;
 import org.osmdroid.config.Configuration;
 import org.osmdroid.config.IConfigurationProvider;
 
+import com.vloc.motion.core.RemotePrefs;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.location.TestProviderInjector;
 import com.vloc.motion.service.EnvProvider;
@@ -19,6 +20,11 @@ public class App extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 新 API 后端的"应用 → 模块"快照通道：向 libxposed 框架登记服务监听。
+        // 只登记回调，不做 IPC、不排任务（幂等），可以放在最前面，不阻塞启动；
+        // 绑定成功后快照会由 service/SnapshotPrefs 双写进远程偏好组 vloc_snapshot。
+        // 旧 world-readable prefs 通道（旧后端用）不受影响，两条通道互不依赖。
+        RemotePrefs.start(this);
         IConfigurationProvider cfg = Configuration.getInstance();
         cfg.load(this, PreferenceManager.getDefaultSharedPreferences(this));
         cfg.setUserAgentValue(getPackageName());

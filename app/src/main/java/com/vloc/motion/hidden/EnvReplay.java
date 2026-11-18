@@ -10,9 +10,9 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 基站 / Wi-Fi 环境回放（v0.4.0）。
@@ -35,8 +35,6 @@ import de.robv.android.xposed.XposedHelpers;
  * </ul>
  */
 final class EnvReplay {
-
-    private static final String TAG = "[VLocHidden] ";
 
     /** CellInfo.CONNECTION_PRIMARY_SERVING / CONNECTION_NONE 的值（AOSP 8.1~15 一致）。 */
     private static final int CONNECTION_PRIMARY_SERVING = 1;
@@ -77,7 +75,7 @@ final class EnvReplay {
         int hooked = 0;
         try {
             final int count =
-                    XposedBridge.hookAllMethods(telephonyManager, "getAllCellInfo", CELL_LIST_HOOK).size();
+                    Xp.hookAllMethods(telephonyManager, "getAllCellInfo", CELL_LIST_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked TelephonyManager#getAllCellInfo (" + count + " overload(s))");
@@ -87,7 +85,7 @@ final class EnvReplay {
         }
         try {
             final int count =
-                    XposedBridge.hookAllMethods(telephonyManager, "getCellLocation", CELL_LOCATION_HOOK).size();
+                    Xp.hookAllMethods(telephonyManager, "getCellLocation", CELL_LOCATION_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked TelephonyManager#getCellLocation (" + count + " overload(s))");
@@ -104,7 +102,7 @@ final class EnvReplay {
         if (wifiManager != null) {
             try {
                 final int count =
-                        XposedBridge.hookAllMethods(wifiManager, "getScanResults", SCAN_RESULTS_HOOK).size();
+                        Xp.hookAllMethods(wifiManager, "getScanResults", SCAN_RESULTS_HOOK);
                 if (count > 0) {
                     hooked++;
                     log("hooked WifiManager#getScanResults (" + count + " overload(s))");
@@ -119,14 +117,14 @@ final class EnvReplay {
         final Class<?> wifiInfo = findClassIfExists("android.net.wifi.WifiInfo", classLoader);
         if (wifiInfo != null) {
             try {
-                XposedHelpers.findAndHookMethod(wifiInfo, "getBSSID", WIFI_BSSID_HOOK);
+                Xp.hook(Xp.findMethodExact(wifiInfo, "getBSSID"), WIFI_BSSID_HOOK);
                 hooked++;
                 log("hooked WifiInfo#getBSSID");
             } catch (Throwable t) {
                 log("skip WifiInfo#getBSSID: " + t);
             }
             try {
-                XposedHelpers.findAndHookMethod(wifiInfo, "getSSID", WIFI_SSID_HOOK);
+                Xp.hook(Xp.findMethodExact(wifiInfo, "getSSID"), WIFI_SSID_HOOK);
                 hooked++;
                 log("hooked WifiInfo#getSSID");
             } catch (Throwable t) {
@@ -142,9 +140,9 @@ final class EnvReplay {
     // hook 回调
     // ==================================================================
 
-    private static final XC_MethodHook CELL_LIST_HOOK = new XC_MethodHook() {
+    private static final Callback CELL_LIST_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final EnvSnapshot snapshot = EnvSnapshot.get();
                 if (snapshot == null || !snapshot.isActive()) {
@@ -162,9 +160,9 @@ final class EnvReplay {
         }
     };
 
-    private static final XC_MethodHook CELL_LOCATION_HOOK = new XC_MethodHook() {
+    private static final Callback CELL_LOCATION_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final EnvSnapshot snapshot = EnvSnapshot.get();
                 if (snapshot == null || !snapshot.isActive()) {
@@ -182,9 +180,9 @@ final class EnvReplay {
         }
     };
 
-    private static final XC_MethodHook SCAN_RESULTS_HOOK = new XC_MethodHook() {
+    private static final Callback SCAN_RESULTS_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final EnvSnapshot snapshot = EnvSnapshot.get();
                 if (snapshot == null || !snapshot.isActive()) {
@@ -202,9 +200,9 @@ final class EnvReplay {
         }
     };
 
-    private static final XC_MethodHook WIFI_BSSID_HOOK = new XC_MethodHook() {
+    private static final Callback WIFI_BSSID_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final EnvSnapshot snapshot = EnvSnapshot.get();
                 if (snapshot == null || !snapshot.isActive()) {
@@ -226,13 +224,13 @@ final class EnvReplay {
         }
     };
 
-    private static final XC_MethodHook WIFI_SSID_HOOK = new XC_MethodHook() {
+    private static final Callback WIFI_SSID_HOOK = new Callback() {
         /**
          * 用 after 钩子先拿“真实返回值”，按它是否带双引号决定回放值的格式：
          * 不同 ROM 的 getSSID() 引号风格不一致，照抄原格式才不会被“格式异常”识别。
          */
         @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        protected void after(Param param) {
             try {
                 final EnvSnapshot snapshot = EnvSnapshot.get();
                 if (snapshot == null || !snapshot.isActive()) {
@@ -854,9 +852,9 @@ final class EnvReplay {
             }
             // API 33 是 public WifiSsid.fromBytes(byte[])；更早版本是 @hide createFromByteArray(byte[])
             java.lang.reflect.Method factory =
-                    XposedHelpers.findMethodExactIfExists(wifiSsidClass, "fromBytes", byte[].class);
+                    Xp.findMethodExactIfExists(wifiSsidClass, "fromBytes", byte[].class);
             if (factory == null) {
-                factory = XposedHelpers.findMethodExactIfExists(
+                factory = Xp.findMethodExactIfExists(
                         wifiSsidClass, "createFromByteArray", byte[].class);
             }
             if (factory == null) {
@@ -918,7 +916,7 @@ final class EnvReplay {
 
     private static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
         try {
-            return XposedHelpers.findClassIfExists(className,
+            return Xp.findClassIfExists(className,
                     classLoader != null ? classLoader : sClassLoader);
         } catch (Throwable t) {
             return null;
@@ -947,7 +945,7 @@ final class EnvReplay {
             return false;
         }
         try {
-            XposedHelpers.callMethod(target, methodName, args);
+            Xp.callMethod(target, methodName, args);
             return true;
         } catch (Throwable t) {
             return false;
@@ -1065,7 +1063,7 @@ final class EnvReplay {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }

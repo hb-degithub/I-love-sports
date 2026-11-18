@@ -75,6 +75,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -1997,7 +1998,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     /**
      * 「注入环境」面板的视图句柄。
      *
-     * <p>只做一件事：把 7 行状态文本和「立即清理痕迹」按钮攒在一起，供异步回调回写；
+     * <p>只做一件事：把 9 行状态文本（原有 7 行 + 兼容状态 2 行）和「立即清理痕迹」按钮
+     * 攒在一起，供异步回调回写；
      * {@link #dialog} 是"面板还在不在"的唯一判据——对话框关掉后所有后台回调直接丢弃，
      * 既不会更新已销毁的视图，也不会因为 Activity 已 finishing 而崩。
      */
@@ -2009,6 +2011,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         TextView overlayValue;
         TextView snapshotValue;
         TextView cleanupValue;
+        TextView lsposedValue;
+        TextView systemValue;
         Button cleanButton;
         AlertDialog dialog;
 
@@ -2047,6 +2051,11 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             panel.overlayValue = addStatusRow(container, "悬浮窗", "…");
             panel.snapshotValue = addStatusRow(container, "快照文件", "检查中…");
             panel.cleanupValue = addStatusRow(container, "上次清理", "…");
+            // 兼容状态两行（只读、追加在既有 7 行之后，不重排）：
+            //   LSPosed API —— XposedBridge.getXposedVersion()，反射取值，取不到显示「未知」
+            //   系统版本   —— Android SDK <RELEASE>（API <SDK_INT>）+ 心跳里的已装 hook 组数
+            panel.lsposedValue = addStatusRow(container, "LSPosed API", lsposedApiText());
+            panel.systemValue = addStatusRow(container, "系统版本", systemCompatText(null));
             panel.cleanButton = new Button(this);
             panel.cleanButton.setText("立即清理痕迹");
             panel.cleanButton.setOnClickListener(v -> startManualTraceCleanup(panel));
@@ -2107,18 +2116,24 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         setValue(panel.cleanupValue, lastCleanupText());
         setValue(panel.moduleValue, "检查中…");
         setValue(panel.appopValue, "检查中…");
+        // 兼容状态：LSPosed API 是内存反射（主线程直接读），系统版本先出 SDK 部分、
+        // hook 组数要读心跳 prefs 所以留给下面的后台线程补全（拿不到保持「—」）。
+        setValue(panel.lsposedValue, lsposedApiText());
+        setValue(panel.systemValue, systemCompatText(null));
 
         // ---- 2. 心跳 + 快照文件（后台；两条线程分开，appop 的 su 慢也不拖住别的行）----
         final Context app = getApplicationContext();
         new Thread(() -> {
             final String module = moduleInjectionText(app);
             final String snapshot = snapshotFileText(app);
+            final String systemCompat = systemCompatText(app);
             runOnUiThread(() -> {
                 if (!panel.alive()) {
                     return;
                 }
                 setValue(panel.moduleValue, module);
                 setValue(panel.snapshotValue, snapshot);
+                setValue(panel.systemValue, systemCompat);
             });
         }, "vloc-inject-hb").start();
 
@@ -2132,6 +2147,95 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 setValue(panel.appopValue, appop);
             });
         }, "vloc-inject-appop").start();
+    }
+
+    /**
+     * 面板「LSPosed API」行：{@code XposedBridge.getXposedVersion()}。
+     *
+     * <p><b>为什么用反射</b>：xposed-api 是 {@code compileOnly}，主 App 进程自己并<b>不</b>被
+     * LSPosed 注入（{@code HookEntry} 明确跳过 {@code com.vloc.motion}），运行时这个类根本不存在，
+     * 直接引用会抛 {@code NoClassDefFoundError}（属于 {@link Error}，不是 Exception）。
+     * 因此这里 {@link Class#forName(String)} + 反射调用，整段 {@code catch (Throwable)}，
+     * 取不到就显示「未知」——降级永远是“少显示一点”，不会崩。
+     *
+     * @return 例如 {@code "API 93"}；取不到返回「未知」
+     */
+    private static String lsposedApiText() {
+        try {
+            final Class<?> bridge = Class.forName("de.robv.android.xposed.XposedBridge");
+            final Method version = bridge.getMethod("getXposedVersion");
+            final Object value = version.invoke(null);
+            if (value instanceof Integer) {
+                return "API " + value;
+            }
+            return value == null ? "未知" : String.valueOf(value);
+        } catch (Throwable t) {
+            return "未知";
+        }
+    }
+
+    /**
+     * 面板「系统版本」行：{@code Android SDK <RELEASE>（API <SDK_INT>）} + 已安装 hook 组数。
+     *
+     * <p>SDK 部分纯内存（主线程可调）；hook 组数来自模块心跳（{@link HookHeartbeatStore}），
+     * 要读 prefs，所以传 {@code null} 时只显示 SDK 部分、hook 显示「—」，
+     * 由后台线程带上 {@code context} 再补全（见 {@link #refreshInjectionPanel}）。
+     *
+     * @param context 用于读心跳；null = 只显示系统版本
+     */
+    private static String systemCompatText(Context context) {
+        String base;
+        try {
+            base = "Android SDK " + Build.VERSION.RELEASE
+                    + "（API " + Build.VERSION.SDK_INT + "）";
+        } catch (Throwable t) {
+            base = "Android SDK ?（API ?）";
+        }
+        String hooks;
+        try {
+            hooks = hookGroupsText(context);
+        } catch (Throwable t) {
+            hooks = "hook 组 —";
+        }
+        return base + " · " + hooks;
+    }
+
+    /**
+     * 已安装的 hook 组数 / 条数（来源：模块心跳的 {@code hooks} 字段）。
+     *
+     * <p>“组”= 心跳里的进程条目数（系统框架 1 组 + 每个被注入的应用进程各 1 组），
+     * “条”= 各组自报的 hook 数之和。一条心跳都没有（模块没注入 / 从没跑过）时显示「—」，
+     * 不猜 0 —— 0 会被误读成“注入了但一个 hook 都没装上”。
+     */
+    private static String hookGroupsText(Context context) {
+        if (context == null) {
+            return "hook 组 —";
+        }
+        try {
+            final long now = System.currentTimeMillis();
+            int groups = 0;
+            int hooks = 0;
+            for (HookHeartbeatStore.Beat beat : HookHeartbeatStore.beats(context)) {
+                if (beat == null) {
+                    continue;
+                }
+                // 只算“新鲜”的心跳（与 moduleInjectionText 同一 24h 窗口）：更早的条目
+                // 说明那个进程很久没上报了，算成“已安装”会虚高。
+                if (now - beat.at > HookHeartbeatStore.FRESH_MS) {
+                    continue;
+                }
+                groups++;
+                if (beat.hooks > 0) {
+                    hooks += beat.hooks;
+                }
+            }
+            if (groups <= 0) {
+                return "hook 组 —";
+            }
+            return "hook 组 " + groups + "（共 " + hooks + " 条）";
+        } catch (Throwable t) {
+            return "hook 组 —";
+        }
     }
 
     /** 面板第 1 行：模块心跳（system 优先，其次 app 进程数，最后「未检测到」）。 */

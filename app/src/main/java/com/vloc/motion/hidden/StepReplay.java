@@ -20,9 +20,9 @@ import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.List;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import com.vloc.motion.hidden.compat.Callback;
+import com.vloc.motion.hidden.compat.Param;
+import com.vloc.motion.hidden.compat.Xp;
 
 /**
  * 计步传感器回放（v0.4.x）：让目标 App 读到的步数 / 步频与虚拟路线一致。
@@ -50,8 +50,6 @@ import de.robv.android.xposed.XposedHelpers;
  * 为透传，绝不把异常抛给目标 App。
  */
 final class StepReplay {
-
-    private static final String TAG = "[VLocHidden] ";
 
     private static final String STEPS_URI_STRING = "content://com.vloc.motion.env/steps";
     private static final Uri STEPS_URI = Uri.parse(STEPS_URI_STRING);
@@ -124,7 +122,7 @@ final class StepReplay {
         final Class<?> sensorManager = SensorManager.class;
         try {
             final int count =
-                    XposedBridge.hookAllMethods(sensorManager, "registerListener", REGISTER_HOOK).size();
+                    Xp.hookAllMethods(sensorManager, "registerListener", REGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked SensorManager#registerListener (" + count + " overload(s))");
@@ -134,7 +132,7 @@ final class StepReplay {
         }
         try {
             final int count =
-                    XposedBridge.hookAllMethods(sensorManager, "unregisterListener", UNREGISTER_HOOK).size();
+                    Xp.hookAllMethods(sensorManager, "unregisterListener", UNREGISTER_HOOK);
             if (count > 0) {
                 hooked++;
                 log("hooked SensorManager#unregisterListener (" + count + " overload(s))");
@@ -150,9 +148,9 @@ final class StepReplay {
     // registerListener / unregisterListener
     // ==================================================================
 
-    private static final XC_MethodHook REGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback REGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 3) {
@@ -202,7 +200,7 @@ final class StepReplay {
         }
 
         @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        protected void after(Param param) {
             final Registration registration = sPendingRegistration.get();
             sPendingRegistration.remove();
             if (registration == null) {
@@ -219,9 +217,9 @@ final class StepReplay {
         }
     };
 
-    private static final XC_MethodHook UNREGISTER_HOOK = new XC_MethodHook() {
+    private static final Callback UNREGISTER_HOOK = new Callback() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void before(Param param) {
             try {
                 final Object[] args = param.args;
                 if (args == null || args.length < 1 || !(args[0] instanceof SensorEventListener)) {
@@ -794,7 +792,7 @@ final class StepReplay {
         try {
             final Class<?> activityThread = Class.forName("android.app.ActivityThread");
             final Object application =
-                    XposedHelpers.callStaticMethod(activityThread, "currentApplication");
+                    Xp.callStaticMethod(activityThread, "currentApplication");
             if (application instanceof Context) {
                 return (Context) application;
             }
@@ -802,11 +800,11 @@ final class StepReplay {
             // 早期启动进程 / isolated 进程拿不到
         }
         try {
-            final Class<?> helper = XposedHelpers.findClassIfExists(
+            final Class<?> helper = Xp.findClassIfExists(
                     "android.app.AndroidAppHelper", StepReplay.class.getClassLoader());
             if (helper != null) {
                 final Object application =
-                        XposedHelpers.callStaticMethod(helper, "currentApplication");
+                        Xp.callStaticMethod(helper, "currentApplication");
                 if (application instanceof Context) {
                     return (Context) application;
                 }
@@ -900,7 +898,7 @@ final class StepReplay {
 
     private static void log(String message) {
         try {
-            XposedBridge.log(TAG + message);
+            Xp.log(message);
         } catch (Throwable ignored) {
             // ignore
         }
