@@ -172,10 +172,13 @@ final class SystemHooks {
         final float bearing;
         final float accuracy;
         final int satellites;
+        final float meanCn0;
+        final float maxCn0;
         final long updatedAt;
 
         Snapshot(double lat, double lon, double alt, float speed, float bearing,
-                 float accuracy, int satellites, long updatedAt) {
+                 float accuracy, int satellites, float meanCn0, float maxCn0,
+                 long updatedAt) {
             this.lat = lat;
             this.lon = lon;
             this.alt = alt;
@@ -183,6 +186,8 @@ final class SystemHooks {
             this.bearing = bearing;
             this.accuracy = accuracy;
             this.satellites = satellites;
+            this.meanCn0 = meanCn0;
+            this.maxCn0 = maxCn0;
             this.updatedAt = updatedAt;
         }
     }
@@ -1467,6 +1472,14 @@ final class SystemHooks {
             try {
                 final android.os.Bundle extras = new android.os.Bundle();
                 extras.putInt("satellites", snapshot.satellites);
+                // 真实 GnssLocationProvider 也写这两个聚合值；很多 App 的「GPS 信号格」
+                // 就是读它们，缺了会直接判定为信号弱/无信号。
+                if (snapshot.meanCn0 > 0f) {
+                    extras.putFloat("meanCn0", snapshot.meanCn0);
+                }
+                if (snapshot.maxCn0 > 0f) {
+                    extras.putFloat("maxCn0", snapshot.maxCn0);
+                }
                 location.setExtras(extras);
             } catch (Throwable ignored) {
                 // ignore
@@ -1651,6 +1664,8 @@ final class SystemHooks {
                     (float) root.optDouble("bearing"),
                     (float) root.optDouble("acc"),
                     root.optInt("satellites", 0),
+                    (float) root.optDouble("meanCn0", 0),
+                    (float) root.optDouble("maxCn0", 0),
                     root.optLong("updatedAt", 0L));
         } catch (Throwable t) {
             logSnapshotUnavailableOnce("snapshot json: " + t.getClass().getName());
@@ -1691,6 +1706,8 @@ final class SystemHooks {
                                     (float) root.optDouble("bearing"),
                                     (float) root.optDouble("acc"),
                                     root.optInt("satellites", 0),
+                                    (float) root.optDouble("meanCn0", 0),
+                                    (float) root.optDouble("maxCn0", 0),
                                     root.optLong("updatedAt", 0L));
                         } else {
                             unavailable = "inactive snapshot";

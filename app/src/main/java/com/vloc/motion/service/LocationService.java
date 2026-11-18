@@ -1389,7 +1389,8 @@ public class LocationService extends Service {
         Fix fix = applyRealismFix(spotLat, spotLon, baseAltitude, 0.0, 0.0);
         // 系统级注入：本进程不写测试 Provider，但要发布快照给模块
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
-                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
+                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites,
+                fix.meanCn0, fix.maxCn0);
         if (injector != null) {
             try {
                 injector.push(fix, System.currentTimeMillis());
@@ -1423,7 +1424,8 @@ public class LocationService extends Service {
     private void injectFix(Fix fix) {
         // 无论哪种注入方式，都先把最新快照发布给模块（系统级注入在 system_server 读取它）
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
-                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites);
+                fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites,
+                fix.meanCn0, fix.maxCn0);
         if (injector == null) {
             // 系统级注入：本进程不写测试 Provider，由 system_server 里的模块改写定位。
             // 但只有"能证明模块在动"时才允许空转，否则界面会显示运行中、里程在涨，

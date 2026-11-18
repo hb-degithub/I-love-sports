@@ -21,6 +21,10 @@ public final class LocationSession {
     public volatile float bearingDeg;
     public volatile float accuracyMeters;
     public volatile int satellites;
+    /** 参与定位卫星的平均/最大载噪比（dB-Hz）：真实 GnssLocationProvider 会写进 Location extras，
+     *  不少 App 用它们画"GPS 信号格"，缺了就被判定为信号弱。 */
+    public volatile float meanCn0;
+    public volatile float maxCn0;
     public volatile long updatedAt;
 
     /** 单例供运行时使用；包内可见的构造函数供单元测试。 */
@@ -30,6 +34,13 @@ public final class LocationSession {
     /** 主 App 每推一帧定位时调用。 */
     public void update(double lat, double lon, double altitude, float speedMps,
                        float bearingDeg, float accuracyMeters, int satellites) {
+        update(lat, lon, altitude, speedMps, bearingDeg, accuracyMeters, satellites, 0f, 0f);
+    }
+
+    /** 带载噪比的版本（mean/max 单位 dB-Hz）。 */
+    public void update(double lat, double lon, double altitude, float speedMps,
+                       float bearingDeg, float accuracyMeters, int satellites,
+                       float meanCn0, float maxCn0) {
         this.lat = lat;
         this.lon = lon;
         this.altitude = altitude;
@@ -37,6 +48,8 @@ public final class LocationSession {
         this.bearingDeg = bearingDeg;
         this.accuracyMeters = accuracyMeters;
         this.satellites = satellites;
+        this.meanCn0 = meanCn0;
+        this.maxCn0 = maxCn0;
         this.active = true;
         this.updatedAt = System.currentTimeMillis();
     }
@@ -52,8 +65,9 @@ public final class LocationSession {
         return String.format(Locale.US,
                 "{\"active\":%s,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,"
                         + "\"speed\":%.3f,\"bearing\":%.1f,\"acc\":%.1f,"
-                        + "\"satellites\":%d,\"updatedAt\":%d}",
+                        + "\"satellites\":%d,\"meanCn0\":%.1f,\"maxCn0\":%.1f,"
+                        + "\"updatedAt\":%d}",
                 active, lat, lon, altitude, speedMps, bearingDeg, accuracyMeters,
-                satellites, updatedAt);
+                satellites, meanCn0, maxCn0, updatedAt);
     }
 }
