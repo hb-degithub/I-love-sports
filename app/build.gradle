@@ -16,8 +16,8 @@ android {
         applicationId "com.vloc.motion"
         minSdk 26
         targetSdk 34
-        versionCode 84
-        versionName "0.46.0"
+        versionCode 85
+        versionName "0.46.1"
         resourceConfigurations += ['zh', 'en']
     }
 

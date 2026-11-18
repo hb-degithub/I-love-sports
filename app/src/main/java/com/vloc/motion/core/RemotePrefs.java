@@ -229,6 +229,7 @@ public final class RemotePrefs {
             }
             // 绑定时刻的这一次只是自检：确认组可读。真正的写入每次都会重新取。
             sCachedPrefs = service.getRemotePreferences(GROUP);
+            fireOnBound();   // 通知写方：此前因未绑定而没送达的 key 可以重发了
             if (LOGGED_READY.compareAndSet(false, true)) {
                 VLog.i(TAG, "remote prefs ready: " + GROUP + " (libxposed service)");
             }
@@ -247,6 +248,25 @@ public final class RemotePrefs {
      * @param value 字符串值；null 等价于 {@link #remove(String)}
      * @return true = 已提交到后台写入队列；false = 通道不可用 / 参数非法 / 队列拒绝
      */
+    /** 绑定完成（能力位已确认可用）后的回调：用于把此前未送达的 key 全量重发。 */
+    private static volatile Runnable sOnBound;
+
+    /** 注册"已可用"回调（幂等覆盖）。回调在该工具的后台线程上执行，调用方需自行切主线程。 */
+    public static void setOnBound(Runnable callback) {
+        sOnBound = callback;
+    }
+
+    private static void fireOnBound() {
+        final Runnable cb = sOnBound;
+        if (cb != null) {
+            try {
+                cb.run();
+            } catch (Throwable t) {
+                VLog.w(TAG, "onBound callback failed: " + t);
+            }
+        }
+    }
+
     public static boolean put(String key, String value) {
         if (value == null) {
             return remove(key);

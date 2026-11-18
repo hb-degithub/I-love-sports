@@ -30,6 +30,14 @@ public final class LegacyEntry implements IXposedHookLoadPackage {
         if (lpparam == null) {
             return;
         }
+        // 旧框架下必须先装上 LegacyBackend：钩子层已统一走 compat.Xp，
+        // 没装 backend 时 Xp.hook/find 会抛 IllegalStateException（被上层吞掉 → 0 hook）。
+        try {
+            com.vloc.motion.hidden.compat.Xp.installIfAbsent(
+                    new com.vloc.motion.hidden.compat.LegacyBackend());
+        } catch (Throwable t) {
+            android.util.Log.e("VLocHidden", "legacy backend install failed: " + t);
+        }
         // 桥接层不抛异常：旧框架里抛出去会被记成模块错误，而 onPackage 内部已逐段兜底。
         try {
             HookEntry.onPackage(lpparam.packageName, lpparam.classLoader, lpparam.processName);

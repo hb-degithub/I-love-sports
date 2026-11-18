@@ -24,7 +24,7 @@ import io.github.libxposed.api.XposedModuleInterface;
  * </ul>
  *
  * <p><b>类加载隔离</b>：本类只引用 {@code io.github.libxposed.*}；正文不出现
- * {@code de.robv.android.xposed.*} 类型。唯一的旧 API 依赖放在嵌套类
+ * 旧 API 依赖只存在于 LegacyEntry/LegacyBackend。新入口本身不含
  * {@link LegacyEntryBridge} 里 —— 嵌套类是独立的 .class，只有
  * {@link #LEGACY_ENTRY_BRIDGE_ENABLED} 打开时才会被解析，旧框架进程/纯新框架进程
  * 都不会因缺少 de.robv 类而失败。
@@ -41,7 +41,6 @@ public final class NewApiEntry extends XposedModule {
      * 进程里同时跑“新入口 + 旧入口逻辑”，否则 hook 会装两遍、心跳计数会翻倍。
      * 打开前必须先确认框架到底加载了哪条入口（见报告 D1 的真机验证方法）。
      */
-    private static final boolean LEGACY_ENTRY_BRIDGE_ENABLED = false;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -72,6 +71,12 @@ public final class NewApiEntry extends XposedModule {
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         if (param == null) {
+            return;
+        }
+        // system_server 进程里框架也会对每个 LoadedApk 派发 onPackageReady；
+        // 若在这里转调 onPackage 会先用包名占掉 processName 去重键，
+        // 导致 onSystemServerStarting 的 SystemHooks 永远装不上。系统层只走那条回调。
+        if (Xp.isSystemServer()) {
             return;
         }
         final String packageName = param.getPackageName();
@@ -129,35 +134,4 @@ public final class NewApiEntry extends XposedModule {
      * <p>这属于过渡手段：同一个 APK 若两条入口都被框架加载，会重复装 hook。
      * 正式方案是 TODO 里的第 2 步（把入口逻辑抽成包内静态方法，两个入口共用）。
      */
-    private static final class LegacyEntryBridge {
-
-        private LegacyEntryBridge() {
-        }
-
-        static void handle(String packageName, ClassLoader classLoader, String processName) {
-            try {
-                final Class<?> paramClass =
-                        Class.forName("de.robv.android.xposed.callbacks.XC_LoadPackage$LoadPackageParam");
-                final java.lang.reflect.Constructor<?> ctor = paramClass.getDeclaredConstructor();
-                ctor.setAccessible(true);
-                final Object param = ctor.newInstance();
-
-                set(paramClass, param, "packageName", packageName);
-                set(paramClass, param, "classLoader", classLoader);
-                set(paramClass, param, "processName", processName);
-                set(paramClass, param, "isFirstApplication", Boolean.TRUE);
-
-                new HookEntry().handleLoadPackage(
-                        (de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam) param);
-            } catch (Throwable t) {
-                Log.w(TAG, "legacy entry bridge failed: " + t.getClass().getSimpleName());
-            }
-        }
-
-        private static void set(Class<?> paramClass, Object param, String field, Object value)
-                throws Exception {
-            final java.lang.reflect.Field f = paramClass.getField(field);
-            f.set(param, value);
-        }
-    }
 }

@@ -190,14 +190,25 @@ public final class SnapshotPrefs {
                 // openLocked() 失败时不再直接返回：新 API 后端的远程通道可能仍然可用，
                 // 定时器要继续为它产出数据（见 onTick()）。
                 final boolean opened = openLocked();
-                if (!opened && !remoteBound()) {
-                    return;   // 两条通道都没有：本会话什么都不写，回退通道继续工作
-                }
+                // 即使两条通道此刻都不可用也要排定时器：新 API 下 binder 是异步送达的，
+                // 若这里 return，绑定之后也没有任何 tick 会把数据补发出去（见审查 #2）。
+                // 绑定成功时 RemotePrefs 会回调下面的监听，重置标记触发下一次全量重发。
                 lastLocAt = 0L;
                 lastGnssAt = 0L;
                 lastTargetsAt = 0L;
                 lastGnssJson = null;
                 lastTargetsJson = null;
+                // 绑定成功后重置标记：下一次 tick 把 loc/gnss/targets 全量重发一遍，
+                // 避免"绑定前已推进标记、绑定后永远不再发送"（审查 #2/#3）。
+                RemotePrefs.setOnBound(() -> {
+                    synchronized (lock) {
+                        lastLocAt = 0L;
+                        lastGnssAt = 0L;
+                        lastTargetsAt = 0L;
+                        lastGnssJson = null;
+                        lastTargetsJson = null;
+                    }
+                });
                 if (handler == null) {
                     handler = new Handler(Looper.getMainLooper());
                 }
@@ -435,7 +446,16 @@ public final class SnapshotPrefs {
 
             // 双写：新 API 后端读的是框架维护的远程偏好处。RemotePrefs 只做
             // volatile 检查 + 入队（真正的 binder 在它自己的后台线程上），主线程不阻塞。
-            RemotePrefs.write(changed, null);
+            final boolean remoteOk = RemotePrefs.write(changed, null);
+            if (opened == null && !remoteOk) {
+                // 两条通道都没送出去：回退标记，下一 tick 重发（否则 targets 永远进不了
+                // 远程组 → TargetScope 读不到名单 → 作用域静默失效，见审查 #3）。
+                lastLocAt = 0L;
+                lastGnssAt = 0L;
+                lastTargetsAt = 0L;
+                lastGnssJson = null;
+                lastTargetsJson = null;
+            }
         } catch (Throwable ignored) {
             // prefs 被删 / 编辑器失效 / 序列化异常：一律静默，绝不影响会话
         }
