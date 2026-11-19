@@ -663,6 +663,8 @@ final class SystemHooks {
     private static final AtomicBoolean sLoggedSnapshotUnavailable = new AtomicBoolean();
     /** prefs 快照过期（主 App 已经没有会话在跑）每进程只记一条。 */
     private static final AtomicBoolean sLoggedPrefsStale = new AtomicBoolean();
+    /** 系统级卫星表“这次为什么没替换”每进程只记一条（见 {@link #logGnssSkippedOnce}）。 */
+    private static final AtomicBoolean sLoggedGnssSkipped = new AtomicBoolean();
 
     /** 日志用「方法名 args=参数个数」；任何异常都退化成占位，绝不影响 hook。 */
     private static String describeCall(Param param) {
@@ -713,6 +715,23 @@ final class SystemHooks {
         try {
             if (sLoggedSnapshotUnavailable.compareAndSet(false, true)) {
                 log("snapshot unavailable: " + reason);
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /**
+     * 系统级卫星表“这次为什么没替换”每进程一行。
+     *
+     * <p>现场最常见的问题是“hook 装上了、坐标也注入了，但目标 App 里还是 0 颗卫星”，
+     * 只看 {@code system gnss replaced} 无法区分是“没走到替换”还是“走不到、被跳过了”，
+     * 所以这里把首次跳过原因写出来（后续替换成功会有另一条日志，两者成对出现）。
+     */
+    private static void logGnssSkippedOnce(String reason) {
+        try {
+            if (sLoggedGnssSkipped.compareAndSet(false, true)) {
+                log("system gnss skipped: " + reason);
             }
         } catch (Throwable ignored) {
             // 日志绝不抛出
@@ -1516,20 +1535,34 @@ final class SystemHooks {
         protected void before(Param param) {
             try {
                 if (currentLocation() == null) {
+                    logGnssSkippedOnce("not-simulating");
                     return;   // 未在模拟：透传真实卫星
                 }
                 final List<Satellite> satellites = currentSatellites();
-                if (satellites == null || satellites.isEmpty() || param.args == null) {
+                if (satellites == null || satellites.isEmpty()) {
+                    logGnssSkippedOnce("no-satellites");
+                    return;
+                }
+                if (param.args == null) {
+                    logGnssSkippedOnce("no-args");
                     return;
                 }
                 final GnssStatus status = buildGnssStatus(satellites);
                 if (status == null) {
+                    // 三级兜底全失败 / 校验没过：保持真实卫星（工厂已记一条 gnss build failed）
+                    logGnssSkippedOnce("build-null");
                     return;
                 }
+                boolean replaced = false;
                 for (int i = 0; i < param.args.length; i++) {
                     if (param.args[i] instanceof GnssStatus) {
                         param.args[i] = status;
+                        replaced = true;
                     }
+                }
+                if (!replaced) {
+                    logGnssSkippedOnce("no-status-arg");
+                    return;
                 }
                 if (!sLoggedFirstGnss) {
                     sLoggedFirstGnss = true;
@@ -1541,30 +1574,26 @@ final class SystemHooks {
         }
     };
 
-    /** {@code GnssStatus$Builder}：API 30+ 才公开，缺失时整段返回 null（透传真实卫星）。 */
-    private static final String GNSS_STATUS_BUILDER_CLASS = "android.location.GnssStatus$Builder";
-
-    /** 用反射的 GnssStatus$Builder 造一套与主 App 一致的卫星（API 30+）。 */
+    /**
+     * 造一套与主 App 一致的卫星表，交给 {@link GnssStatusFactory} 做三级兜底
+     * （Builder → 反射构造器 → Unsafe；每级都自检，通过后锁定到本进程）。
+     *
+     * <p>返回 {@code null} = 本进程没有可用构造路径（或产出校验没过）：调用方保持真实卫星，
+     * 绝不替换成半成品。每级失败的原因由工厂记一条
+     * {@code gnss build failed: ctors=[…] fields=[…] err=…}。
+     */
     private static GnssStatus buildGnssStatus(List<Satellite> satellites) {
-        try {
-            final Class<?> builderClass =
-                    HookCompat.find(GnssStatus.class.getClassLoader(), GNSS_STATUS_BUILDER_CLASS);
-            if (builderClass == null) {
-                // Android 11 以下没有公开的 Builder：不造卫星（回调里保持真实值），只记一条日志
-                HookCompat.logCandidate(GNSS_STATUS_BUILDER_CLASS, false, 0, "system-gnss",
-                        "absent before API 30");
-                return null;
-            }
-            final Object builder = Xp.newInstance(builderClass);
-            for (Satellite sat : satellites) {
-                Xp.callMethod(builder, "addSatellite",
-                        sat.svid, sat.constellation, sat.cn0, sat.elevation, sat.azimuth,
-                        sat.carrierHz, sat.usedInFix, sat.hasAlmanac, sat.hasEphemeris);
-            }
-            return (GnssStatus) Xp.callMethod(builder, "build");
-        } catch (Throwable t) {
+        if (satellites == null || satellites.isEmpty()) {
             return null;
         }
+        final List<GnssStatusFactory.Sat> input = new ArrayList<>(satellites.size());
+        for (int i = 0; i < satellites.size(); i++) {
+            final Satellite sat = satellites.get(i);
+            input.add(new GnssStatusFactory.Sat(sat.svid, sat.constellation, sat.cn0,
+                    sat.elevation, sat.azimuth, sat.carrierHz, sat.usedInFix,
+                    sat.hasAlmanac, sat.hasEphemeris));
+        }
+        return GnssStatusFactory.create(input);
     }
 
     // ================================================================== 快照读取（prefs → 套接字 → Provider）
