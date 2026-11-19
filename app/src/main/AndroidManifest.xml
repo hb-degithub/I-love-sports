@@ -16,6 +16,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 应用内更新：下载完成后拉起系统安装器（仍需用户在系统设置里允许
+         「安装未知应用」，见 MainActivity.installUpdateApk 的引导） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <!-- 虚拟摄像头悬浮窗的前台服务（Android 14 起特殊用途需单独声明） -->
@@ -125,5 +128,18 @@
             android:authorities="com.vloc.motion.env"
             android:exported="true"
             android:grantUriPermissions="false" />
+
+        <!-- 应用内更新：把下载到「外部 files/Download」的 APK 以 content:// 交给系统安装器。
+             exported=false + 仅临时 grantUriPermissions；路径白名单见 res/xml/file_paths.xml
+             （只暴露 Download 子目录，不暴露整个外部目录）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.vloc.motion.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider 暴露路径（仅用于应用内下载的更新 APK）。
+
+    只暴露「应用外部私有目录下的 Download 子目录」——
+    即 DownloadManager.setDestinationInExternalFilesDir(context,
+    Environment.DIRECTORY_DOWNLOADS, name) 的落盘位置
+    （/sdcard/Android/data/com.vloc.motion/files/Download/），
+    不暴露整个外部目录、也不暴露 files/ 根目录：
+    FileProvider 的 external-files-path 根是 getExternalFilesDir(null)（.../files），
+    所以 path 写 "Download/" 而不是 "files/Download/"。
+
+    安全约束：本 Provider 为 exported=false，且只在拉起安装器时通过
+    FLAG_GRANT_READ_URI_PERMISSION 临时授权，其他应用拿不到该目录的常驻访问权。
+-->
+<paths>
+    <external-files-path
+        name="update_apk"
+        path="Download/" />
+</paths>

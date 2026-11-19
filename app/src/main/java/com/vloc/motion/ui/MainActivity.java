@@ -1,11 +1,17 @@
 package com.vloc.motion.ui;
 
 import android.Manifest;
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.net.Uri;
+import android.os.Environment;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Log;
@@ -36,6 +42,7 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 
 import com.google.android.material.appbar.MaterialToolbar;
 import com.google.android.material.button.MaterialButton;
@@ -51,6 +58,7 @@ import com.vloc.motion.core.Route;
 import com.vloc.motion.core.RouteStore;
 import com.vloc.motion.core.TleUpdater;
 import com.vloc.motion.core.TraceCleaner;
+import com.vloc.motion.core.UpdateChecker;
 import com.vloc.motion.location.RealLocationProvider;
 import com.vloc.motion.location.ModuleCheck;
 import com.vloc.motion.location.RootShell;
@@ -111,6 +119,18 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private static final int SERVICE_NOTIFICATION_ID = 1001;
     private static final int ALERT_NOTIFICATION_ID = 1002;
 
+    /**
+     * 更新 APK 的 FileProvider authority，必须与 {@code AndroidManifest.xml} 里的
+     * {@code <provider android:authorities="...">} 完全一致（写错只会在安装时抛
+     * IllegalArgumentException，编译期发现不了）。
+     */
+    private static final String FILE_PROVIDER_AUTHORITY = "com.vloc.motion.fileprovider";
+
+    /** 安装前预检 APK 签名的三种结果（{@link #checkApkSignature}）。 */
+    private static final int SIGNATURE_UNKNOWN = 0;
+    private static final int SIGNATURE_MATCH = 1;
+    private static final int SIGNATURE_MISMATCH = 2;
+
     private MapView mapView;
     /** 是否已 detach 过 MapView：onDestroy 只释放一次，避免重复 onDetach。 */
     private boolean mapViewDetached;
@@ -147,6 +167,37 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     private boolean tleUpdating;
     /** 启动期星表检查只做一次（Activity 因配置变化重建时不重复弹提醒）。 */
     private boolean tleReminderChecked;
+
+    /** 启动期版本检查只做一次（同一 Activity 内不重复发起）。 */
+    private boolean autoUpdateChecked;
+    /** 设置里的「检查更新」正在请求中：避免连点重复起后台任务。 */
+    private boolean manualUpdateChecking;
+    /** 本次更新下载的 DownloadManager id（<=0 = 没有进行中的下载）。 */
+    private long updateDownloadId = -1L;
+    /** 本次更新下载的 APK 直链与落盘文件名：完成回调里要按名字回查文件。 */
+    private String updateApkUrl;
+    private String updateApkName;
+    /** 下载完成广播是否已注册（重复注册会收到两次）。 */
+    private boolean updateReceiverRegistered;
+
+    /**
+     * DownloadManager 下载完成广播：只认本次更新下载的 id，其余（别的应用/本应用其它下载、
+     * 或伪造的广播）一律忽略——真正的状态以 {@code DownloadManager.query()} 为准。
+     */
+    private final BroadcastReceiver updateDownloadReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null
+                    || !DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(intent.getAction())) {
+                return;
+            }
+            final long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+            if (id <= 0L || updateDownloadId <= 0L || id != updateDownloadId) {
+                return;
+            }
+            handleUpdateDownloadComplete(id);
+        }
+    };
 
     // 目标配速选择器候选值（用选择器代替手工输入，避免非法数据）
     private static final int[] LAP_OPTIONS = {200, 300, 350, 398, 400, 500, 800, 1000};
@@ -187,6 +238,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         autoPickTileSource(false);
         watchTileLoading();
         maybeRemindTleUpdate();
+        // 版本检查放最后：后台线程 + 24 小时节流，不阻塞启动，也不显示 loading；
+        // 只有确实有新版本才弹窗（见 maybeAutoCheckUpdate）
+        maybeAutoCheckUpdate();
     }
 
     @Override
@@ -213,6 +267,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
 
     @Override
     protected void onDestroy() {
+        // 下载完成广播只在 Activity 存活期间收：销毁后不再回调已失效的界面
+        unregisterUpdateReceiver();
         // osmdroid 的 MapView 持有瓦片缓存/下载器与原生资源，不 detach 会随 Activity 泄漏
         detachMapView();
         super.onDestroy();
@@ -1878,6 +1934,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         final InjectionPanel injectPanel = addInjectionStatusPanel(content);
         // 「停止时清理日志（logcat）」：新增开关（SettingsSchema 里登记为 clear_logcat_on_stop）
         SwitchMaterial switchClearLogcat = addClearLogcatOption(content);
+        // 「应用更新」：当前版本 + 检查更新（追加在最后，不插入、不重排既有项）
+        addAppUpdateRow(content);
 
         // ---- 回填当前值 ----
         editAltitude.setText(String.format(Locale.US, "%.0f", RouteStore.loadAltitude(this)));
@@ -2800,6 +2858,494 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                         + "部分应用会检测并拒绝。安装 hidden 隐藏模块并在 LSPosed 中启用，可清除该标记。")
                 .setPositiveButton("知道了", null)
                 .show();
+    }
+
+    // ------------------------------------------------------------ 应用内更新（检查 / 下载 / 安装）
+
+    /**
+     * 启动时的静默版本检查：24 小时内只做一次，查到有更新才弹窗，其余情况完全不提示。
+     *
+     * <p>节流时间在发起请求<b>之前</b>就落盘（{@link UpdateChecker#markChecked}）：
+     * 检查失败也算"查过了"，不会每次冷启动都去打 GitHub 接口；手动检查不受这个限制。
+     * 网络在 {@link UpdateChecker} 的后台线程里跑，这里不阻塞、不显示 loading。
+     */
+    private void maybeAutoCheckUpdate() {
+        if (autoUpdateChecked) {
+            return;
+        }
+        autoUpdateChecked = true;
+        try {
+            if (!UpdateChecker.shouldAutoCheck(this)) {
+                return;
+            }
+            UpdateChecker.markChecked(this);
+            UpdateChecker.check(this, (hasUpdate, latestTag, notes, apkUrl, sha256Url, error) -> {
+                // 静默：失败不提示、没有更新也不提示；只有确实有新版本才弹窗
+                if (error != null || !hasUpdate) {
+                    return;
+                }
+                showUpdateDialog(latestTag, notes, apkUrl);
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "auto update check failed", t);
+        }
+    }
+
+    /**
+     * 设置弹窗里的「应用更新」行：{@code 当前版本 vX.Y.Z} + 「检查更新」按钮。
+     *
+     * <p>沿用 {@link #addGnssSyntheticOption} 的做法（{@code res/layout/dialog_settings.xml}
+     * 属于前端资源、本轮不动）：按 {@code ScrollView → LinearLayout} 的结构追加到末尾，
+     * <b>不插入、不重排既有设置项</b>。
+     */
+    private void addAppUpdateRow(View content) {
+        try {
+            final LinearLayout container = settingsContainer(content);
+            if (container == null) {
+                return;
+            }
+            container.addView(groupTitle("应用更新"));
+            final LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            final TextView version = new TextView(this);
+            version.setText("当前版本 v" + UpdateChecker.currentVersionName());
+            version.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+            try {
+                version.setTextColor(ContextCompat.getColor(this, R.color.text_secondary));
+            } catch (Throwable ignored) {
+                // 取不到主题色只是观感差异，不影响功能
+            }
+            version.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            final Button check = new Button(this);
+            check.setText("检查更新");
+            check.setOnClickListener(v -> startManualUpdateCheck(check));
+            row.addView(version);
+            row.addView(check);
+            container.addView(row);
+            container.addView(hintText(
+                    "从 GitHub Releases 检查最新版本；无更新时会提示「已是最新版本」。"));
+        } catch (Throwable t) {
+            Log.w(TAG, "add app update row failed", t);
+        }
+    }
+
+    /**
+     * 手动检查更新（设置里的「检查更新」）：无更新 / 失败都只 Toast，不弹窗。
+     *
+     * <p>回调可能晚于对话框关闭，所以只判 Activity 状态、不碰对话框视图；
+     * 检查期间禁用按钮，防止连点重复起后台任务。
+     */
+    private void startManualUpdateCheck(final Button button) {
+        if (manualUpdateChecking) {
+            toast("正在检查更新，请稍候…");
+            return;
+        }
+        manualUpdateChecking = true;
+        setCheckButtonEnabled(button, false);
+        try {
+            UpdateChecker.check(this, (hasUpdate, latestTag, notes, apkUrl, sha256Url, error) -> {
+                manualUpdateChecking = false;
+                setCheckButtonEnabled(button, true);
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                if (error != null) {
+                    toast("检查失败：" + error);
+                    return;
+                }
+                if (!hasUpdate) {
+                    toast("已是最新版本（当前 v" + UpdateChecker.currentVersionName() + "）");
+                    return;
+                }
+                showUpdateDialog(latestTag, notes, apkUrl);
+            });
+        } catch (Throwable t) {
+            manualUpdateChecking = false;
+            setCheckButtonEnabled(button, true);
+            toast("检查失败：" + reasonText(t));
+        }
+    }
+
+    /** 检查期间禁用按钮（视图已分离时只记日志，不影响检查本身）。 */
+    private static void setCheckButtonEnabled(final Button button, final boolean enabled) {
+        if (button == null) {
+            return;
+        }
+        try {
+            button.setEnabled(enabled);
+            button.setAlpha(enabled ? 1f : 0.5f);
+        } catch (Throwable ignored) {
+            // 视图已分离：忽略
+        }
+    }
+
+    /**
+     * 「发现新版本」对话框：当前版本 → 新版本 + 更新说明（截断到 ~500 字）+ 下载并安装 / 稍后。
+     *
+     * <p>回调来自主线程，Activity 已销毁（用户已退出）时直接丢弃，不更新任何视图。
+     */
+    private void showUpdateDialog(String latestTag, String notes, final String apkUrl) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        final String remote = tagWithPrefix(latestTag);
+        final String current = UpdateChecker.currentVersionName();
+        final String body = clipNotes(notes, 500);
+        final StringBuilder message = new StringBuilder();
+        message.append("当前版本 v").append(current)
+                .append(" → 新版本 ").append(remote).append('\n');
+        if (!body.isEmpty()) {
+            message.append("\n更新说明：\n").append(body).append('\n');
+        }
+        message.append("\n下载完成后会拉起系统安装器（首次需允许「安装未知应用」）。")
+                .append("\n提示：若安装时提示「签名不一致 / 应用未安装」，请先卸载当前版本再安装")
+                .append("（本机路线库、使用记录等数据会被清空）。");
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("发现新版本 " + remote)
+                    .setMessage(message.toString())
+                    .setPositiveButton("下载并安装",
+                            (dialog, which) -> startUpdateDownload(remote, apkUrl))
+                    .setNegativeButton("稍后", null)
+                    .show();
+        } catch (Throwable t) {
+            Log.w(TAG, "show update dialog failed", t);
+        }
+    }
+
+    /** tag 统一带 v 前缀用于展示（GitHub 的 tag 一般本来就是 vX.Y.Z）。 */
+    private static String tagWithPrefix(String tag) {
+        final String text = tag == null ? "" : tag.trim();
+        if (text.isEmpty()) {
+            return "v?";
+        }
+        return text.startsWith("v") || text.startsWith("V") ? "v" + text.substring(1) : "v" + text;
+    }
+
+    /**
+     * 更新说明截断到约 {@code max} 字：Release 正文可能很长，把对话框撑爆不好看；
+     * 截断时避免切坏 emoji 的代理对（不会产生半个字符导致的乱码）。
+     */
+    private static String clipNotes(String notes, int max) {
+        if (notes == null) {
+            return "";
+        }
+        final String text = notes.trim();
+        if (text.length() <= max) {
+            return text;
+        }
+        int end = Math.max(max, 0);
+        if (end > 0 && Character.isHighSurrogate(text.charAt(end - 1))) {
+            end--;
+        }
+        return text.substring(0, end).trim() + "…";
+    }
+
+    /**
+     * 用 DownloadManager 下载 APK 到「应用外部目录 → Download」：通知栏显示进度，
+     * 完成后由 {@link #updateDownloadReceiver} 拉起安装。
+     *
+     * <p>任何一步失败（系统下载服务不可用 / 外部目录不可写 / enqueue 抛异常）都退回
+     * 浏览器打开 APK 直链；连直链都没有就打开 Releases 页。
+     */
+    private void startUpdateDownload(String remoteTag, String apkUrl) {
+        final String url = apkUrl == null ? "" : apkUrl.trim();
+        if (url.isEmpty()) {
+            toast("下载地址不可用，改用浏览器打开发布页");
+            openInBrowser(null);
+            return;
+        }
+        final String name = updateApkFileName(remoteTag, url);
+        try {
+            final DownloadManager manager =
+                    (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (manager == null) {
+                throw new IllegalStateException("系统下载服务不可用");
+            }
+            final File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            if (dir == null) {
+                throw new IllegalStateException("外部下载目录不可用");
+            }
+            // DownloadManager 的目标文件已存在时 enqueue 会直接失败：先清掉上一次的残留
+            final File stale = new File(dir, name);
+            if (stale.isFile() && !stale.delete()) {
+                Log.w(TAG, "delete stale apk failed: " + stale);
+            }
+            final DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+            request.setTitle("虚拟运动 " + tagWithPrefix(remoteTag));
+            request.setDescription("正在下载新版本，完成后会提示安装");
+            request.setMimeType("application/vnd.android.package-archive");
+            request.setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setAllowedOverMetered(true);
+            request.setAllowedOverRoaming(true);
+            request.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name);
+            updateDownloadId = manager.enqueue(request);
+            updateApkUrl = url;
+            updateApkName = name;
+            registerUpdateReceiver();
+            toast("开始下载，可在通知栏查看进度");
+        } catch (Throwable t) {
+            Log.w(TAG, "start update download failed", t);
+            toast("下载启动失败：" + reasonText(t) + "，改用浏览器下载");
+            openInBrowser(url);
+        }
+    }
+
+    /** 下载文件名：优先复用 URL 里的 {@code virtual-motion-*.apk}，否则按版本号拼一个。 */
+    private static String updateApkFileName(String remoteTag, String apkUrl) {
+        final String version = remoteTag == null ? "" : remoteTag.trim().replaceFirst("^[vV]", "");
+        final String fallback = "virtual-motion-" + (version.isEmpty() ? "latest" : version) + ".apk";
+        try {
+            final String segment = Uri.parse(apkUrl).getLastPathSegment();
+            if (segment != null) {
+                // 只取 basename：防止 URL 里的 ../ 之类路径穿越写到 Download 之外
+                final String name = new File(segment).getName();
+                if (name.startsWith("virtual-motion-") && name.endsWith(".apk")) {
+                    return name;
+                }
+            }
+        } catch (Throwable ignored) {
+            // URL 解析失败就用拼出来的名字
+        }
+        return fallback;
+    }
+
+    /** 注册下载完成广播（只注册一次；Android 14 起必须显式给 exported 标记）。 */
+    private void registerUpdateReceiver() {
+        if (updateReceiverRegistered) {
+            return;
+        }
+        try {
+            // ACTION_DOWNLOAD_COMPLETE 由系统下载服务（独立进程/UID）发出，
+            // 用 RECEIVER_EXPORTED 才能稳定收到；接收端只认本次 updateDownloadId，
+            // 其它 id 的广播（含伪造的）一律忽略，真实状态以 DownloadManager.query 为准。
+            ContextCompat.registerReceiver(this, updateDownloadReceiver,
+                    new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+                    ContextCompat.RECEIVER_EXPORTED);
+            updateReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "register download receiver failed", t);
+        }
+    }
+
+    /** 注销下载完成广播（Activity 销毁时调用；重复调用安全）。 */
+    private void unregisterUpdateReceiver() {
+        if (!updateReceiverRegistered) {
+            return;
+        }
+        updateReceiverRegistered = false;
+        try {
+            unregisterReceiver(updateDownloadReceiver);
+        } catch (Throwable t) {
+            Log.w(TAG, "unregister download receiver failed", t);
+        }
+    }
+
+    /**
+     * 下载完成：后台核对下载状态、找文件、预检签名，再回主线程拉起安装器。
+     *
+     * <p>状态失败 / 文件缺失 / 文件为空 → 退回浏览器下载；签名与已安装版本不一致时
+     * 先弹提示（系统必然拒绝覆盖安装），由用户决定是否仍然尝试。
+     */
+    private void handleUpdateDownloadComplete(final long downloadId) {
+        final String url = updateApkUrl;
+        final File apk = pendingUpdateApkFile();
+        new Thread(() -> {
+            final int status = queryDownloadStatus(downloadId);
+            final boolean ready = status == DownloadManager.STATUS_SUCCESSFUL
+                    && apk != null && apk.isFile() && apk.length() > 0L;
+            final int signature = ready ? checkApkSignature(apk) : SIGNATURE_UNKNOWN;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                if (!ready) {
+                    updateDownloadId = -1L;
+                    toast("下载失败，改用浏览器下载");
+                    openInBrowser(url);
+                    return;
+                }
+                if (signature == SIGNATURE_MISMATCH) {
+                    showSignatureMismatchDialog(apk, url);
+                    return;
+                }
+                installUpdateApk(apk, url);
+            });
+        }, "vloc-update-install").start();
+    }
+
+    /** 本次下载的 APK 文件（外部 {@code files/Download} 下，与 FileProvider 暴露的路径一致）。 */
+    private File pendingUpdateApkFile() {
+        if (updateApkName == null || updateApkName.isEmpty()) {
+            return null;
+        }
+        try {
+            final File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            return dir == null ? null : new File(dir, updateApkName);
+        } catch (Throwable t) {
+            Log.w(TAG, "resolve apk file failed", t);
+            return null;
+        }
+    }
+
+    /** 查 DownloadManager 里这次下载的状态（查不到 / 异常都按 STATUS_FAILED 处理）。 */
+    private int queryDownloadStatus(long downloadId) {
+        Cursor cursor = null;
+        try {
+            final DownloadManager manager =
+                    (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (manager == null) {
+                return DownloadManager.STATUS_FAILED;
+            }
+            cursor = manager.query(new DownloadManager.Query().setFilterById(downloadId));
+            if (cursor != null && cursor.moveToFirst()) {
+                final int column = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS);
+                if (column >= 0) {
+                    return cursor.getInt(column);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "query download status failed", t);
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored) {
+                    // 关闭失败无需处理
+                }
+            }
+        }
+        return DownloadManager.STATUS_FAILED;
+    }
+
+    /**
+     * 预检 APK 的签名 / 包名是否与已安装版本一致（后台线程调用）。
+     *
+     * <p>签名不同（例如之前用别的 debug keystore 签名装过）时系统必然拒绝覆盖安装
+     * （提示「应用未安装 / 解析包时出现问题」），提前发现能给用户可操作的说明；
+     * APK 读不出来就返回 {@link #SIGNATURE_UNKNOWN}，不阻挡正常安装。
+     */
+    @SuppressWarnings("deprecation")
+    private int checkApkSignature(File apk) {
+        if (apk == null || !apk.isFile()) {
+            return SIGNATURE_UNKNOWN;
+        }
+        try {
+            final PackageManager pm = getPackageManager();
+            final PackageInfo archive =
+                    pm.getPackageArchiveInfo(apk.getAbsolutePath(), PackageManager.GET_SIGNATURES);
+            if (archive == null || archive.signatures == null || archive.signatures.length == 0) {
+                return SIGNATURE_UNKNOWN;
+            }
+            if (archive.packageName != null && !getPackageName().equals(archive.packageName)) {
+                return SIGNATURE_MISMATCH;   // 附件不是本应用的包，装上也覆盖不了
+            }
+            final PackageInfo installed =
+                    pm.getPackageInfo(getPackageName(), PackageManager.GET_SIGNATURES);
+            if (installed == null || installed.signatures == null
+                    || installed.signatures.length == 0) {
+                return SIGNATURE_UNKNOWN;
+            }
+            final byte[] remote = archive.signatures[0].toByteArray();
+            final byte[] local = installed.signatures[0].toByteArray();
+            return Arrays.equals(remote, local) ? SIGNATURE_MATCH : SIGNATURE_MISMATCH;
+        } catch (Throwable t) {
+            Log.w(TAG, "apk signature check failed", t);
+            return SIGNATURE_UNKNOWN;
+        }
+    }
+
+    /** 签名不一致提示：覆盖安装必然失败，先把原因和代价（卸载会清数据）讲清楚。 */
+    private void showSignatureMismatchDialog(final File apk, final String apkUrl) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("签名与已安装版本不一致")
+                    .setMessage("下载的 APK 与当前安装的版本签名不同，系统会拒绝覆盖安装"
+                            + "（通常提示「应用未安装」或「解析包时出现问题」）。\n\n"
+                            + "解决办法：先卸载当前版本，再安装新版本。"
+                            + "卸载会清空本机路线库、使用记录、作用域名单等数据。\n\n"
+                            + "也可以取消后用浏览器下载，自行处理。")
+                    .setPositiveButton("仍然尝试安装", (d, which) -> installUpdateApk(apk, apkUrl))
+                    .setNeutralButton("浏览器下载", (d, which) -> openInBrowser(apkUrl))
+                    .setNegativeButton("取消", null)
+                    .show();
+        } catch (Throwable t) {
+            Log.w(TAG, "show signature mismatch dialog failed", t);
+            installUpdateApk(apk, apkUrl);
+        }
+    }
+
+    /**
+     * FileProvider + ACTION_VIEW 拉起系统安装器；失败再退回浏览器。
+     *
+     * <p>Android 8+ 必须先允许本应用「安装未知应用」，否则安装器直接拒绝，
+     * 这里提前引导去系统设置（装好后再点一次「下载并安装」即可复用已下载的文件）。
+     * 注意：这里传的是 {@code content://} URI + 只读临时授权，FileProvider 也只
+     * 暴露 {@code files/Download} 子目录，不把整个外部目录交给安装器。
+     */
+    private void installUpdateApk(final File apk, final String apkUrl) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        try {
+            if (apk == null || !apk.isFile() || apk.length() <= 0L) {
+                toast("安装包不完整，请重新下载");
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    && !getPackageManager().canRequestPackageInstalls()) {
+                toast("请先允许本应用「安装未知应用」，再回到这里重试");
+                try {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:" + getPackageName())));
+                } catch (Throwable t) {
+                    Log.w(TAG, "open unknown-sources settings failed", t);
+                }
+                return;
+            }
+            final Uri uri = FileProvider.getUriForFile(this, FILE_PROVIDER_AUTHORITY, apk);
+            final Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(intent);
+            // 安装器已拉起：清掉待处理下载 id，避免同一个广播被重复处理
+            updateDownloadId = -1L;
+            updateApkUrl = null;
+        } catch (Throwable t) {
+            Log.w(TAG, "install update apk failed", t);
+            toast("无法拉起安装器：" + reasonText(t) + "，改用浏览器下载");
+            openInBrowser(apkUrl);
+        }
+    }
+
+    /** 浏览器兜底：优先打开 APK 直链，地址缺失时打开 GitHub Releases 页。 */
+    private void openInBrowser(String url) {
+        final String target = url == null || url.trim().isEmpty()
+                ? UpdateChecker.RELEASES_URL : url.trim();
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(target)));
+        } catch (Throwable t) {
+            Log.w(TAG, "open browser failed", t);
+            toast("无法打开浏览器，请手动访问 " + target);
+        }
+    }
+
+    /** 异常 → 可展示原因（与 UpdateChecker / TleUpdater 的写法保持一致）。 */
+    private static String reasonText(Throwable t) {
+        if (t == null) {
+            return "未知错误";
+        }
+        final String message = t.getMessage();
+        if (message != null && !message.trim().isEmpty()) {
+            return message.trim();
+        }
+        return t.getClass().getSimpleName();
     }
 
     // ------------------------------------------------------------ 工具
