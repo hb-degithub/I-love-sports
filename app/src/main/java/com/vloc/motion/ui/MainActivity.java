@@ -1928,6 +1928,12 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         TextView textInjectMode = content.findViewById(R.id.textInjectMode);
         // 「GNSS 完全模拟」：不改布局 XML（本次只动 Java），运行时插进「定位参数」之前
         CheckBox cbGnssSynthetic = addGnssSyntheticOption(content);
+        // 「强制接管 GNSS」：构造替换失败时由模块就地改写系统卫星表（默认开）
+        final CheckBox cbGnssForce = addGnssForceOption(content);
+        // 打开设置就把当前开关同步给模块通道：痕迹清理会删掉 vloc_snapshot.xml，删完之后
+        // 模块读不到 key → 退回默认（开）；用户重开设置即恢复自己的选择，不会"设置显示关、
+        // 实际却按开执行"
+        RouteStore.publishGnssForce(this, RouteStore.loadGnssForce(this));
         // 「GNSS 星表」信息行 + 检查更新按钮：同样运行时插进布局末尾
         addTleUpdateRow(content);
         // 「注入环境」只读状态面板 + 「立即清理痕迹」：追加在既有 9 项之后，不重排
@@ -1951,6 +1957,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         switchAutoStop.setChecked(RouteStore.loadAutoStopOnFinish(this));
         switchSystemInject.setChecked(RouteStore.loadSystemInject(this));
         cbGnssSynthetic.setChecked(RouteStore.loadGnssSynthetic(this));
+        cbGnssForce.setChecked(RouteStore.loadGnssForce(this));
         switchClearLogcat.setChecked(RouteStore.loadClearLogcatOnStop(this));
         updateInjectModeHint(textInjectMode, switchSystemInject.isChecked());
         // 系统级注入时 Provider 勾选无意义，直接禁用避免误解
@@ -1969,7 +1976,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                         saveSettings(editAltitude, editAccuracy, cbGps, cbNetwork, cbFused,
                                 switchRealism, switchSpeedVariance, switchAttitude,
                                 switchRandomStart, switchAutoStop, switchSystemInject,
-                                cbGnssSynthetic, switchClearLogcat))
+                                cbGnssSynthetic, switchClearLogcat, cbGnssForce))
                 .setNegativeButton("取消", null)
                 .create();
         injectPanel.dialog = dialog;
@@ -2042,6 +2049,41 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         return checkbox;
     }
 
+    /**
+     * 「强制接管 GNSS（构造失败时就地改写系统卫星表）」复选框：运行时插进设置弹窗。
+     *
+     * <p>与 {@link #addGnssSyntheticOption} 同一手法（{@code res/layout/dialog_settings.xml}
+     * 属于前端资源不改），位置在上一个 GNSS 选项之后、「定位参数」之前。
+     * key 是 {@code RouteStore.gnss_force}，<b>默认开</b>：构造替换（Builder → 反射构造器 →
+     * Unsafe）全部失败时，模块改为反射改写系统正在下发的 {@code GnssStatus}，而不是让 App
+     * 看到真实卫星（室内 0 颗、室外与模拟坐标对不上）。
+     *
+     * @return 复选框本身——即使插不进布局也照常返回，保证「保存」仍能读写该项
+     */
+    private CheckBox addGnssForceOption(View content) {
+        final CheckBox checkbox = new CheckBox(this);
+        checkbox.setText("强制接管 GNSS（构造失败时就地改写系统卫星表）");
+        try {
+            final LinearLayout container = settingsContainer(content);
+            if (container == null) {
+                return checkbox;   // 布局结构变了：设置仍可读写，绝不因为插不进视图而崩
+            }
+            int index = container.getChildCount();
+            for (int i = 0; i < container.getChildCount(); i++) {
+                final View child = container.getChildAt(i);
+                if (child instanceof TextView
+                        && "定位参数".contentEquals(((TextView) child).getText())) {
+                    index = i;
+                    break;
+                }
+            }
+            container.addView(checkbox, index);
+        } catch (Throwable t) {
+            Log.w("VLocSettings", "add gnss force option failed", t);
+        }
+        return checkbox;
+    }
+
     /** 设置弹窗的内容容器：{@code ScrollView} 里的那个 {@code LinearLayout}（取不到返回 null）。 */
     private static LinearLayout settingsContainer(View content) {
         View root = content;
@@ -2056,8 +2098,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
     /**
      * 「注入环境」面板的视图句柄。
      *
-     * <p>只做一件事：把 9 行状态文本（原有 7 行 + 兼容状态 2 行）和「立即清理痕迹」按钮
-     * 攒在一起，供异步回调回写；
+     * <p>只做一件事：把 10 行状态文本（原有 7 行 + 「卫星表注入」1 行 + 兼容状态 2 行）和
+     * 「立即清理痕迹」按钮攒在一起，供异步回调回写；
      * {@link #dialog} 是"面板还在不在"的唯一判据——对话框关掉后所有后台回调直接丢弃，
      * 既不会更新已销毁的视图，也不会因为 Activity 已 finishing 而崩。
      */
@@ -2069,6 +2111,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         TextView overlayValue;
         TextView snapshotValue;
         TextView cleanupValue;
+        /** 「卫星表注入」：最近一次 system 心跳里模块上报的 GNSS 注入结果。 */
+        TextView gnssValue;
         TextView lsposedValue;
         TextView systemValue;
         Button cleanButton;
@@ -2090,7 +2134,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
      *
      * <p>沿用 {@link #addGnssSyntheticOption} 的做法（{@code res/layout/dialog_settings.xml}
      * 属于前端资源、本轮不动）：整个面板按 {@code ScrollView → LinearLayout} 的结构追加，
-     * <b>不插入、不重排既有的 9 个设置项</b>。7 行数据来源见 {@link #refreshInjectionPanel}。
+     * <b>不插入、不重排既有的 9 个设置项</b>。10 行数据来源见 {@link #refreshInjectionPanel}。
      *
      * @return 视图句柄——即使布局结构变了、插不进去也照常返回（各值仍可刷新，只是看不见）
      */
@@ -2109,6 +2153,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             panel.overlayValue = addStatusRow(container, "悬浮窗", "…");
             panel.snapshotValue = addStatusRow(container, "快照文件", "检查中…");
             panel.cleanupValue = addStatusRow(container, "上次清理", "…");
+            // 卫星表注入：模块在 GNSS hook 首次确定结果后补报的心跳字段（gnss），
+            // 中文映射见 gnssInjectionLabel；无心跳 / 没上报 → 「未知」
+            panel.gnssValue = addStatusRow(container, "卫星表注入", "检查中…");
             // 兼容状态两行（只读、追加在既有 7 行之后，不重排）：
             //   LSPosed API —— XposedBridge.getXposedVersion()，反射取值，取不到显示「未知」
             //   系统版本   —— Android SDK <RELEASE>（API <SDK_INT>）+ 心跳里的已装 hook 组数
@@ -2174,6 +2221,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         setValue(panel.cleanupValue, lastCleanupText());
         setValue(panel.moduleValue, "检查中…");
         setValue(panel.appopValue, "检查中…");
+        // 「卫星表注入」要读心跳 prefs（后台线程），先占位
+        setValue(panel.gnssValue, "检查中…");
         // 兼容状态：LSPosed API 是内存反射（主线程直接读），系统版本先出 SDK 部分、
         // hook 组数要读心跳 prefs 所以留给下面的后台线程补全（拿不到保持「—」）。
         setValue(panel.lsposedValue, lsposedApiText());
@@ -2185,6 +2234,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             final String module = moduleInjectionText(app);
             final String snapshot = snapshotFileText(app);
             final String systemCompat = systemCompatText(app);
+            // 卫星表注入：最近一条 system 心跳里的 gnss 字段（模块在 GNSS hook 里补报）
+            final String gnss = gnssInjectionText(app);
             runOnUiThread(() -> {
                 if (!panel.alive()) {
                     return;
@@ -2192,6 +2243,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 setValue(panel.moduleValue, module);
                 setValue(panel.snapshotValue, snapshot);
                 setValue(panel.systemValue, systemCompat);
+                setValue(panel.gnssValue, gnss);
             });
         }, "vloc-inject-hb").start();
 
@@ -2314,6 +2366,59 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             }
         }
         return apps > 0 ? "已注入 " + apps + " 个应用进程" : "未检测到";
+    }
+
+    /**
+     * 面板「卫星表注入」行：最近一条 <b>system</b> 心跳里模块上报的 {@code gnss} 字段。
+     *
+     * <p>数据链路：{@code hidden/SystemHooks} 在 GNSS hook 里首次确定结果 → 静态字段
+     * {@code sGnssState} → {@code HookHeartbeat.reportGnss} 补一条心跳 →
+     * {@link HookHeartbeatStore.Beat#gnss}。这里只负责"取最近一条 + 中文映射"。
+     *
+     * <p>没有 system 心跳（模块没注入）、或心跳里没有 gnss（老版本模块；或补报还没到）
+     * 一律显示「未知」，不猜。
+     */
+    private static String gnssInjectionText(Context context) {
+        if (context == null) {
+            return "未知";
+        }
+        try {
+            final HookHeartbeatStore.Beat system = HookHeartbeatStore.freshestSystem(
+                    context, HookHeartbeatStore.FRESH_MS, Build.VERSION.SDK_INT);
+            if (system == null) {
+                return "未知";
+            }
+            return gnssInjectionLabel(system.gnss);
+        } catch (Throwable t) {
+            return "未知";
+        }
+    }
+
+    /**
+     * 模块上报值 → 面板中文（与 {@link HookHeartbeatStore} 的 {@code GNSS_*} 常量一一对应）。
+     *
+     * <p>未知值（更新的模块带来新枚举 / 脏数据）→「未知」：宁可少说，也不显示原始协议串。
+     */
+    private static String gnssInjectionLabel(String gnss) {
+        if (gnss == null) {
+            return "未知";
+        }
+        switch (gnss) {
+            case HookHeartbeatStore.GNSS_BUILT_BUILDER:
+                return "已构造(builder)";
+            case HookHeartbeatStore.GNSS_BUILT_CTOR:
+                return "已构造(构造器)";
+            case HookHeartbeatStore.GNSS_BUILT_UNSAFE:
+                return "已构造(Unsafe)";
+            case HookHeartbeatStore.GNSS_FORCE_MUTATED:
+                return "已强制改写";
+            case HookHeartbeatStore.GNSS_SKIP_NO_SATELLITES:
+                return "无卫星可用";
+            case HookHeartbeatStore.GNSS_SKIP_NULL:
+                return "未生效";
+            default:
+                return "未知";
+        }
     }
 
     /** 面板第 2 行：当前注入模式（{@code system_inject} 优先，否则看会话是否在跑）。 */
@@ -2719,7 +2824,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                               SwitchMaterial switchRealism, SwitchMaterial switchSpeedVariance,
                               SwitchMaterial switchAttitude, SwitchMaterial switchRandomStart,
                               SwitchMaterial switchAutoStop, SwitchMaterial switchSystemInject,
-                              CheckBox cbGnssSynthetic, SwitchMaterial switchClearLogcat) {
+                              CheckBox cbGnssSynthetic, SwitchMaterial switchClearLogcat,
+                              CheckBox cbGnssForce) {
         // 海拔：-500 ~ 9000 m 之外的输入夹紧
         float altitude = RouteStore.loadAltitude(this);
         try {
@@ -2765,6 +2871,11 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         RouteStore.saveSystemInject(this, switchSystemInject.isChecked());
         // GNSS 完全模拟：不依赖本机真实卫星（室内/模拟器）；与注入方式一样，下次「开始」生效
         RouteStore.saveGnssSynthetic(this, cbGnssSynthetic.isChecked());
+        // 强制接管 GNSS（默认开）：构造失败时就地改写系统卫星表 —— 模块侧 30s 内读到新值，
+        // 不用重启系统（saveGnssForce 同时把值发布到模块读得到的通道）
+        if (cbGnssForce != null) {
+            RouteStore.saveGnssForce(this, cbGnssForce.isChecked());
+        }
         // 停止时清 logcat（默认关；破坏性，只有用户显式打开才会在停止流程里执行）
         if (switchClearLogcat != null) {
             RouteStore.saveClearLogcatOnStop(this, switchClearLogcat.isChecked());

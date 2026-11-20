@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -105,6 +106,20 @@ final class SystemHooks {
     private static volatile int sHookCount;
     private static volatile boolean sLoggedFirstReplace;
     private static volatile boolean sLoggedFirstGnss;
+
+    /**
+     * 本进程 GNSS 注入的最终结果（心跳的 {@code gnss} 字段，见 {@link HookHeartbeat}）。
+     *
+     * <p>取值：{@code built:builder} / {@code built:ctor} / {@code built:unsafe} /
+     * {@code force:mutated} / {@code skip:no-satellites} / {@code skip:null}；
+     * {@code null} = 还没确定（卫星回调一次都没来过 / 未在模拟）。
+     */
+    private static volatile String sGnssState;
+
+    /** 当前结果（心跳读取用；取不到就是 {@code null}，主 App 面板显示「未知」）。 */
+    static String gnssState() {
+        return sGnssState;
+    }
 
     // ================================================================== 作用域（目标应用）
 
@@ -269,6 +284,8 @@ final class SystemHooks {
         log("target scope: " + TargetScope.summary());
         // GNSS 卫星表没有“接收方”信息：按契约保持全局生效，这里说明一次
         log("gnss sv status: no target pkg info -> always applies globally");
+        // 强制接管开关（默认开）：真机日志里直接能看到本进程按哪一侧执行
+        log("gnss force: " + (gnssForceEnabled() ? "on" : "off") + " (gnss_force)");
         report(hooked);
         return hooked;
     }
@@ -1530,16 +1547,103 @@ final class SystemHooks {
                 GNSS_HOOK, "gnss", true);
     }
 
+    // ---------------------------------------------------------------- 注入结果（心跳 / 面板）
+
+    /*
+     * 结果只写一个静态字段，由 SystemHooks 在 GNSS hook 里确定、HookHeartbeat 带回主 App
+     * （主 App 落到 HookHeartbeatStore，设置面板「注入环境 → 卫星表注入」直接显示中文）：
+     *   built:builder / built:ctor / built:unsafe  → 构造替换成功
+     *   force:mutated                              → 构造失败，就地改写系统卫星表成功
+     *   skip:no-satellites                         → 没有可写的卫星（系统 0 颗 / 快照为空）
+     *   skip:null                                  → 构造 + 就地改写都没成（或开关关闭）
+     * 「未在模拟」不写：那不是注入失败，只是本会话没在跑。
+     */
+
+    /** 心跳 {@code gnss} 字段的取值（与主 App {@code HookHeartbeatStore} / 面板逐字对应）。 */
+    static final String GNSS_BUILT_BUILDER = "built:builder";
+    static final String GNSS_BUILT_CTOR = "built:ctor";
+    static final String GNSS_BUILT_UNSAFE = "built:unsafe";
+    static final String GNSS_FORCE_MUTATED = "force:mutated";
+    static final String GNSS_SKIP_NO_SATELLITES = "skip:no-satellites";
+    static final String GNSS_SKIP_NULL = "skip:null";
+
+    /**
+     * 记下本进程的 GNSS 注入结果，并让心跳带上它。
+     *
+     * <p>{@link HookHeartbeat#report} 在 {@code install()} 之后立刻发一次心跳，那时卫星回调
+     * 还没来过，{@code gnss} 字段是空的；所以结果首次确定后调
+     * {@link HookHeartbeat#reportGnss(String)} <b>补发一条</b>带 gnss 的心跳（每进程一次），
+     * 否则设置面板永远是「未知」——这正是用户不想翻 logcat 的原因。
+     */
+    private static void setGnssState(String state) {
+        try {
+            if (state == null || state.equals(sGnssState)) {
+                return;
+            }
+            sGnssState = state;
+            HookHeartbeat.reportGnss(state);
+        } catch (Throwable ignored) {
+            // 状态只影响面板显示，绝不影响注入
+        }
+    }
+
+    // ---------------------------------------------------------------- 「强制接管 GNSS」开关
+
+    /** 与主 App {@code core/RouteStore.KEY_GNSS_FORCE} 逐字一致（world-readable prefs 通道）。 */
+    private static final String PREF_GNSS_FORCE = "gnss_force";
+
+    /** 开关读取缓存：GNSS 回调约 1Hz，不必每次都 stat prefs 文件；改设置最迟 30s 生效。 */
+    private static final long GNSS_FORCE_TTL_MS = 30_000L;
+
+    private static volatile boolean sGnssForce = true;
+    private static volatile long sGnssForceReadAt;
+
+    private static final AtomicBoolean sLoggedGnssForceOff = new AtomicBoolean();
+
+    /**
+     * 「强制接管 GNSS」是否启用（<b>默认开</b>）。
+     *
+     * <p>模块侧从 {@link PrefsClient}（LSPosed New XSharedPreferences /
+     * {@code Xp.getPrefs}，prefs 名与主 App {@code SnapshotPrefs} 一致）读 {@code gnss_force}；
+     * 主 App 由 {@code core/RouteStore.saveGnssForce} 写这个 key。读不到（老版本主 App 没发过 /
+     * prefs 通道不可用）按<b>开</b>处理：现场的核心症状就是"构造替换失败后卫星信号不跟着模拟"，
+     * 兜底宁可按开。
+     */
+    private static boolean gnssForceEnabled() {
+        final long now = SystemClock.elapsedRealtime();
+        if (sGnssForceReadAt != 0L && now - sGnssForceReadAt < GNSS_FORCE_TTL_MS) {
+            return sGnssForce;
+        }
+        sGnssForceReadAt = now;
+        boolean enabled = true;
+        try {
+            final String raw = PrefsClient.read(PREF_GNSS_FORCE);
+            if (raw != null) {
+                final String value = raw.trim().toLowerCase(Locale.US);
+                enabled = !("0".equals(value) || "false".equals(value) || "off".equals(value));
+            }
+        } catch (Throwable ignored) {
+            enabled = true;
+        }
+        sGnssForce = enabled;
+        if (!enabled && sLoggedGnssForceOff.compareAndSet(false, true)) {
+            log("gnss force: disabled by setting (gnss_force=0)");
+        }
+        return enabled;
+    }
+
     private static final Callback GNSS_HOOK = new Callback() {
         @Override
         protected void before(Param param) {
             try {
                 if (currentLocation() == null) {
                     logGnssSkippedOnce("not-simulating");
-                    return;   // 未在模拟：透传真实卫星
+                    return;   // 未在模拟：透传真实卫星（不写状态：这不是注入失败）
                 }
                 final List<Satellite> satellites = currentSatellites();
                 if (satellites == null || satellites.isEmpty()) {
+                    // 没有卫星表可注入：与"系统 0 颗卫星"同一种结果（面板：无卫星可用）
+                    setGnssState(GNSS_SKIP_NO_SATELLITES);
                     logGnssSkippedOnce("no-satellites");
                     return;
                 }
@@ -1547,32 +1651,500 @@ final class SystemHooks {
                     logGnssSkippedOnce("no-args");
                     return;
                 }
+                // 顺序：先尝试构造替换，失败才就地改写系统对象（见类注释 A 段）
                 final GnssStatus status = buildGnssStatus(satellites);
-                if (status == null) {
-                    // 三级兜底全失败 / 校验没过：保持真实卫星（工厂已记一条 gnss build failed）
-                    logGnssSkippedOnce("build-null");
-                    return;
-                }
-                boolean replaced = false;
-                for (int i = 0; i < param.args.length; i++) {
-                    if (param.args[i] instanceof GnssStatus) {
-                        param.args[i] = status;
-                        replaced = true;
+                if (status != null) {
+                    boolean replaced = false;
+                    for (int i = 0; i < param.args.length; i++) {
+                        if (param.args[i] instanceof GnssStatus) {
+                            param.args[i] = status;
+                            replaced = true;
+                        }
                     }
-                }
-                if (!replaced) {
-                    logGnssSkippedOnce("no-status-arg");
+                    if (!replaced) {
+                        setGnssState(GNSS_SKIP_NULL);
+                        logGnssSkippedOnce("no-status-arg");
+                        return;
+                    }
+                    if (!sLoggedFirstGnss) {
+                        sLoggedFirstGnss = true;
+                        log("system gnss replaced: satellites=" + satellites.size());
+                    }
+                    setGnssState(builtState());
                     return;
                 }
-                if (!sLoggedFirstGnss) {
-                    sLoggedFirstGnss = true;
-                    log("system gnss replaced: satellites=" + satellites.size());
+                // ---- 构造失败：强制接管兜底（就地改写系统正在下发的 GnssStatus）----
+                if (!gnssForceEnabled()) {
+                    setGnssState(GNSS_SKIP_NULL);
+                    logGnssSkippedOnce("build-null (force disabled)");
+                    return;
                 }
+                final int mutated = forceMutateArgs(param, satellites);
+                if (mutated == FORCE_NO_SATELLITES) {
+                    // 系统对象里一颗卫星都没有（室内）：就地改写无从下手，保持原样
+                    setGnssState(GNSS_SKIP_NO_SATELLITES);
+                    logGnssForceNoSatellitesOnce();
+                    return;
+                }
+                if (mutated > 0) {
+                    setGnssState(GNSS_FORCE_MUTATED);
+                    logGnssForceMutatedOnce(mutated);
+                    return;
+                }
+                setGnssState(GNSS_SKIP_NULL);
+                logGnssSkippedOnce("build-null+mutate-failed");
             } catch (Throwable t) {
-                // 出错透传
+                // 出错透传：构造 + 就地改写都不可能让 hook 抛异常（这条日志只用来定位本文件里的 bug）
+                logGnssHookFailedOnce(t);
             }
         }
     };
+
+    /** 构造成功时的心跳状态串：按工厂实际锁定的路径区分 builder / ctor / unsafe。 */
+    private static String builtState() {
+        final String kind = gnssBuildKind();
+        if ("ctor".equals(kind)) {
+            return GNSS_BUILT_CTOR;
+        }
+        if ("unsafe".equals(kind)) {
+            return GNSS_BUILT_UNSAFE;
+        }
+        return GNSS_BUILT_BUILDER;
+    }
+
+    // ---------------------------------------------------------------- 就地改写（强制接管）
+
+    /*
+     * 字段候选：不同 ROM / 版本对 GnssStatus 内部数组的命名不一致（dexdump 见过两套）。
+     * 只<b>读</b>这些字段，然后直接在数组内部改元素 —— 数组本身是 final，但元素可写，
+     * 所以"就地改写"不需要替换对象，也不需要动 final 引用，改完对投递链天然可见
+     * （监听者是在 hook 之后才把 GnssStatus 拆成各 getter / parcel 下发）。
+     */
+    private static final String[] GNSS_SVID_FIELDS = {"mSvidWithFlags"};
+    private static final String[] GNSS_CN0_FIELDS = {"mCn0DbHz", "mCn0DbHzs"};
+    private static final String[] GNSS_ELEVATION_FIELDS = {"mSvElevationDegrees", "mElevations"};
+    private static final String[] GNSS_AZIMUTH_FIELDS = {"mSvAzimuthDegrees", "mAzimuths"};
+    private static final String[] GNSS_CARRIER_FIELDS = {"mSvCarrierFreqHz", "mCarrierFrequencies"};
+    private static final String[] GNSS_BASEBAND_FIELDS = {"mBasebandCn0DbHz", "mBasebandCn0DbHzs"};
+
+    /** 逻辑槽位（与上面的候选表一一对应）。 */
+    private static final int SLOT_CN0 = 0;
+    private static final int SLOT_ELEVATION = 1;
+    private static final int SLOT_AZIMUTH = 2;
+    private static final int SLOT_CARRIER = 3;
+    private static final int SLOT_BASEBAND = 4;
+    private static final int SLOT_COUNT = 5;
+
+    /** {@link #forceMutateGnssStatus} 的返回值：系统对象里 0 颗卫星 / 改不了。 */
+    private static final int FORCE_NO_SATELLITES = -1;
+    private static final int FORCE_FAILED = -2;
+
+    /** 每个 GnssStatus 实现类解析出来的字段句柄（缓存，避免 1Hz 反复 getDeclaredField）。 */
+    private static final Map<Class<?>, Field[]> sGnssForceFields =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, Field[]>());
+
+    /** {@code sun.misc.Unsafe.theUnsafe} 的探测结果（{@link #NO_UNSAFE} = 确认拿不到）。 */
+    private static final Object NO_UNSAFE = new Object();
+    private static volatile Object sUnsafe;
+
+    private static final AtomicBoolean sLoggedGnssForceMutated = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedGnssForceNoSatellites = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedGnssForceFailed = new AtomicBoolean();
+    /** GNSS hook 整体异常（本文件的 bug）：与"改写失败"分开记，定位更快。 */
+    private static final AtomicBoolean sLoggedGnssHookFailed = new AtomicBoolean();
+
+    /**
+     * 对 hook 的全部参数做就地改写（正常只有一个 {@link GnssStatus}）。
+     *
+     * @return {@code >0} 改写的卫星数；{@link #FORCE_NO_SATELLITES}；{@link #FORCE_FAILED}
+     */
+    private static int forceMutateArgs(Param param, List<Satellite> satellites) {
+        if (param == null || param.args == null) {
+            return FORCE_FAILED;
+        }
+        int result = FORCE_FAILED;
+        for (int i = 0; i < param.args.length; i++) {
+            final Object arg = param.args[i];
+            if (!(arg instanceof GnssStatus)) {
+                continue;
+            }
+            final int mutated = forceMutateGnssStatus((GnssStatus) arg, satellites);
+            if (mutated > 0) {
+                return mutated;   // 有一个改成功就够，后面的参数不必再动
+            }
+            if (mutated == FORCE_NO_SATELLITES) {
+                result = FORCE_NO_SATELLITES;   // 记下原因，继续看其它参数
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 就地改写系统正在下发的 {@link GnssStatus}：<b>不新建对象</b>，把前 N 颗卫星的
+     * cn0 / 仰角 / 方位角（另外顺带载波频率、baseband cn0）换成我们快照里的值。
+     *
+     * <p><b>数量取 {@code min(系统卫星数, 快照卫星数)}</b>：数组长度与卫星数都是系统定的，
+     * 多出来的没有数据可填、也造不出来，所以只覆盖两边都有的前 N 颗。
+     *
+     * <p><b>为什么保留 svid / 星座</b>：它们与 flags（usedInFix/almanac/ephemeris）一起编码在
+     * {@code mSvidWithFlags} 里，编码方式各 ROM 不同；重写会让
+     * {@code getSvid()/getConstellationType()} 与本机的星座编号自相矛盾（出现该星座不存在的
+     * svid），App 反而更容易判定"卫星数据是伪造的"。只改信号强度与几何这三个连续量，与系统
+     * 自己的卫星编号天然自洽。
+     *
+     * @return 实际改写的卫星数；{@link #FORCE_NO_SATELLITES} = 系统对象没有卫星；
+     *         {@link #FORCE_FAILED} = 字段缺失 / 反射失败
+     */
+    private static int forceMutateGnssStatus(GnssStatus status, List<Satellite> satellites) {
+        if (status == null || satellites == null || satellites.isEmpty()) {
+            return FORCE_FAILED;
+        }
+        try {
+            final int count = satelliteCountOf(status);
+            if (count <= 0) {
+                return FORCE_NO_SATELLITES;
+            }
+            final int n = Math.min(count, satellites.size());
+            final Field[] fields = gnssForceFields(status.getClass());
+            final float[] cn0 = floatArrayOf(status, fields[SLOT_CN0], count);
+            final float[] elevation = floatArrayOf(status, fields[SLOT_ELEVATION], count);
+            final float[] azimuth = floatArrayOf(status, fields[SLOT_AZIMUTH], count);
+            if (cn0 == null && elevation == null && azimuth == null) {
+                // 没有任何可写字段：卫星表就在这几个数组里，缺了就只能放弃
+                logGnssForceFailedOnce(new IllegalStateException(
+                        "no cn0/elevation/azimuth field on " + status.getClass().getName()));
+                return FORCE_FAILED;
+            }
+            final float[] carrier = floatArrayOf(status, fields[SLOT_CARRIER], count);
+            final float[] baseband = floatArrayOf(status, fields[SLOT_BASEBAND], count);
+            int mutated = 0;
+            for (int i = 0; i < n; i++) {
+                final Satellite sat = satellites.get(i);
+                if (sat == null) {
+                    continue;
+                }
+                boolean wrote = false;
+                wrote |= writeFloat(cn0, i, sat.cn0);
+                wrote |= writeFloat(elevation, i, sat.elevation);
+                wrote |= writeFloat(azimuth, i, sat.azimuth);
+                // 展示字段：很多 App 的「信号强度」读的是这两个（best-effort，失败不影响上面的）
+                writeFloat(carrier, i, sat.carrierHz);
+                writeFloat(baseband, i, sat.cn0);
+                if (wrote) {
+                    mutated++;
+                }
+            }
+            return mutated > 0 ? mutated : FORCE_FAILED;
+        } catch (Throwable t) {
+            logGnssForceFailedOnce(t);
+            return FORCE_FAILED;
+        }
+    }
+
+    /**
+     * 系统对象的卫星数：以 {@code getSatelliteCount()} 为准（App 看到的就是这个数，
+     * 0 就代表室内无星，必须按 {@link #FORCE_NO_SATELLITES} 处理，不能拿数组长度"凑"卫星）。
+     * 只有这个调用本身失败时，才退回数组长度。
+     */
+    private static int satelliteCountOf(GnssStatus status) {
+        try {
+            return Math.max(0, status.getSatelliteCount());
+        } catch (Throwable ignored) {
+            // 老版本 / 异常对象：退回数组长度
+        }
+        try {
+            final Class<?> clazz = status.getClass();
+            final Field svid = findField(clazz, GNSS_SVID_FIELDS);
+            if (svid != null) {
+                final Object value = svid.get(status);
+                if (value instanceof int[]) {
+                    return ((int[]) value).length;
+                }
+            }
+            final Field[] fields = gnssForceFields(clazz);
+            for (Field field : fields) {
+                if (field == null) {
+                    continue;
+                }
+                final Object value = field.get(status);
+                if (value instanceof float[]) {
+                    return ((float[]) value).length;
+                }
+            }
+        } catch (Throwable ignored) {
+            // ignore
+        }
+        return 0;
+    }
+
+    /** 解析（并按类缓存）一个 GnssStatus 实现类的数组字段句柄。 */
+    private static Field[] gnssForceFields(Class<?> clazz) {
+        final Field[] cached = sGnssForceFields.get(clazz);
+        if (cached != null) {
+            return cached;
+        }
+        final Field[] resolved = new Field[SLOT_COUNT];
+        resolved[SLOT_CN0] = findField(clazz, GNSS_CN0_FIELDS);
+        resolved[SLOT_ELEVATION] = findField(clazz, GNSS_ELEVATION_FIELDS);
+        resolved[SLOT_AZIMUTH] = findField(clazz, GNSS_AZIMUTH_FIELDS);
+        resolved[SLOT_CARRIER] = findField(clazz, GNSS_CARRIER_FIELDS);
+        resolved[SLOT_BASEBAND] = findField(clazz, GNSS_BASEBAND_FIELDS);
+        sGnssForceFields.put(clazz, resolved);
+        return resolved;
+    }
+
+    /** 按候选名在类（含父类）上找字段；找不到返回 null（不抛异常）。 */
+    private static Field findField(Class<?> clazz, String[] names) {
+        if (clazz == null || names == null) {
+            return null;
+        }
+        for (Class<?> c = clazz; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (String name : names) {
+                try {
+                    final Field field = c.getDeclaredField(name);
+                    field.setAccessible(true);
+                    return field;
+                } catch (Throwable ignored) {
+                    // 该名字不存在 / 不接受 setAccessible：试下一个
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 取一个 float[] 字段的值；字段为 null 时尝试<b>装入新数组</b>（final 字段处理见
+     * {@link #installFloatArray}）。
+     *
+     * <p>绝大多数 ROM 上这里只是 {@code field.get(target)}（数组长度够用），
+     * 只有"字段存在但没初始化"的极端情况才需要写 final 引用。
+     */
+    private static float[] floatArrayOf(Object target, Field field, int requiredLength) {
+        if (field == null) {
+            return null;
+        }
+        try {
+            final Object value = field.get(target);
+            if (value instanceof float[]) {
+                return (float[]) value;   // 长度不足由 writeFloat 按下标拦掉
+            }
+        } catch (Throwable ignored) {
+            // 读失败：下面尝试装新数组
+        }
+        return installFloatArray(target, field, requiredLength);
+    }
+
+    /**
+     * 给 {@code final float[]} 字段装一个新数组：<b>先 {@code Field#set}</b>（
+     * {@code setAccessible(true)} 之后对实例 final 字段通常可行），失败的再走
+     * {@code Unsafe.objectFieldOffset + putObject} 偏移写；两条都失败就返回 null
+     * （调用方跳过该字段，绝不抛异常）。
+     */
+    private static float[] installFloatArray(Object target, Field field, int requiredLength) {
+        if (target == null || field == null || requiredLength <= 0) {
+            return null;
+        }
+        final float[] fresh = new float[requiredLength];
+        try {
+            field.set(target, fresh);
+            return fresh;
+        } catch (Throwable ignored) {
+            // final 字段被拦：试 Unsafe
+        }
+        try {
+            final Object unsafe = unsafe();
+            if (unsafe == null) {
+                return null;
+            }
+            final Method offset = unsafe.getClass().getMethod("objectFieldOffset", Field.class);
+            final Method putObject = unsafe.getClass().getMethod("putObject",
+                    Object.class, long.class, Object.class);
+            final long at = ((Number) offset.invoke(unsafe, field)).longValue();
+            putObject.invoke(unsafe, target, Long.valueOf(at), fresh);
+            return fresh;
+        } catch (Throwable t) {
+            logGnssForceFailedOnce(t);
+            return null;
+        }
+    }
+
+    /** {@code sun.misc.Unsafe.theUnsafe}（拿不到返回 null，每进程只探测一次）。 */
+    private static Object unsafe() {
+        final Object cached = sUnsafe;
+        if (cached != null) {
+            return cached == NO_UNSAFE ? null : cached;
+        }
+        Object found = null;
+        try {
+            final Class<?> clazz = Class.forName("sun.misc.Unsafe");
+            final Field field = clazz.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            found = field.get(null);
+        } catch (Throwable ignored) {
+            // 拿不到就走"跳过"（就地改写只用数组元素，通常不需要 Unsafe）
+        }
+        sUnsafe = found == null ? NO_UNSAFE : found;
+        return found;
+    }
+
+    /** 写一个 float 元素：数组为 null / 下标越界 / 值非法都只跳过，绝不抛。 */
+    private static boolean writeFloat(float[] array, int index, float value) {
+        if (array == null || index < 0 || index >= array.length) {
+            return false;
+        }
+        if (Float.isNaN(value) || Float.isInfinite(value)) {
+            return false;
+        }
+        try {
+            array[index] = value;
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------- 构造路径（builder/ctor/unsafe）
+
+    /** 本进程锁定的构造路径（{@code builder} / {@code ctor} / {@code unsafe}）。 */
+    private static volatile String sGnssBuildKind;
+
+    /**
+     * 构造替换用的是哪条路径（决定心跳的 {@code built:builder/ctor/unsafe}）。
+     *
+     * <p>{@link GnssStatusFactory} 不对外暴露它锁定的方案（本文件不改那个工厂），所以先
+     * <b>只读</b>反射它的私有字段 {@code sPlan.kind}（{@code "builder"} / {@code "ctor…"} /
+     * {@code "unsafe"}），失败再按"类能力"推断；都拿不到就按 builder 记（大多数 ROM 如此）。
+     */
+    private static String gnssBuildKind() {
+        final String cached = sGnssBuildKind;
+        if (cached != null) {
+            return cached;
+        }
+        String kind = null;
+        try {
+            final Field planField = GnssStatusFactory.class.getDeclaredField("sPlan");
+            planField.setAccessible(true);
+            final Object plan = planField.get(null);
+            if (plan != null) {
+                final Field kindField = plan.getClass().getDeclaredField("kind");
+                kindField.setAccessible(true);
+                final Object value = kindField.get(plan);
+                if (value instanceof String) {
+                    kind = (String) value;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射拿不到：走能力推断
+        }
+        final String resolved;
+        if (kind != null && kind.startsWith("ctor")) {
+            resolved = "ctor";
+        } else if (kind != null && kind.startsWith("unsafe")) {
+            resolved = "unsafe";
+        } else if (kind != null && kind.startsWith("builder")) {
+            resolved = "builder";
+        } else {
+            resolved = inferGnssBuildKind();
+        }
+        sGnssBuildKind = resolved;
+        return resolved;
+    }
+
+    /** 兜底推断：Builder 可用 → builder；GnssStatus 有"int[] + float[]"构造器 → ctor；否则 unsafe。 */
+    private static String inferGnssBuildKind() {
+        try {
+            final Class<?> builder = Class.forName("android.location.GnssStatus$Builder");
+            boolean hasAdd = false;
+            boolean hasBuild = false;
+            for (Method method : builder.getDeclaredMethods()) {
+                if ("addSatellite".equals(method.getName())) {
+                    hasAdd = true;
+                } else if ("build".equals(method.getName())
+                        && method.getParameterTypes().length == 0) {
+                    hasBuild = true;
+                }
+            }
+            if (hasAdd && hasBuild) {
+                return "builder";
+            }
+        } catch (Throwable ignored) {
+            // 没有 Builder / 扫不了方法表：试构造器
+        }
+        try {
+            for (Constructor<?> constructor : GnssStatus.class.getDeclaredConstructors()) {
+                boolean hasInts = false;
+                boolean hasFloats = false;
+                for (Class<?> type : constructor.getParameterTypes()) {
+                    hasInts |= type == int[].class;
+                    hasFloats |= type == float[].class;
+                }
+                if (hasInts && hasFloats) {
+                    return "ctor";
+                }
+            }
+        } catch (Throwable ignored) {
+            // 连构造器都扫不了：只能按 Unsafe 记
+        }
+        return "unsafe";
+    }
+
+    // ---------------------------------------------------------------- 强制改写日志（每进程一次）
+
+    /** 成功就地改写：{@code gnss force: mutated N}（每进程一行，证明兜底真的生效了）。 */
+    private static void logGnssForceMutatedOnce(int mutated) {
+        try {
+            if (sLoggedGnssForceMutated.compareAndSet(false, true)) {
+                log("gnss force: mutated " + mutated);
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 系统对象没有卫星（室内）：{@code gnss force: no-satellites}（每进程一行）。 */
+    private static void logGnssForceNoSatellitesOnce() {
+        try {
+            if (sLoggedGnssForceNoSatellites.compareAndSet(false, true)) {
+                log("gnss force: no-satellites");
+            }
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 就地改写本身失败（字段缺失 / 反射异常）：每进程一行，附异常与前 3 层堆栈。 */
+    private static void logGnssForceFailedOnce(Throwable t) {
+        try {
+            if (!sLoggedGnssForceFailed.compareAndSet(false, true)) {
+                return;
+            }
+            log("gnss force failed: " + describe(t));
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** GNSS hook 外层异常：每进程一行（与 {@code gnss force failed} 区分）。 */
+    private static void logGnssHookFailedOnce(Throwable t) {
+        try {
+            if (!sLoggedGnssHookFailed.compareAndSet(false, true)) {
+                return;
+            }
+            log("gnss hook failed: " + describe(t));
+        } catch (Throwable ignored) {
+            // 日志绝不抛出
+        }
+    }
+
+    /** 异常 → {@code 类名 (message) stack=[前 3 层]}，日志用，绝不抛。 */
+    private static String describe(Throwable t) {
+        final Throwable cause = unwrapReflective(t == null
+                ? new IllegalStateException("unknown") : t);
+        final StringBuilder message = new StringBuilder(cause.getClass().getName())
+                .append(" (").append(firstLine(cause.getMessage())).append(')');
+        appendStackFrames(message, cause, 3);
+        return message.toString();
+    }
 
     /**
      * 造一套与主 App 一致的卫星表，交给 {@link GnssStatusFactory} 做三级兜底

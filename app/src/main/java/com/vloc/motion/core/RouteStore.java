@@ -52,6 +52,18 @@ public final class RouteStore {
     private static final String KEY_CLEAR_LOGCAT_ON_STOP = "clear_logcat_on_stop";
     /** 「GNSS 完全模拟」：不依赖本机真实卫星，用内置星表 + 模拟坐标/时间生成卫星表（默认 false = 自动）。 */
     private static final String KEY_GNSS_SYNTHETIC = "gnss_synthetic";
+    /**
+     * 「强制接管 GNSS」（<b>默认开</b>）：{@code GnssStatus} 构造替换失败时，由系统层模块
+     * （{@code hidden/SystemHooks}）就地改写系统正在下发的卫星表，而不是放行真实卫星。
+     */
+    private static final String KEY_GNSS_FORCE = "gnss_force";
+    /** 模块通道里的发布 key（与 {@link #KEY_GNSS_FORCE} 同名，值是字符串 {@code "1"} / {@code "0"}）。 */
+    private static final String KEY_GNSS_FORCE_PUBLISHED = "gnss_force";
+    /**
+     * 模块通道的 prefs 名：与 {@code service/SnapshotPrefs.PREFS_NAME}、
+     * {@code hidden/PrefsClient.PREFS_NAME} 逐字一致（改名等于换协议）。
+     */
+    private static final String SNAPSHOT_PREFS = "vloc_snapshot";
     /** 上次弹出「GNSS 星表过期」提醒的时间戳（0/缺省＝从未提醒）：同一份星表 7 天内只提醒一次。 */
     private static final String KEY_TLE_REMIND_AT = "tle_remind_at";
     private static final String KEY_RANDOM_START = "random_start";
@@ -353,6 +365,62 @@ public final class RouteStore {
 
     public static void saveGnssSynthetic(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_GNSS_SYNTHETIC, enabled).apply();
+    }
+
+    /**
+     * 「强制接管 GNSS」（<b>默认 true</b>）。
+     *
+     * <p>含义：{@code GnssStatus} 的三级构造兜底（Builder → 反射构造器 → Unsafe）全部失败时，
+     * 不要再"放行真实卫星"（室内就 0 颗、室外则是与模拟坐标不符的真实信号），而是由
+     * {@code hidden/SystemHooks} 反射改写系统正在下发的 {@code GnssStatus}：
+     * 数量取 {@code min(系统, 快照)}，前 N 颗的 cn0 / 仰角 / 方位角换成快照里的值，
+     * svid / 星座保持不变（避免自相矛盾）。
+     *
+     * <p>模块侧读的是同一个 key（{@code gnss_force}），但走的是它能访问的
+     * world-readable prefs 通道 —— 见 {@link #publishGnssForce}。
+     */
+    public static boolean loadGnssForce(Context context) {
+        return prefs(context).getBoolean(KEY_GNSS_FORCE, true);
+    }
+
+    public static void saveGnssForce(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_GNSS_FORCE, enabled).apply();
+        publishGnssForce(context, enabled);
+    }
+
+    /**
+     * 把「强制接管 GNSS」开关发布到模块读得到的通道（best-effort，绝不抛异常）。
+     *
+     * <p><b>为什么必须单独发布</b>：{@link #prefs} 是 {@code MODE_PRIVATE}，system_server
+     * （uid 1000）里的模块读不到它；模块能读的只有
+     * {@code service/SnapshotPrefs} 写的 world-readable {@code vloc_snapshot}
+     * （旧 LSPosed 的 New XSharedPreferences）与 {@link RemotePrefs}（新 API 后端）。
+     * 这里写的是同一份快照 prefs 里的 {@code gnss_force} key，值用字符串
+     * {@code "1"} / {@code "0"}（模块侧 {@code PrefsClient.read} 固定按
+     * {@code getString} 读，写 boolean 会抛 {@code ClassCastException}）。
+     *
+     * <p>两个通道各自 try/catch：没启用 LSPosed 的 {@code xposedsharedprefs} 时
+     * Android 7+ 会对 {@code MODE_WORLD_READABLE} 抛 {@code SecurityException}，
+     * 此时模块读不到就按默认（开）处理，功能不受影响。
+     */
+    @SuppressWarnings("deprecation")
+    public static void publishGnssForce(Context context, boolean enabled) {
+        final String value = enabled ? "1" : "0";
+        try {
+            if (context != null) {
+                context.getSharedPreferences(SNAPSHOT_PREFS, Context.MODE_WORLD_READABLE)
+                        .edit().putString(KEY_GNSS_FORCE_PUBLISHED, value).apply();
+            }
+        } catch (Throwable ignored) {
+            // 旧通道不可用（未启用 xposedsharedprefs / 非模块环境）：模块按默认开处理
+        }
+        try {
+            if (RemotePrefs.available()) {
+                RemotePrefs.put(KEY_GNSS_FORCE_PUBLISHED, value);
+            }
+        } catch (Throwable ignored) {
+            // 新 API 后端未绑定：同上，不影响功能
+        }
     }
 
     /**

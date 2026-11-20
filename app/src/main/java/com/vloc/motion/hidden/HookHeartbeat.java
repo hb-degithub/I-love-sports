@@ -33,14 +33,25 @@ import com.vloc.motion.hidden.compat.Xp;
  *   kind    (String)  system（系统 uid 段的系统进程）/ app（目标应用进程）
  *   at      (long)    System.currentTimeMillis()
  *   sdk     (int)     Build.VERSION.SDK_INT
+ *   gnss    (String)  可选：GNSS 注入结果（built:builder / built:ctor / built:unsafe /
+ *                     force:mutated / skip:no-satellites / skip:null）。
+ *                     <b>缺失 = 该进程还没确定结果</b>（老版本模块也不带该字段），
+ *                     主 App 侧必须兼容为 null（{@code HookHeartbeatStore} 读不到就当 null）。
  * </pre>
+ *
+ * <p><b>为什么会有第二条心跳</b>（{@link #reportGnss(String)}）：{@code install()} 之后立刻
+ * 发的第一次心跳发生在本进程第一次 satellite 回调之前，那时 {@code gnss} 还确定不了；等
+ * {@code SystemHooks} 在 GNSS hook 里首次确定结果后再补一条带 {@code gnss} 的心跳
+ * （同进程覆盖写、每进程最多一条），设置面板才能显示「卫星表注入」而不必翻 logcat。
  *
  * <p>约束：
  * <ul>
  *   <li><b>每进程成功一次即可</b>：{@code sReported} 只在 {@code insert} 返回非 null Uri
  *       之后才置位；失败（拿不到 Context / insert 返回 null / 抛异常）<b>不</b>置位，
  *       因此后续还有补报机会。进程之间天然各有一份静态状态，“每个被注入的进程各报一次”
- *       仍是预期行为，主 App 按 {@code process} 分别记录（同名进程重复上报是覆盖写，幂等）。</li>
+ *       仍是预期行为，主 App 按 {@code process} 分别记录（同名进程重复上报是覆盖写，幂等）。
+ *       <b>唯一例外</b>：GNSS 结果晚于第一条心跳时才允许再补一条（{@link #reportGnss(String)}，
+ *       由 {@link #sGnssSynced} 保证每进程最多一次），同样是覆盖写。</li>
  *   <li><b>有界重试</b>：失败后最多再补 4 次（总计 {@value #MAX_ATTEMPTS} 次尝试），
  *       间隔 2s / 5s / 10s / 30s，用主线程 {@code Handler#postDelayed} 排队
  *       （一次性任务，不建常驻线程、不轮询），另外 {@link #retryIfPending()} 允许既有 hook
@@ -68,6 +79,8 @@ final class HookHeartbeat {
     private static final String COL_KIND = "kind";
     private static final String COL_AT = "at";
     private static final String COL_SDK = "sdk";
+    /** 可选：GNSS 注入结果（{@code built:*} / {@code force:mutated} / {@code skip:*}）。 */
+    private static final String COL_GNSS = "gnss";
 
     /** kind：系统进程（system_server / com.android.location.fused / settings / telecom 等系统 uid 进程）。 */
     static final String KIND_SYSTEM = "system";
@@ -146,6 +159,27 @@ final class HookHeartbeat {
     private static volatile int sPendingHooks;
     private static volatile String sPendingKind;
 
+    /**
+     * 待上报的 GNSS 结果（{@code built:*} / {@code force:mutated} / {@code skip:*}）；
+     * {@code null} = 还没确定 / 不是系统进程 → 本次心跳不带 {@code gnss} 字段（老契约兼容）。
+     */
+    private static volatile String sPendingGnss;
+
+    /** 已成功上报那条心跳的参数：供 {@link #reportGnss(String)} 补发一条带 gnss 的心跳。 */
+    private static volatile String sReportedProcess;
+    private static volatile int sReportedHooks;
+    private static volatile String sReportedKind;
+    /** 已成功上报的那条心跳带的 gnss（去重用：同一个值不再补发，避免无意义的多一条心跳）。 */
+    private static volatile String sReportedGnss;
+
+    /**
+     * GNSS 结果只补报一次（每进程）。
+     *
+     * <p>没有这个闸门时，GNSS 回调 1Hz 会让 {@link #reportGnss(String)} 每次都把
+     * {@link #sReported} 放开再重发，等于每秒一次跨进程 insert。
+     */
+    private static final AtomicBoolean sGnssSynced = new AtomicBoolean(false);
+
     /** 进程内复用的 Context（同一个进程里 ContentResolver 不会变，省掉每进程一次的反射）。 */
     private static volatile Context sContext;
 
@@ -179,6 +213,18 @@ final class HookHeartbeat {
      * @param kind        {@link #KIND_SYSTEM} 或 {@link #KIND_APP}，见 {@link #kindOfCurrentProcess()}
      */
     static void report(Context ctx, String processName, int hooks, String kind) {
+        // 兼容 4 参调用（HookEntry 不改）：gnss 结果从 SystemHooks 的静态字段取，
+        // 那时通常还是 null（卫星回调还没来过），随后 reportGnss 会补一条带值的。
+        report(ctx, processName, hooks, kind, SystemHooks.gnssState());
+    }
+
+    /**
+     * 带 GNSS 结果的心跳（{@code gnss} 可空；空 = 本次心跳不带该字段，老 App 侧完全兼容）。
+     *
+     * @param gnss {@code built:builder} / {@code built:ctor} / {@code built:unsafe} /
+     *             {@code force:mutated} / {@code skip:no-satellites} / {@code skip:null}
+     */
+    static void report(Context ctx, String processName, int hooks, String kind, String gnss) {
         try {
             if (sReported.get()) {
                 return;  // 本进程已经成功报过
@@ -187,9 +233,59 @@ final class HookHeartbeat {
             sPendingProcess = resolveProcessName(processName);
             sPendingHooks = hooks;
             sPendingKind = kind == null ? KIND_APP : kind;
+            if (gnss != null && !gnss.isEmpty()) {
+                sPendingGnss = gnss;   // null 不覆盖已经补报上来的结果
+            }
             attemptOnce(ctx);
         } catch (Throwable ignored) {
             // 模块绝不影响宿主：任何 Throwable 都在这里终止
+        }
+    }
+
+    /**
+     * GNSS 结果确定后补报一条系统心跳（<b>每进程最多一次</b>）。
+     *
+     * <p>调用时机：{@code SystemHooks} 在 GNSS hook 里首次确定结果（构造成功 / 就地改写 /
+     * 跳过）之后。为什么需要它：{@code install()} 之后立刻发的第一条心跳早于第一次卫星回调，
+     * 不带 {@code gnss}；不补这一条，设置面板的「卫星表注入」永远是「未知」。
+     *
+     * <p>实现上<b>复用既有管道</b>（限频 2s、退避 2s/5s/10s/30s、次数上限
+     * {@value #MAX_ATTEMPTS}）：重新武装同一份参数后再走一次 {@link #attemptOnce(Context)}，
+     * 所以不会新增线程、不会轮询，失败也不会把进程拖住。{@link #sGnssSynced} 保证只补一次。
+     *
+     * @param gnss 结果串；null / 空直接忽略
+     */
+    static void reportGnss(String gnss) {
+        try {
+            if (gnss == null || gnss.isEmpty()) {
+                return;
+            }
+            sPendingGnss = gnss;   // 仍在补试中的心跳也带上最新结果
+            if (!sGnssSynced.compareAndSet(false, true)) {
+                return;   // 每进程只补发一次
+            }
+            if (!sReported.get()) {
+                return;   // 主心跳还没成功：它自己会带上（上面已写 sPendingGnss）
+            }
+            if (gnss.equals(sReportedGnss)) {
+                return;   // 已经报过这个值（例如首次心跳就带上了）：不重复发
+            }
+            final String name = sReportedProcess;
+            final String kind = sReportedKind;
+            if (name == null || name.isEmpty() || kind == null) {
+                return;
+            }
+            sPendingProcess = name;
+            sPendingHooks = sReportedHooks;
+            sPendingKind = kind;
+            sReported.set(false);   // 重新武装：下面这次 insert 成功后会再关上
+            attemptOnce(null);
+            if (!sReported.get()) {
+                // 可能被 2s 限频挡下（主心跳刚发完）：交给既有退避链补发，不在这里忙等
+                scheduleRetry();
+            }
+        } catch (Throwable ignored) {
+            // 补报失败绝不影响宿主进程
         }
     }
 
@@ -234,6 +330,7 @@ final class HookHeartbeat {
         final String name = sPendingProcess;
         final int hooks = sPendingHooks;
         final String kind = sPendingKind;
+        final String gnss = sPendingGnss;   // 可空：空就不带这个字段（老 App 侧兼容）
         try {
             sLastAttemptAt = now;
             sAttempts.incrementAndGet();
@@ -253,23 +350,32 @@ final class HookHeartbeat {
                 return;
             }
             sContext = context;  // 已验证有 ContentResolver：进程内复用，省掉后续反射
-            final ContentValues values = new ContentValues(5);
+            final ContentValues values = new ContentValues(6);
             values.put(COL_PROCESS, name);
             values.put(COL_HOOKS, Integer.valueOf(hooks));
             values.put(COL_KIND, kind == null ? KIND_APP : kind);
             values.put(COL_AT, Long.valueOf(System.currentTimeMillis()));
             values.put(COL_SDK, Integer.valueOf(Build.VERSION.SDK_INT));
+            if (gnss != null && !gnss.isEmpty()) {
+                values.put(COL_GNSS, gnss);   // 可选字段：老 App 侧读不到就是 null
+            }
             final Uri inserted = resolver.insert(Uri.parse(HEARTBEAT_URI), values);
             if (inserted == null) {
                 // 主 App 进程未就绪 / Provider 拉不起来 / 旧版未实现 hookbeat：都算失败，稍后补试
                 logInsertNullOnce();
                 return;
             }
-            // 只有真的拿到 Uri 才算成功：成功之后才关闸
+            // 只有真的拿到 Uri 才算成功：成功之后才关闸。
+            // 记下这份参数：GNSS 结果晚到时 reportGnss 用它补发一条（同进程覆盖写，幂等）。
+            sReportedProcess = name;
+            sReportedHooks = hooks;
+            sReportedKind = kind == null ? KIND_APP : kind;
+            sReportedGnss = gnss;
             sReported.set(true);
             sPendingProcess = null;
             sPendingKind = null;
-            log("heartbeat reported: " + name + " hooks=" + hooks);
+            log("heartbeat reported: " + name + " hooks=" + hooks
+                    + (gnss == null || gnss.isEmpty() ? "" : " gnss=" + gnss));
         } catch (Throwable t) {
             // 刚用过的 Context 可能已失效（例如 insert 内部 NPE）：丢掉缓存，下一轮重新探测；
             // 异常本身只在这里被“记录 + 吞掉”，绝不冒到宿主进程，也不再让 NPE 打满 5 次无信息日志。

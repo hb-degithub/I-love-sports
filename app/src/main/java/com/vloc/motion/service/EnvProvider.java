@@ -51,7 +51,8 @@ public final class EnvProvider extends ContentProvider {
     public static final Uri TARGETS_URI = Uri.parse("content://" + AUTHORITY + "/" + PATH_TARGETS);
     /**
      * 模块心跳：模块在**每个被注入的进程**里 insert 一次，字段
-     * {@code process / hooks / kind / at / sdk}（见 {@link HookHeartbeatStore}）。
+     * {@code process / hooks / kind / at / sdk}，外加可选的 {@code gnss}
+     * （GNSS 注入结果；见 {@link HookHeartbeatStore}）。
      *
      * <p>这条通道是"模块是否生效"的判定依据：包名（LSPosed 管理器）会被隐藏模块屏蔽，
      * 心跳不会。只接收 insert，数据落在 prefs，不落任何其它副作用。
@@ -65,6 +66,14 @@ public final class EnvProvider extends ContentProvider {
     private static final String KEY_KIND = "kind";
     private static final String KEY_AT = "at";
     private static final String KEY_SDK = "sdk";
+    /**
+     * 可选：GNSS 注入结果（{@code built:builder} / {@code built:ctor} / {@code built:unsafe} /
+     * {@code force:mutated} / {@code skip:no-satellites} / {@code skip:null}）。
+     *
+     * <p>缺失 = 该进程还没确定结果（老版本模块也不带）；{@link HookHeartbeatStore} 按 null 存，
+     * 设置面板显示「未知」。取值由 {@link HookHeartbeatStore#normalizeGnss(String)} 做白名单校验。
+     */
+    private static final String KEY_GNSS = "gnss";
 
     private static final String[] COLUMNS = {"mode", "json", "updated_at"};
     /** targets 路径单独用一列，避免模块侧还要按列名索引。 */
@@ -265,6 +274,8 @@ public final class EnvProvider extends ContentProvider {
         final String kind = readString(values, KEY_KIND);
         final Long rawAt = readLong(values, KEY_AT);
         final Integer sdk = readInt(values, KEY_SDK);
+        // 可选字段：老模块不带；带了但值不认识由 store 的白名单丢掉（不影响整条心跳落库）
+        final String gnss = readString(values, KEY_GNSS);
         // 必需字段：process / hooks / kind。at 缺省时用本机时间（老模块漏字段也能记下来），
         // 但显式给了就必须在合理范围内。
         if (!HookHeartbeatStore.isValidProcess(process) || hooks == null || hooks < 0) {
@@ -283,7 +294,7 @@ public final class EnvProvider extends ContentProvider {
             return null;
         }
         final int sdkValue = sdk == null ? 0 : sdk;   // <=0 时 store 用当前 SDK_INT 兜底
-        return HookHeartbeatStore.record(context, process, hooks, kind, at, sdkValue)
+        return HookHeartbeatStore.record(context, process, hooks, kind, at, sdkValue, gnss)
                 ? uri : null;
     }
 
