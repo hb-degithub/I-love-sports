@@ -512,11 +512,13 @@ public final class HookEntry {
         final int gnssHooks = safeInstall("gnss", GnssReplay::install, classLoader);
         // 旁路 10：反检测补强（provider 列表 / 时间戳一致性 / 精度抖动 / NMEA，v0.38）
         final int antiDetectHooks = safeInstall("anti_detect", AntiDetect::install, classLoader);
+        // 旁路 11：启动期静态环境遮蔽（包名 / 开发者选项 / AppOps / 调试器，v0.46.6）
+        final int envHidingHooks = safeInstall("env_hiding", EnvHiding::install, classLoader);
 
         // 安装条数随 Android 版本自然变化（如 Android 11 上没有 isMock/setMock，4/5 属正常）
         final int total = installed + settingsHooks + appOpsHooks + appOpsExtraHooks
                 + resolverHooks + parcelHooks + envHooks + stepHooks + imuHooks + gnssHooks
-                + antiDetectHooks;
+                + antiDetectHooks + envHidingHooks;
         log("hooks installed in " + packageName + " (sdk=" + Build.VERSION.SDK_INT
                 + ", location=" + installed + "/5, settings=" + settingsHooks
                 + ", appops_check=" + appOpsHooks + "/" + APP_OPS_CHECK_SLOTS
@@ -524,7 +526,8 @@ public final class HookEntry {
                 + ", resolver=" + resolverHooks + "/2, parcel=" + parcelHooks + "/1"
                 + ", env=" + envHooks + "/5, step=" + stepHooks + "/2"
                 + ", imu=" + imuHooks + "/2, gnss=" + gnssHooks + "/15"
-                + ", anti_detect=" + antiDetectHooks + "/4, total=" + total + ")");
+                + ", anti_detect=" + antiDetectHooks + "/4"
+                + ", env_hiding=" + envHidingHooks + "/7, total=" + total + ")");
 
         // 注入成功：回报一次心跳，供主 App 区分“模块未注入 / 已注入但目标 App 不读传感器 / 正在读取”
         StepReplay.sendHeartbeatOnce();

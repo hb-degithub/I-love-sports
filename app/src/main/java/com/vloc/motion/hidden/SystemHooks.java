@@ -1636,10 +1636,9 @@ final class SystemHooks {
         @Override
         protected void before(Param param) {
             try {
-                if (currentLocation() == null) {
-                    logGnssSkippedOnce("not-simulating");
-                    return;   // 未在模拟：透传真实卫星（不写状态：这不是注入失败）
-                }
+                // 卫星表与位置是两个独立维度：位置可能处于"暂停/停止移动但定位保持"
+                // （快照 active=false），而卫星表仍应注入——否则 App 会判定 GPS 信号弱、
+                // 直接拒绝开始跑步。这里只以"有没有合成卫星表"为准。
                 final List<Satellite> satellites = currentSatellites();
                 if (satellites == null || satellites.isEmpty()) {
                     // 没有卫星表可注入：与"系统 0 颗卫星"同一种结果（面板：无卫星可用）
