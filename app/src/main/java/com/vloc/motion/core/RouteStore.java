@@ -75,6 +75,17 @@ public final class RouteStore {
      * 手动选过模拟位置应用）没有这个标记，停止时绝不去改它。
      */
     private static final String KEY_MOCK_APPOP_GRANTED_BY_APP = "mock_appop_granted_by_app";
+    /**
+     * 上次弹出「模块已更新，需要重启」提示时针对的<b>目标版本号</b>（{@code BuildConfig.VERSION_CODE}；
+     * 0/缺省 = 从未提示）。
+     *
+     * <p>只做去重：同一目标版本只提示一次（点「稍后」也记），否则每次开屏都会弹。
+     * 下次 APK 更新后版本号变了，才会再提示一次。
+     *
+     * <p>和 {@link #KEY_TLE_REMIND_AT} 一样属于内部状态，不出现在
+     * {@code SettingsSchema}（没有用户可改的语义）。
+     */
+    private static final String KEY_LAST_RESTART_PROMPT_VER = "last_restart_prompt_ver";
 
     private RouteStore() {
     }
@@ -600,6 +611,32 @@ public final class RouteStore {
 
     public static void clearMockAppopGrantedByApp(Context context) {
         prefs(context).edit().remove(KEY_MOCK_APPOP_GRANTED_BY_APP).apply();
+    }
+
+    /**
+     * 「模块已更新，需要重启」提示的去重版本号（0 = 从未提示）。
+     *
+     * <p>语义：上次提示所面向的目标版本（当时应用的 {@code BuildConfig.VERSION_CODE}）。
+     * 与当前版本号相等 → 这个版本已经提示过，不再弹（见
+     * {@code ui/MainActivity#maybePromptModuleRestart}）。
+     *
+     * <p>用 {@link #readIntCompat} 读：历史版本可能把同一 key 存成别的类型，
+     * 直接 {@code getInt} 会抛 {@code ClassCastException}，而这段代码在 onCreate 主线程上。
+     */
+    public static int loadLastRestartPromptVer(Context context) {
+        return readIntCompat(prefs(context), KEY_LAST_RESTART_PROMPT_VER, 0);
+    }
+
+    /** 记下"这个目标版本已经提示过重启"（点「稍后」也记，避免每次开屏都弹）。 */
+    public static void saveLastRestartPromptVer(Context context, int ver) {
+        if (context == null) {
+            return;
+        }
+        try {
+            prefs(context).edit().putInt(KEY_LAST_RESTART_PROMPT_VER, ver).apply();
+        } catch (Throwable ignored) {
+            // 去重失败只影响"会不会再弹一次"，绝不能影响启动
+        }
     }
 
     /**

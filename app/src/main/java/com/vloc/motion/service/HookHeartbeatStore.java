@@ -23,9 +23,17 @@ import java.util.List;
  * 心跳由模块自己上报，隐藏模块管不到，才是模块侧的真信号。
  *
  * <p>存储：独立 prefs 文件 {@code vloc_hookbeat}，一个 key 存整份 JSON
- * {@code {进程名: {hooks, kind, at, sdk, gnss}}}，按 {@code process} 覆盖写。
- * {@code gnss} 是<b>可选</b>字段（老版本模块不带；{@code null} = 该进程还没确定结果 /
- * 不是 GNSS 注入进程），读取侧一律按"缺失 = null"兼容。
+ * {@code {进程名: {hooks, kind, at, sdk, gnss, ver, vn}}}，按 {@code process} 覆盖写。
+ * {@code gnss} / {@code ver} / {@code vn} 都是<b>可选</b>字段（老版本模块不带；
+ * {@code null} = 该进程还没确定结果 / 不是 GNSS 注入进程 / 没上报版本），
+ * 读取侧一律按"缺失 = null（{@code ver} 则 = 0）"兼容。
+ *
+ * <p>为什么要有 {@code ver}/{@code vn}：模块被 LSPosed 加载进 {@code system_server} 后，
+ * 那份代码会一直留在进程里；APK 更新后不重启，system_server 里跑的仍是旧模块。
+ * 心跳里的 {@code ver} 是"那个进程里真正在跑的模块版本号"，主 App 用
+ * {@link #freshestSystemVersionCode(Context)} 与自己的 {@code BuildConfig.VERSION_CODE}
+ * 比对，就能判断"模块已更新但系统没重启"（{@code ui/MainActivity} 据此提示重启）。
+ * {@code 0} = 未知（老模块没上报）→ 调用方<b>不得</b>据此判定版本失配。
  *
  * <p>性能约束（模块在 system_server / 目标进程启动路径上调用）：只读写 prefs，
  * 不做磁盘扫描、不查 PackageManager；写入用 {@code apply()}。
@@ -67,6 +75,15 @@ public final class HookHeartbeatStore {
     /** {@code gnss} 字段长度上限：只做防御（面板会原样显示，不让脏数据撑爆界面）。 */
     static final int MAX_GNSS_LEN = 40;
 
+    /**
+     * {@code ver} 的上限：模块版本号只用于"相等 / 不等"的判定和显示，
+     * 超过这个量级的值一定是脏数据（Provider 对外暴露，任何应用都能 insert）。
+     */
+    static final int MAX_VERSION_CODE = 2_000_000_000;
+
+    /** {@code vn} 字段长度上限：面板会原样显示，挡住超长字符串（面板侧复用它做展示校验）。 */
+    public static final int MAX_VERSION_NAME_LEN = 40;
+
     /** 全部合法取值（{@link #normalizeGnss(String)} 的白名单）。 */
     private static final String[] GNSS_VALUES = {
             GNSS_BUILT_BUILDER, GNSS_BUILT_CTOR, GNSS_BUILT_UNSAFE,
@@ -93,14 +110,27 @@ public final class HookHeartbeatStore {
          * <p>取值见 {@code GNSS_*} 常量；设置面板的「卫星表注入」一行由它决定。
          */
         public final String gnss;
+        /**
+         * 模块<b>代码</b>版本号（模块侧 {@code BuildConfig.VERSION_CODE}）；0 = 没上报（老版本模块
+         * / 历史数据）→ 版本未知，调用方不得据此判定"需要重启"。
+         *
+         * <p>这是"那个进程里当时真正在跑的那份模块代码"的版本：APK 更新后没重启，
+         * system_server 里的旧模块仍然报旧值。
+         */
+        public final int ver;
+        /** 模块版本名（{@code BuildConfig.VERSION_NAME}），仅用于显示；{@code null} = 没上报。 */
+        public final String vn;
 
-        Beat(String process, int hooks, String kind, long at, int sdk, String gnss) {
+        Beat(String process, int hooks, String kind, long at, int sdk, String gnss,
+             int ver, String vn) {
             this.process = process;
             this.hooks = hooks;
             this.kind = kind;
             this.at = at;
             this.sdk = sdk;
             this.gnss = gnss;
+            this.ver = ver;
+            this.vn = vn;
         }
 
         public boolean isSystem() {
@@ -130,6 +160,23 @@ public final class HookHeartbeatStore {
      */
     public static boolean record(Context context, String process, int hooks, String kind,
                                  long at, int sdk, String gnss) {
+        return record(context, process, hooks, kind, at, sdk, gnss, 0, null);
+    }
+
+    /**
+     * 记一次心跳（带 GNSS 结果与<b>模块代码版本</b>）。
+     *
+     * <p>{@code ver}/{@code vn} 都是可选：{@code ver <= 0} 或 {@code vn} 非法时<b>不写</b>这两个
+     * 字段，读取侧得到 0 / {@code null}（= 未知），与老版本模块上报的数据完全同构。
+     * 这样新增列既不会破坏既有条目，也不会让"没上报版本"被误判成"版本不匹配"。
+     *
+     * @param gnss {@code built:*} / {@code force:mutated} / {@code skip:*}；{@code null} = 不写
+     * @param ver  模块代码版本号（模块侧 {@code BuildConfig.VERSION_CODE}）；{@code <= 0} = 不写
+     * @param vn   模块版本名（{@code BuildConfig.VERSION_NAME}）；空白 / 超长 / 含控制字符 = 不写
+     * @return false 表示字段不合法被丢弃（调用方返回 null，不抛异常）
+     */
+    public static boolean record(Context context, String process, int hooks, String kind,
+                                 long at, int sdk, String gnss, int ver, String vn) {
         if (context == null || !isValidProcess(process)) {
             return false;
         }
@@ -144,8 +191,11 @@ public final class HookHeartbeatStore {
         }
         final int safeHooks = Math.max(0, Math.min(hooks, MAX_HOOKS));
         final int safeSdk = sdk > 0 ? sdk : Build.VERSION.SDK_INT;
-        // gnss 可选：白名单外的值一律当"没上报"（Provider 对外暴露，不能把任意字符串存进面板）
+        // gnss / ver / vn 可选：白名单外的值一律当"没上报"（Provider 对外暴露，
+        // 不能把任意字符串存进面板）
         final String normGnss = normalizeGnss(gnss);
+        final int normVer = normalizeVersionCode(ver);
+        final String normVn = normalizeVersionName(vn);
         synchronized (LOCK) {
             JSONObject all = load(context);
             try {
@@ -156,6 +206,12 @@ public final class HookHeartbeatStore {
                 entry.put("sdk", safeSdk);
                 if (normGnss != null) {
                     entry.put("gnss", normGnss);
+                }
+                if (normVer > 0) {
+                    entry.put("ver", normVer);
+                }
+                if (normVn != null) {
+                    entry.put("vn", normVn);
                 }
                 all.put(name, entry);
             } catch (JSONException e) {
@@ -272,6 +328,44 @@ public final class HookHeartbeatStore {
         return bestAny;
     }
 
+    /**
+     * 最近一条「系统框架」心跳自报的<b>模块代码版本号</b>（{@link Beat#ver}）。
+     *
+     * <p>这是判断"模块是否已更新但系统没重启"的唯一依据：
+     * <pre>
+     *   running == BuildConfig.VERSION_CODE      → 一致（system_server 里跑的是当前版本）
+     *   running &gt; 0 &amp;&amp; running != 当前          → 模块已更新但系统未重启 → 提示重启
+     *   running == 0                              → 未知（老模块没上报 / 没有 system 心跳）→ 不提示
+     * </pre>
+     * 窗口与 {@link #freshestSystem} 相同（{@link #FRESH_MS}，24 小时），进程选择规则也一致
+     * （system_server 优先），因此"面板显示已生效"的那条心跳与这里判定的就是同一条。
+     *
+     * @return 版本号；没有符合条件的 system 心跳 / 老模块没上报 → 0（调用方必须当"未知"处理）
+     */
+    public static int freshestSystemVersionCode(Context context) {
+        try {
+            final Beat system = freshestSystem(context, FRESH_MS, Build.VERSION.SDK_INT);
+            return system == null ? 0 : system.ver;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * 最近一条「系统框架」心跳自报的<b>模块版本名</b>（{@link Beat#vn}），只用于显示。
+     *
+     * <p>没有心跳 / 老模块没上报 / 值非法 → {@code null}；调用方应退回
+     * {@link #freshestSystemVersionCode(Context)} 的数字版本号。
+     */
+    public static String freshestSystemVersionName(Context context) {
+        try {
+            final Beat system = freshestSystem(context, FRESH_MS, Build.VERSION.SDK_INT);
+            return system == null ? null : system.vn;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** system_server 的进程名：LSPosed 里「系统框架」注入的就是它（{@code android} 包）。 */
     public static boolean isSystemServerProcess(String process) {
         if (process == null) {
@@ -347,6 +441,43 @@ public final class HookHeartbeatStore {
         return null;
     }
 
+    /**
+     * 归一化 {@code ver}：{@code <= 0} 或超出 {@link #MAX_VERSION_CODE} 一律当"没上报"（返回 0）。
+     *
+     * <p>为什么负数 / 离谱值不抛错而是归 0：{@code ver} 是附加列，一个脏值不该让整条心跳作废
+     * （那会让"模块已生效"退化），而 0 在读取侧的含义正好是"版本未知、不据此提示重启"。
+     */
+    static int normalizeVersionCode(int ver) {
+        if (ver <= 0) {
+            return 0;
+        }
+        return Math.min(ver, MAX_VERSION_CODE);
+    }
+
+    /**
+     * 归一化 {@code vn}：去空白后非空、长度 &le; {@link #MAX_VERSION_NAME_LEN}、无控制字符才接受，
+     * 其余返回 {@code null}（= 没上报，显示侧退回数字版本号）。
+     *
+     * <p>与 {@link #normalizeGnss} 同样出于"面板会原样显示"的考虑：Provider 对外暴露，
+     * 任何应用都能 insert，不能让任意字符串（含换行）出现在设置面板里。
+     */
+    static String normalizeVersionName(String vn) {
+        if (vn == null) {
+            return null;
+        }
+        final String value = vn.trim();
+        if (value.isEmpty() || value.length() > MAX_VERSION_NAME_LEN) {
+            return null;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            final char ch = value.charAt(i);
+            if (ch < 0x20 || ch == 0x7F) {
+                return null;
+            }
+        }
+        return value;
+    }
+
     // ------------------------------------------------------------------ 内部
 
     private static SharedPreferences prefs(Context context) {
@@ -373,7 +504,8 @@ public final class HookHeartbeatStore {
         }
         String kind = KIND_SYSTEM.equals(entry.optString("kind", "")) ? KIND_SYSTEM : KIND_APP;
         return new Beat(name, Math.max(0, entry.optInt("hooks", 0)), kind, at,
-                entry.optInt("sdk", 0), readGnss(entry));
+                entry.optInt("sdk", 0), readGnss(entry),
+                normalizeVersionCode(entry.optInt("ver", 0)), readVersionName(entry));
     }
 
     /**
@@ -385,6 +517,20 @@ public final class HookHeartbeatStore {
     private static String readGnss(JSONObject entry) {
         try {
             return normalizeGnss(entry.optString("gnss", null));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 读 {@code vn} 字段：缺失 / 空 / 超长 / 含控制字符 → {@code null}。
+     *
+     * <p>与 {@link #readGnss} 同理：本次改动之前落库的历史条目里没有这一列，老版本模块
+     * 上报的也没有，所以必须"读不到就是 null"，不能抛异常（否则既有心跳整条读不出来）。
+     */
+    private static String readVersionName(JSONObject entry) {
+        try {
+            return normalizeVersionName(entry.optString("vn", null));
         } catch (Throwable t) {
             return null;
         }

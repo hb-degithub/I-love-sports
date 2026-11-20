@@ -47,6 +47,7 @@ import androidx.core.content.FileProvider;
 import com.google.android.material.appbar.MaterialToolbar;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.switchmaterial.SwitchMaterial;
+import com.vloc.motion.BuildConfig;
 import com.vloc.motion.R;
 import com.vloc.motion.core.GeoMath;
 import com.vloc.motion.core.GoalPlanner;
@@ -241,6 +242,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         // 版本检查放最后：后台线程 + 24 小时节流，不阻塞启动，也不显示 loading；
         // 只有确实有新版本才弹窗（见 maybeAutoCheckUpdate）
         maybeAutoCheckUpdate();
+        // 模块被 LSPosed 注入到 system_server / 各 App 进程后，APK 更新不会替换已运行进程里的
+        // 旧代码：这里比对 system 心跳自报的模块版本，不一致就提示重启（非阻塞，见方法注释）
+        maybePromptModuleRestart();
     }
 
     @Override
@@ -2093,18 +2097,196 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         return root instanceof LinearLayout ? (LinearLayout) root : null;
     }
 
+    // ------------------------------------------------------------ 模块更新提示（重启）
+
+    /** 「立即重启」执行的命令（最终形态 {@code su -c reboot}，见 {@link RootShell#su(String)}）。 */
+    private static final String CMD_REBOOT = "reboot";
+    /**
+     * 「仅重启系统框架」执行的命令：重启 zygote 会让 system_server 重新 fork 并重新加载
+     * LSPosed 模块，比整机重启轻；不改磁盘、不改任何配置。
+     */
+    private static final String CMD_RESTART_ZYGOTE = "setprop ctl.restart zygote";
+
+    /**
+     * 「模块已更新」提示：模块代码由 LSPosed <b>注入</b>到 {@code system_server} 与各目标进程里，
+     * APK 更新只换了磁盘上的安装包，<b>已经跑着的进程里仍然是旧代码</b>，必须重启手机
+     * （或重启系统框架 / zygote）才会换成新模块。
+     *
+     * <p>判定用的是心跳链路（{@code hidden/HookHeartbeat} → {@code service/EnvProvider} →
+     * {@link HookHeartbeatStore}）里模块自报的 {@code ver}，与当前
+     * {@link BuildConfig#VERSION_CODE} 比较：
+     * <ul>
+     *   <li>相等 → 一致，不提示；</li>
+     *   <li>{@code ver > 0} 且不等 → 模块已更新但系统未重启 → 弹窗提示；</li>
+     *   <li>{@code ver == 0}（老版本模块不上报版本 / 没有 system 心跳）→ <b>未知，不弹</b>，
+     *       宁可少提示，也不误报"需要重启"。</li>
+     * </ul>
+     *
+     * <p>去重：目标版本（当前 {@code VERSION_CODE}）记进 {@link RouteStore} 的
+     * {@code last_restart_prompt_ver}，同一目标版本只提示一次；用户点「稍后」也记，
+     * 避免每次开屏都弹。下次 APK 更新（版本号变化）才会再提示一次。
+     *
+     * <p>非阻塞：本方法只做一次 prefs 读 + 整数比较（主线程），弹窗 post 到下一个主线程消息，
+     * root 命令全部在后台线程执行（见 {@link #restartWithRoot}）。任何 Throwable 只记日志。
+     */
+    private void maybePromptModuleRestart() {
+        try {
+            final int current = BuildConfig.VERSION_CODE;
+            if (current <= 0) {
+                return;
+            }
+            final int running = HookHeartbeatStore.freshestSystemVersionCode(this);
+            if (!restartNeeded(running, current)) {
+                return;   // 未知（老模块 / 没有 system 心跳）或版本一致：都不提示
+            }
+            if (RouteStore.loadLastRestartPromptVer(this) == current) {
+                return;   // 这个目标版本已经提示过（点过「稍后」也算）
+            }
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            final String oldLabel = versionLabel(
+                    HookHeartbeatStore.freshestSystemVersionName(this), running);
+            final String newLabel = versionLabel(BuildConfig.VERSION_NAME, current);
+            final String body = "检测到系统里的模块仍是 v" + oldLabel + "，当前应用是 v" + newLabel
+                    + "。需要重启手机（或重启系统框架）新模块才会生效。";
+            final Runnable show = () -> showModuleRestartDialog(current, body);
+            // 晚一拍再弹：onCreate 阶段窗口 token 可能还没就绪，直接 show() 有风险；
+            // post 到 decorView 既保证"启动后"才出现，也完全不阻塞启动路径。
+            final View anchor = getWindow() == null ? null : getWindow().getDecorView();
+            if (anchor == null) {
+                show.run();
+            } else {
+                anchor.post(show);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "module restart prompt failed", t);
+        }
+    }
+
+    /**
+     * 「模块已更新」对话框：立即重启 / 仅重启系统框架 / 稍后。
+     *
+     * <p>三个按钮都会先记下目标版本（去重），再执行各自的动作；「稍后」只记录不重启。
+     * 关闭方式（按钮 / 返回键 / 点外部）统一在 {@code setOnDismissListener} 里再记一次，
+     * 保证"同一版本只提示一次"不会因为绕开按钮而失效（写同一个 int，幂等）。
+     *
+     * @param targetVer 当前应用版本号（去重 key 的值）
+     * @param body      正文文案
+     */
+    private void showModuleRestartDialog(final int targetVer, String body) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        final AlertDialog dialog;
+        try {
+            dialog = new AlertDialog.Builder(this)
+                    .setTitle("模块已更新")
+                    .setMessage(body)
+                    .setPositiveButton("立即重启", (d, w) -> {
+                        markRestartPromptShown(targetVer);
+                        restartWithRoot(CMD_REBOOT);
+                    })
+                    .setNeutralButton("仅重启系统框架", (d, w) -> {
+                        markRestartPromptShown(targetVer);
+                        restartWithRoot(CMD_RESTART_ZYGOTE);
+                    })
+                    .setNegativeButton("稍后", (d, w) -> markRestartPromptShown(targetVer))
+                    .create();
+        } catch (Throwable t) {
+            Log.w(TAG, "create module restart dialog failed", t);
+            return;
+        }
+        try {
+            dialog.setOnDismissListener(d -> markRestartPromptShown(targetVer));
+            dialog.show();
+        } catch (Throwable t) {
+            Log.w(TAG, "show module restart dialog failed", t);
+        }
+    }
+
+    /** 记下"这个目标版本已经提示过重启"（{@code last_restart_prompt_ver}；重复写同一个值无害）。 */
+    private void markRestartPromptShown(int targetVer) {
+        try {
+            RouteStore.saveLastRestartPromptVer(this, targetVer);
+        } catch (Throwable t) {
+            Log.w(TAG, "save restart prompt version failed", t);
+        }
+    }
+
+    /**
+     * 后台线程执行一条 root 命令（{@code su -c <cmd>}）。
+     *
+     * <p>为什么必须后台：{@link RootShell#su(String)} 首次授权要等用户点 Magisk/KernelSU 的
+     * 授权弹窗（默认 20s 超时），放主线程会 ANR；<code>reboot</code> / <code>setprop</code>
+     * 本身也可能要一两秒。
+     *
+     * <p>失败处理：只 Toast 提示"请手动重启"，<b>不重试、不抛异常、不影响后续使用</b>。
+     * 成功时设备/框架马上重启，这条 Toast 不会再走到（因此不做成功提示，避免一闪而过）。
+     *
+     * @param command 要执行的命令（本类只传 {@link #CMD_REBOOT} / {@link #CMD_RESTART_ZYGOTE}）
+     */
+    private void restartWithRoot(final String command) {
+        if (command == null || command.isEmpty()) {
+            return;
+        }
+        try {
+            new Thread(() -> {
+                RootShell.Result result = null;
+                try {
+                    result = RootShell.su(command);
+                } catch (Throwable t) {
+                    Log.w(TAG, "root restart failed: " + command, t);
+                }
+                if (result != null && result.ok()) {
+                    return;   // 已成功下发：紧接着系统就会重启/重建
+                }
+                runOnUiThread(() -> {
+                    try {
+                        if (isFinishing() || isDestroyed()) {
+                            return;
+                        }
+                        toast("重启失败，请手动重启手机（或重启系统框架）");
+                    } catch (Throwable t) {
+                        Log.w(TAG, "restart failure toast failed", t);
+                    }
+                });
+            }, "vloc-restart").start();
+        } catch (Throwable t) {
+            Log.w(TAG, "start restart thread failed", t);
+        }
+    }
+
+    /**
+     * 版本展示：优先用版本名（{@code VERSION_NAME}，如 {@code 0.46.5}），
+     * 没有 / 不可用时退回数字版本号（模块心跳里 {@code ver} 一定存在）。
+     */
+    private static String versionLabel(String name, int code) {
+        try {
+            final String trimmed = name == null ? "" : name.trim();
+            if (!trimmed.isEmpty() && trimmed.length() <= HookHeartbeatStore.MAX_VERSION_NAME_LEN) {
+                return trimmed;
+            }
+        } catch (Throwable ignored) {
+            // 落到数字版本号
+        }
+        return code > 0 ? String.valueOf(code) : "?";
+    }
+
     // ------------------------------------------------------------ 注入环境面板（只读 + 立即清理）
 
     /**
      * 「注入环境」面板的视图句柄。
      *
-     * <p>只做一件事：把 10 行状态文本（原有 7 行 + 「卫星表注入」1 行 + 兼容状态 2 行）和
-     * 「立即清理痕迹」按钮攒在一起，供异步回调回写；
+     * <p>只做一件事：把 11 行状态文本（原有 7 行 + 「卫星表注入」1 行 + 兼容状态 2 行 +
+     * 「模块版本」1 行）和「立即清理痕迹」按钮攒在一起，供异步回调回写；
      * {@link #dialog} 是"面板还在不在"的唯一判据——对话框关掉后所有后台回调直接丢弃，
      * 既不会更新已销毁的视图，也不会因为 Activity 已 finishing 而崩。
      */
     private final class InjectionPanel {
         TextView moduleValue;
+        /** 「模块版本」：system 心跳自报的模块版本 vs 当前应用版本（见 {@link #moduleVersionText}）。 */
+        TextView moduleVersionValue;
         TextView modeValue;
         TextView providerValue;
         TextView appopValue;
@@ -2134,7 +2316,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
      *
      * <p>沿用 {@link #addGnssSyntheticOption} 的做法（{@code res/layout/dialog_settings.xml}
      * 属于前端资源、本轮不动）：整个面板按 {@code ScrollView → LinearLayout} 的结构追加，
-     * <b>不插入、不重排既有的 9 个设置项</b>。10 行数据来源见 {@link #refreshInjectionPanel}。
+     * <b>不插入、不重排既有的 9 个设置项</b>。11 行数据来源见 {@link #refreshInjectionPanel}。
      *
      * @return 视图句柄——即使布局结构变了、插不进去也照常返回（各值仍可刷新，只是看不见）
      */
@@ -2147,6 +2329,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             }
             container.addView(groupTitle("注入环境（只读状态）"));
             panel.moduleValue = addStatusRow(container, "模块注入", "检查中…");
+            // 模块版本：system 心跳里模块自报的 ver/vn 与当前应用版本比对（见 moduleVersionText）。
+            // 不一致 = 模块已更新但没重启，运行中还是旧代码 → 用警示色 + ⚠ 前缀。
+            panel.moduleVersionValue = addStatusRow(container, "模块版本", "检查中…");
             panel.modeValue = addStatusRow(container, "注入模式", "…");
             panel.providerValue = addStatusRow(container, "测试 Provider", "…");
             panel.appopValue = addStatusRow(container, "mock_location 权限", "检查中…");
@@ -2220,6 +2405,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
         setValue(panel.overlayValue, FloatingWindow.isAnyShowing() ? "显示中" : "已隐藏");
         setValue(panel.cleanupValue, lastCleanupText());
         setValue(panel.moduleValue, "检查中…");
+        // 「模块版本」要读心跳 prefs（后台线程算，回来连颜色一起写），先占位
+        setValue(panel.moduleVersionValue, "检查中…");
         setValue(panel.appopValue, "检查中…");
         // 「卫星表注入」要读心跳 prefs（后台线程），先占位
         setValue(panel.gnssValue, "检查中…");
@@ -2236,6 +2423,9 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             final String systemCompat = systemCompatText(app);
             // 卫星表注入：最近一条 system 心跳里的 gnss 字段（模块在 GNSS hook 里补报）
             final String gnss = gnssInjectionText(app);
+            // 模块版本：system 心跳自报的 ver/vn vs 当前应用版本（不一致 = 需要重启）
+            final String moduleVersion = moduleVersionText(app);
+            final boolean moduleVersionWarn = moduleVersionNeedsRestart(app);
             runOnUiThread(() -> {
                 if (!panel.alive()) {
                     return;
@@ -2244,6 +2434,7 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 setValue(panel.snapshotValue, snapshot);
                 setValue(panel.systemValue, systemCompat);
                 setValue(panel.gnssValue, gnss);
+                setModuleVersionRow(panel.moduleVersionValue, moduleVersion, moduleVersionWarn);
             });
         }, "vloc-inject-hb").start();
 
@@ -2418,6 +2609,88 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
                 return "未生效";
             default:
                 return "未知";
+        }
+    }
+
+    /**
+     * 面板「模块版本」行：最近一条 <b>system</b> 心跳里模块自报的版本 vs 当前应用版本。
+     *
+     * <p>三态（与 {@link #maybePromptModuleRestart} 的判定口径完全一致）：
+     * <ul>
+     *   <li>一致 → {@code v<当前>（已生效）}；</li>
+     *   <li>不一致（心跳 {@code ver > 0}）→ {@code ⚠ 运行中 v<旧> / 当前 v<新>（需重启）}；</li>
+     *   <li>没有 system 心跳 / 老模块没上报版本（{@code ver == 0}）→ {@code 未知}。</li>
+     * </ul>
+     *
+     * <p>为什么 {@code ver == 0} 显示「未知」而不是"不一致"：老版本模块根本没有这个字段，
+     * 把它当"版本不对"会让所有还没升级模块的用户看到一片 ⚠，那是误报。
+     */
+    private static String moduleVersionText(Context context) {
+        if (context == null) {
+            return "未知";
+        }
+        try {
+            final String currentName = BuildConfig.VERSION_NAME;
+            final int current = BuildConfig.VERSION_CODE;
+            final int running = HookHeartbeatStore.freshestSystemVersionCode(context);
+            if (running <= 0) {
+                return "未知";   // 没有 system 心跳 / 老模块没上报版本：不猜
+            }
+            if (running == current) {
+                return "v" + versionLabel(currentName, current) + "（已生效）";
+            }
+            return "⚠ 运行中 v"
+                    + versionLabel(HookHeartbeatStore.freshestSystemVersionName(context), running)
+                    + " / 当前 v" + versionLabel(currentName, current) + "（需重启）";
+        } catch (Throwable t) {
+            return "未知";
+        }
+    }
+
+    /**
+     * 「模块版本」行是否处于"需要重启"状态——决定用警示色还是常规强调色。
+     *
+     * <p>单独判定（而不是去 {@link #moduleVersionText} 里找 ⚠）是为了让颜色逻辑不依赖文案：
+     * 文案以后改了也不会让颜色跟着错。
+     */
+    private static boolean moduleVersionNeedsRestart(Context context) {
+        if (context == null) {
+            return false;
+        }
+        try {
+            return restartNeeded(HookHeartbeatStore.freshestSystemVersionCode(context),
+                    BuildConfig.VERSION_CODE);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 版本失配判定（提示与面板共用同一口径，避免两处漂移）：
+     * 只有"心跳里的模块版本已知（{@code > 0}）且与当前应用版本不同"才需要重启。
+     *
+     * <p>{@code running == 0} 是"未知"（老版本模块不上报 / 没有 system 心跳 / 心跳过期），
+     * <b>不是</b>"版本不一致"——把它算成不一致会让所有还没升级模块的用户被误提示。
+     *
+     * @param running 最近一条 system 心跳自报的模块版本号（0 = 未知）
+     * @param current 当前应用版本号（{@code BuildConfig.VERSION_CODE}）
+     */
+    private static boolean restartNeeded(int running, int current) {
+        return running > 0 && current > 0 && running != current;
+    }
+
+    /** 写「模块版本」行：需要重启时用警示色（{@code R.color.danger}），否则用常规强调色。 */
+    private void setModuleVersionRow(TextView view, String text, boolean warn) {
+        if (view == null) {
+            return;
+        }
+        try {
+            view.setText(text == null ? "" : text);
+            view.setTextColor(warn
+                    ? ContextCompat.getColor(this, R.color.danger)
+                    : brandColor());
+        } catch (Throwable t) {
+            Log.w(TAG, "set module version row failed", t);
         }
     }
 

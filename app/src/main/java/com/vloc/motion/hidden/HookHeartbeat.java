@@ -37,7 +37,18 @@ import com.vloc.motion.hidden.compat.Xp;
  *                     force:mutated / skip:no-satellites / skip:null）。
  *                     <b>缺失 = 该进程还没确定结果</b>（老版本模块也不带该字段），
  *                     主 App 侧必须兼容为 null（{@code HookHeartbeatStore} 读不到就当 null）。
+ *   ver     (int)     <b>模块代码版本号</b>（{@code BuildConfig.VERSION_CODE}）。
+ *                     老版本模块不带该列 → 主 App 侧读成 0 = "未知"，不据此判定版本失配。
+ *   vn      (String)  可选的模块版本名（{@code BuildConfig.VERSION_NAME}），仅用于界面显示。
  * </pre>
+ *
+ * <p><b>为什么心跳要带版本</b>：模块被 LSPosed 加载进 {@code system_server} 与各目标进程后，
+ * 代码就一直留在那个进程里。用户更新 APK 后，<b>已运行进程里跑的还是旧代码</b>，
+ * 必须重启（或重启 zygote）才会换成新模块。心跳里的 {@code ver} 是"那一刻在那个进程里
+ * 真正跑着的模块版本"，主 App 拿它和自己的 {@code BuildConfig.VERSION_CODE} 比对，
+ * 就能判断"模块已更新但系统没重启"（见 {@code ui/MainActivity#maybePromptModuleRestart}）。
+ * 注意 {@code VERSION_CODE} 是 {@code public static final int} 常量，javac 会把值内联进
+ * 调用点，所以老进程里套的还是老常量 —— 这正是我们要的证据。
  *
  * <p><b>为什么会有第二条心跳</b>（{@link #reportGnss(String)}）：{@code install()} 之后立刻
  * 发的第一次心跳发生在本进程第一次 satellite 回调之前，那时 {@code gnss} 还确定不了；等
@@ -81,6 +92,10 @@ final class HookHeartbeat {
     private static final String COL_SDK = "sdk";
     /** 可选：GNSS 注入结果（{@code built:*} / {@code force:mutated} / {@code skip:*}）。 */
     private static final String COL_GNSS = "gnss";
+    /** 模块代码版本号（{@code BuildConfig.VERSION_CODE}）：主 App 用它判断"跑的是不是旧模块"。 */
+    private static final String COL_VER = "ver";
+    /** 模块版本名（{@code BuildConfig.VERSION_NAME}）：只用于界面显示，缺失不影响判定。 */
+    private static final String COL_VN = "vn";
 
     /** kind：系统进程（system_server / com.android.location.fused / settings / telecom 等系统 uid 进程）。 */
     static final String KIND_SYSTEM = "system";
@@ -331,6 +346,8 @@ final class HookHeartbeat {
         final int hooks = sPendingHooks;
         final String kind = sPendingKind;
         final String gnss = sPendingGnss;   // 可空：空就不带这个字段（老 App 侧兼容）
+        final int ver = moduleVersionCode();
+        final String vn = moduleVersionName();
         try {
             sLastAttemptAt = now;
             sAttempts.incrementAndGet();
@@ -350,7 +367,7 @@ final class HookHeartbeat {
                 return;
             }
             sContext = context;  // 已验证有 ContentResolver：进程内复用，省掉后续反射
-            final ContentValues values = new ContentValues(6);
+            final ContentValues values = new ContentValues(8);
             values.put(COL_PROCESS, name);
             values.put(COL_HOOKS, Integer.valueOf(hooks));
             values.put(COL_KIND, kind == null ? KIND_APP : kind);
@@ -358,6 +375,12 @@ final class HookHeartbeat {
             values.put(COL_SDK, Integer.valueOf(Build.VERSION.SDK_INT));
             if (gnss != null && !gnss.isEmpty()) {
                 values.put(COL_GNSS, gnss);   // 可选字段：老 App 侧读不到就是 null
+            }
+            // 模块版本：固定上报（0 也写），老 App 侧多一列不影响解析；
+            // 主 App 靠它判断"system_server 里跑的模块是不是更新前的旧代码"。
+            values.put(COL_VER, Integer.valueOf(ver));
+            if (vn != null && !vn.isEmpty()) {
+                values.put(COL_VN, vn);   // 可选：只用于显示，缺了不影响版本判定
             }
             final Uri inserted = resolver.insert(Uri.parse(HEARTBEAT_URI), values);
             if (inserted == null) {
@@ -374,7 +397,7 @@ final class HookHeartbeat {
             sReported.set(true);
             sPendingProcess = null;
             sPendingKind = null;
-            log("heartbeat reported: " + name + " hooks=" + hooks
+            log("heartbeat reported: " + name + " hooks=" + hooks + " ver=" + ver
                     + (gnss == null || gnss.isEmpty() ? "" : " gnss=" + gnss));
         } catch (Throwable t) {
             // 刚用过的 Context 可能已失效（例如 insert 内部 NPE）：丢掉缓存，下一轮重新探测；
@@ -471,6 +494,39 @@ final class HookHeartbeat {
                     : KIND_APP;
         } catch (Throwable t) {
             return KIND_APP;
+        }
+    }
+
+    // ================================================================ 模块版本（心跳栏位）
+
+    /**
+     * 本进程里真正在跑的模块代码版本号（{@code BuildConfig.VERSION_CODE}）。
+     *
+     * <p>{@code VERSION_CODE} 是编译期常量，javac 会把数值直接内联进这里，
+     * 因此<b>老 APK 的代码报的是老版本号</b>——主 App 更新后，system_server 里那份没重启的
+     * 旧模块仍然报旧值，正是"模块已更新但系统未重启"的判据。
+     *
+     * @return 版本号；取不到（异常 / 类加载环境异常）返回 0 = "未知"，主 App 侧不会据此提示
+     */
+    static int moduleVersionCode() {
+        try {
+            return com.vloc.motion.BuildConfig.VERSION_CODE;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * 本进程里模块的版本名（{@code BuildConfig.VERSION_NAME}），仅用于界面显示。
+     *
+     * @return 例如 {@code "0.46.5"}；取不到返回 {@code null}（调用方退回数字版本号）
+     */
+    static String moduleVersionName() {
+        try {
+            final String name = com.vloc.motion.BuildConfig.VERSION_NAME;
+            return name == null ? null : name;
+        } catch (Throwable t) {
+            return null;
         }
     }
 
