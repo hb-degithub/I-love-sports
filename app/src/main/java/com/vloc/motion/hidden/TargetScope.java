@@ -99,9 +99,31 @@ final class TargetScope {
      * @param packageName 进程所属包名（非空；由 LSPosed 提供）
      * @return true = 允许安装 hook（未启用名单 / 在名单内 / 读不到名单的兜底）
      */
+    private static volatile boolean sLoggedEmptyScope;
+
+    /** 作用域开关打开但名单为空：每进程只提示一次，避免刷屏。 */
+    private static void logEmptyScopeAllowed() {
+        if (sLoggedEmptyScope) {
+            return;
+        }
+        sLoggedEmptyScope = true;
+        try {
+            com.vloc.motion.hidden.compat.Xp.log(
+                    "target scope: enabled but empty -> allow all");
+        } catch (Throwable ignored) {
+            // 日志失败不影响放行
+        }
+    }
+
     static boolean isAllowed(String packageName) {
         final Scope scope = current();
         if (scope == null || !scope.enabled) {
+            return true;
+        }
+        // 开关打开但一颗都没勾：放行。否则等于"静默全拦"，用户会看到
+        // 「模块未注入」却完全不知道是自己开了作用域——这个坑真实踩过。
+        if (scope.packages.isEmpty()) {
+            logEmptyScopeAllowed();
             return true;
         }
         if (packageName == null || packageName.isEmpty()) {
@@ -134,6 +156,12 @@ final class TargetScope {
     static boolean allowsDelivery(String packageName) {
         final Scope scope = current();
         if (scope == null || !scope.enabled) {
+            return true;
+        }
+        // 开关打开但一颗都没勾：放行。否则等于"静默全拦"，用户会看到
+        // 「模块未注入」却完全不知道是自己开了作用域——这个坑真实踩过。
+        if (scope.packages.isEmpty()) {
+            logEmptyScopeAllowed();
             return true;
         }
         if (packageName == null || packageName.isEmpty()) {
