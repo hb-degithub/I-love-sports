@@ -92,7 +92,11 @@
         <service
             android:name=".service.LocationService"
             android:exported="false"
-            android:foregroundServiceType="location" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="location simulation for fitness apps" />
+        </service>
 
 
         <activity

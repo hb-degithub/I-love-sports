@@ -144,6 +144,16 @@ final class EnvHiding {
      * @return 实际装上的分类数（0 ~ {@value #CATEGORY_COUNT}，用于心跳与安装日志）
      */
     static int install(ClassLoader classLoader) {
+        // 包名隐藏只在「目标 App 进程」里有意义。system_server 里一旦把
+        // com.vloc.motion 伪造成"未安装"，系统自己（NMS 的 fixNotification、
+        // 权限校验等）解析本应用就会抛 NameNotFoundException，
+        // 表现为 "Invalid FGS notification" → 前台服务通知被拒 → 进程被杀。
+        // 真机日志已确认（NotificationManagerService.fixNotification
+        // → getApplicationInfoAsUser → EnvHiding.applyPackageNotFound）。
+        if (Xp.isSystemServer()) {
+            log("env hiding skipped: system_server");
+            return 0;
+        }
         int installed = 0;
         installed += installPackageManager(classLoader) ? 1 : 0;
         installed += installGlobalDevelopmentSetting(classLoader) ? 1 : 0;
