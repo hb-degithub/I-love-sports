@@ -354,7 +354,10 @@ public class LocationService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 若服务是被 startForegroundService 拉起的，系统要求尽快 startForeground；
+        // 这里先挂一条最朴素的常驻通知，避免"未及时前台化"与"通知非法"两类问题。
         ensureNotificationChannel();
+        startForegroundSafe(buildNotification());
         activeInstance = this;
         loadGnssCatalog();
         VlocStateFile.init(this);
@@ -2155,27 +2158,21 @@ public class LocationService extends Service {
         PendingIntent openPending = PendingIntent.getActivity(this, 0, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent pauseIntent = new Intent(this, LocationService.class)
-                .setAction(ACTION_TOGGLE_PAUSE);
-        PendingIntent pausePending = PendingIntent.getService(this, 1, pauseIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-
-        Intent stopIntent = new Intent(this, LocationService.class).setAction(ACTION_STOP);
-        PendingIntent stopPending = PendingIntent.getService(this, 2, stopIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-
-        Session session = Session.INSTANCE;
-        // 动作文案也不带会话细节：暂停/继续靠状态决定，停止只写"停止"
-        return new NotificationCompat.Builder(this, CHANNEL_ID)
+        // 前台服务通知必须是"最朴素"的形态：只用平台 Notification.Builder、
+        // 不带任何 action / 自定义 extras。真机曾因通知被判非法而抛
+        // CannotPostForegroundServiceNotificationException（异步到主线程，catch 不住）。
+        // 通知栏里的暂停/停止按钮属于"锦上添花"，稳定性优先，不做。
+        final Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
+        return builder
                 .setSmallIcon(com.vloc.motion.R.drawable.ic_my_location)
                 .setContentTitle(NOTIFICATION_TITLE)
                 .setContentText(NOTIFICATION_TEXT)
                 .setContentIntent(openPending)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .addAction(0, (session.paused || session.held) ? "继续" : "暂停", pausePending)
-                .addAction(0, "停止", stopPending)
+                .setCategory(Notification.CATEGORY_SERVICE)
                 .build();
     }
 
