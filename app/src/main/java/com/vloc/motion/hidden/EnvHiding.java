@@ -550,14 +550,10 @@ final class EnvHiding {
             if (mode != MODE_ALLOWED && mode != MODE_FOREGROUND) {
                 return; // 已经不是“已授予”，不需要动
             }
-            final String methodName = ((Method) param.method).getName();
-            if (isThrowingCheck(methodName)) {
-                // 与框架语义一致：MODE_ERRORED 时 throwing 变体抛 SecurityException
-                param.setThrowable(new SecurityException(tagForCheck(methodName)
-                        + ": op=" + args[0] + " mode=" + MODE_ERRORED));
-            } else {
-                param.setResult(Integer.valueOf(MODE_ERRORED));
-            }
+            // 一律只改返回值，绝不主动抛异常：目标 App 调 checkOp（throwing 变体）
+            // 时通常不写 try/catch，我们凭空抛 SecurityException 会直接把对方弄崩。
+            // 返回 MODE_ERRORED 与"未授予"语义一致，且不会改变调用方的控制流。
+            param.setResult(Integer.valueOf(MODE_ERRORED));
             logOpsCheckOnce(param.method);
         } catch (Throwable ignored) {
             // 判断失败：放行原逻辑
