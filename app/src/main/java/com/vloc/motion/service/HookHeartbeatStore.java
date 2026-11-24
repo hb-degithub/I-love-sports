@@ -43,6 +43,16 @@ public final class HookHeartbeatStore {
     /** 心跳"新鲜"窗口：超过这个时间的系统框架心跳不再当作存活证据（24 小时）。 */
     public static final long FRESH_MS = 24L * 60L * 60L * 1000L;
 
+    /**
+     * 「模块版本」判定专用窗口：只认最近 10 分钟内的 system 心跳。
+     *
+     * <p>用 {@link #FRESH_MS}（24h）会出现误判：模块早先跑过并上报过版本，
+     * 之后没再上报（进程没被注入 / 重启后尚未加载），界面仍拿那条历史心跳
+     * 当作"当前模块版本"，显示成"模块 0.47.5 / 应用 0.48.1"并要求重启——
+     * 而实际模块可能压根没运行。故版本比较必须用短窗口。
+     */
+    public static final long VERSION_FRESH_MS = 10L * 60L * 1000L;
+
     public static final String KIND_SYSTEM = "system";
     public static final String KIND_APP = "app";
 
@@ -344,7 +354,7 @@ public final class HookHeartbeatStore {
      */
     public static int freshestSystemVersionCode(Context context) {
         try {
-            final Beat system = freshestSystem(context, FRESH_MS, Build.VERSION.SDK_INT);
+            final Beat system = freshestSystem(context, VERSION_FRESH_MS, Build.VERSION.SDK_INT);
             return system == null ? 0 : system.ver;
         } catch (Throwable t) {
             return 0;
@@ -359,7 +369,7 @@ public final class HookHeartbeatStore {
      */
     public static String freshestSystemVersionName(Context context) {
         try {
-            final Beat system = freshestSystem(context, FRESH_MS, Build.VERSION.SDK_INT);
+            final Beat system = freshestSystem(context, VERSION_FRESH_MS, Build.VERSION.SDK_INT);
             return system == null ? null : system.vn;
         } catch (Throwable t) {
             return null;
