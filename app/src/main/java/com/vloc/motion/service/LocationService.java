@@ -89,6 +89,8 @@ public class LocationService extends Service {
     public static final String EXTRA_SPEED_VARIANCE = "speed_variance";
 
     private static final String CHANNEL_ID = "vloc_playback";
+    /** 主渠道被用户关闭时使用（新 id 不会继承"已关闭"状态）。 */
+    private static final String CHANNEL_ID_BACKUP = "vloc_playback_v2";
     /**
      * 前台通知的固定文案（<b>中性化</b>）。
      *
@@ -2131,6 +2133,9 @@ public class LocationService extends Service {
 
     // ---------------------------------------------------------------- 通知
 
+    /** 当前实际使用的通知渠道（渠道被用户关闭时会切到备用 id）。 */
+    private String activeChannelId = CHANNEL_ID;
+
     private void ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             return;
@@ -2139,11 +2144,29 @@ public class LocationService extends Service {
         if (nm == null) {
             return;
         }
-        NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "运行状态",
-                NotificationManager.IMPORTANCE_LOW);
-        channel.setShowBadge(false);
-        channel.setDescription("虚拟运动运行状态");
-        nm.createNotificationChannel(channel);
+        createChannel(nm, CHANNEL_ID, "运行状态");
+        createChannel(nm, CHANNEL_ID_BACKUP, "运行状态（备用）");
+        // 渠道被用户/系统设为"关闭"(IMPORTANCE_NONE) 时，继续往它发前台通知
+        // 会被判 Bad notification（真机踩过）。此时切到备用渠道，保证会话能起来。
+        NotificationChannel primary = nm.getNotificationChannel(CHANNEL_ID);
+        if (primary != null && primary.getImportance() == NotificationManager.IMPORTANCE_NONE) {
+            activeChannelId = CHANNEL_ID_BACKUP;
+            Log.w(TAG, "channel " + CHANNEL_ID + " disabled, using backup channel");
+        } else {
+            activeChannelId = CHANNEL_ID;
+        }
+    }
+
+    private static void createChannel(NotificationManager nm, String id, String name) {
+        try {
+            NotificationChannel channel = new NotificationChannel(id, name,
+                    NotificationManager.IMPORTANCE_LOW);
+            channel.setShowBadge(false);
+            channel.setDescription("虚拟运动运行状态");
+            nm.createNotificationChannel(channel);
+        } catch (Throwable ignored) {
+            // 部分 ROM 会拒绝建渠道：忽略，后面还有降级
+        }
     }
 
     /**
@@ -2163,7 +2186,7 @@ public class LocationService extends Service {
         // CannotPostForegroundServiceNotificationException（异步到主线程，catch 不住）。
         // 通知栏里的暂停/停止按钮属于"锦上添花"，稳定性优先，不做。
         final Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, CHANNEL_ID)
+                ? new Notification.Builder(this, activeChannelId)
                 : new Notification.Builder(this);
         return builder
                 .setSmallIcon(com.vloc.motion.R.drawable.ic_my_location)
@@ -2410,6 +2433,18 @@ public class LocationService extends Service {
         // CannotPostForegroundServiceNotificationException（"Bad notification"）
         // 且该异常是异步投递到主线程的，外面 catch 不住 → 直接闪退。
         ensureNotificationChannel();
+        // 通知被整体关闭时，startForeground 会被 ROM 判非法并异步抛异常（catch 不住）。
+        // 这种情况降级：不前台化，提示用户去开通知，避免整个进程被系统杀掉。
+        try {
+            final NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null && !nm.areNotificationsEnabled()) {
+                Log.w(TAG, "notifications disabled, skip startForeground");
+                toast("请在系统设置中允许「虚拟运动」发送通知，否则后台运行会被限制");
+                return;
+            }
+        } catch (Throwable ignored) {
+            // 查询失败按"可用"处理，继续走正常路径
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceCompat.startForeground(this, NOTIFICATION_ID, notification,
