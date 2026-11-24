@@ -2150,33 +2150,15 @@ public class LocationService extends Service {
      * 那些信息一律不进入通知（见 {@link #NOTIFICATION_TITLE}）。
      */
     private Notification buildNotification() {
-        Intent openIntent = new Intent(this, MainActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
-        PendingIntent openPending = PendingIntent.getActivity(this, 0, openIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-
-        Intent pauseIntent = new Intent(this, LocationService.class)
-                .setAction(ACTION_TOGGLE_PAUSE);
-        PendingIntent pausePending = PendingIntent.getService(this, 1, pauseIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-
-        Intent stopIntent = new Intent(this, LocationService.class).setAction(ACTION_STOP);
-        PendingIntent stopPending = PendingIntent.getService(this, 2, stopIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-
-        Session session = Session.INSTANCE;
-        // 动作文案也不带会话细节：暂停/继续靠状态决定，停止只写"停止"
-        return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setContentTitle(NOTIFICATION_TITLE)
-                .setContentText(NOTIFICATION_TEXT)
-                .setContentIntent(openPending)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .addAction(0, (session.paused || session.held) ? "继续" : "暂停", pausePending)
-                .addAction(0, "停止", stopPending)
-                .build();
+        // 最终形态：只有 渠道 + 小图标 + 标题 + 正文。
+        // 不含 contentIntent / actions / priority / ongoing / category，
+        // 也不手动改 flags —— 用于排除所有可能在 Android 17 上被判非法的字段。
+        final NotificationCompat.Builder builder =
+                new NotificationCompat.Builder(this, CHANNEL_ID)
+                        .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                        .setContentTitle(NOTIFICATION_TITLE)
+                        .setContentText(NOTIFICATION_TEXT);
+        return builder.build();
     }
 
     /**
