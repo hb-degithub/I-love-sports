@@ -2167,7 +2167,7 @@ public class LocationService extends Service {
         Session session = Session.INSTANCE;
         // 动作文案也不带会话细节：暂停/继续靠状态决定，停止只写"停止"
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .setSmallIcon(com.vloc.motion.R.drawable.ic_my_location)
                 .setContentTitle(NOTIFICATION_TITLE)
                 .setContentText(NOTIFICATION_TEXT)
                 .setContentIntent(openPending)
@@ -2215,7 +2215,7 @@ public class LocationService extends Service {
         PendingIntent openPending = PendingIntent.getActivity(this, 0, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification alert = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .setSmallIcon(com.vloc.motion.R.drawable.ic_my_location)
                 .setContentTitle("虚拟运动 · 需要处理")
                 .setContentText(SYSTEM_MODULE_MISSING_MSG)
                 .setStyle(new NotificationCompat.BigTextStyle().bigText(SYSTEM_MODULE_MISSING_MSG))
@@ -2409,6 +2409,10 @@ public class LocationService extends Service {
     
 
     private void startForegroundSafe(Notification notification) {
+        // 通道必须在 startForeground 之前就存在：缺失时系统会抛
+        // CannotPostForegroundServiceNotificationException（"Bad notification"）
+        // 且该异常是异步投递到主线程的，外面 catch 不住 → 直接闪退。
+        ensureNotificationChannel();
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceCompat.startForeground(this, NOTIFICATION_ID, notification,
