@@ -7,7 +7,6 @@ import android.location.Criteria;
 import android.location.Location;
 import android.location.LocationManager;
 import android.os.Build;
-import android.os.SystemClock;
 
 import com.vloc.motion.core.Fix;
 import com.vloc.motion.core.VLog;
@@ -275,7 +274,7 @@ public final class TestProviderInjector {
     }
 
     /** 写入一次拟真定位（含海拔 / 垂直精度 / GNSS 附属数据）。 */
-    public synchronized void push(Fix fix, long timeMs) {
+    public synchronized void push(Fix fix, long timeMs, long elapsedRealtimeNanos) {
         if (!prepared) {
             throw new IllegalStateException("injector not prepared");
         }
@@ -285,7 +284,6 @@ public final class TestProviderInjector {
             prepared = false;
             throw new IllegalStateException("no test provider left: " + describe());
         }
-        long elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos();
         // 只往本次真正接管成功的 Provider 写：失败的 provider 写也写不进去
         List<String> lost = null;
         for (String provider : preparedProviders) {
@@ -312,8 +310,8 @@ public final class TestProviderInjector {
                 // 真实 GPS 定位常带这些 extras，缺失本身就是一种"假定位"特征
                 Bundle extras = new Bundle();
                 extras.putInt("satellites", fix.satellites);
-                extras.putFloat("meanCn0", fix.meanCn0);
-                extras.putFloat("maxCn0", fix.maxCn0);
+                extras.putInt("meanCn0", Math.round(fix.meanCn0));
+                extras.putInt("maxCn0", Math.round(fix.maxCn0));
                 location.setExtras(extras);
             }
             try {

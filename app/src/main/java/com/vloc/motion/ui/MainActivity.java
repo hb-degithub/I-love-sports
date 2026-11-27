@@ -2595,6 +2595,8 @@ public class MainActivity extends AppCompatActivity implements Session.Listener 
             return "未知";
         }
         switch (gnss) {
+            case HookHeartbeatStore.GNSS_BUILT_LEGACY:
+                return "已注入（旧版卫星数组）";
             case HookHeartbeatStore.GNSS_BUILT_BUILDER:
                 return "已构造(builder)";
             case HookHeartbeatStore.GNSS_BUILT_CTOR:

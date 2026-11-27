@@ -75,6 +75,7 @@ public final class HookHeartbeatStore {
     static final int MAX_PROCESS_LEN = 200;
 
     /** {@code gnss} 字段的合法取值（与模块侧 {@code SystemHooks} / 设置面板逐字对应）。 */
+    public static final String GNSS_BUILT_LEGACY = "built:legacy";
     public static final String GNSS_BUILT_BUILDER = "built:builder";
     public static final String GNSS_BUILT_CTOR = "built:ctor";
     public static final String GNSS_BUILT_UNSAFE = "built:unsafe";
@@ -96,7 +97,7 @@ public final class HookHeartbeatStore {
 
     /** 全部合法取值（{@link #normalizeGnss(String)} 的白名单）。 */
     private static final String[] GNSS_VALUES = {
-            GNSS_BUILT_BUILDER, GNSS_BUILT_CTOR, GNSS_BUILT_UNSAFE,
+            GNSS_BUILT_LEGACY, GNSS_BUILT_BUILDER, GNSS_BUILT_CTOR, GNSS_BUILT_UNSAFE,
             GNSS_FORCE_MUTATED, GNSS_SKIP_NO_SATELLITES, GNSS_SKIP_NULL,
     };
 

@@ -125,7 +125,7 @@ public final class SnapshotServer {
     private String socketName;
 
     /** 正在处理的那条连接：{@link #stop()} 关掉它，让阻塞中的 {@code read} 立刻返回。 */
-    private volatile LocalSocket current;
+    private LocalSocket current; // guarded by lock
 
     private SnapshotServer() {
     }
@@ -337,18 +337,22 @@ public final class SnapshotServer {
                 if (client == null) {
                     continue;
                 }
-                if (!isCurrent(myEpoch)) {
-                    closeQuietly(client);
-                    break;
+                synchronized (lock) {
+                    if (!running || epoch != myEpoch) {
+                        closeQuietly(client);
+                        break;
+                    }
+                    current = client;
                 }
-                current = client;
                 try {
                     serve(client);
                 } catch (Throwable ignored) {
                     // 单条连接的任何异常都不能拖垮服务：静默关闭，继续 accept
                 } finally {
-                    if (current == client) {
-                        current = null;
+                    synchronized (lock) {
+                        if (current == client) {
+                            current = null;
+                        }
                     }
                     closeQuietly(client);
                 }
@@ -364,13 +368,6 @@ public final class SnapshotServer {
                 }
             }
             closeQuietly(socket);
-        }
-    }
-
-    /** 本次启动的代次是否仍是当前代次（stop / 下一次 start 之后为 false）。 */
-    private boolean isCurrent(int myEpoch) {
-        synchronized (lock) {
-            return running && epoch == myEpoch;
         }
     }
 

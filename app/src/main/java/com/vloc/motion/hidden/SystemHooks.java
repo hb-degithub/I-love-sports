@@ -5,6 +5,7 @@ import android.location.GnssStatus;
 import android.location.Location;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.Build;
 import android.os.IInterface;
 import android.os.Process;
 import android.os.SystemClock;
@@ -190,10 +191,11 @@ final class SystemHooks {
         final float meanCn0;
         final float maxCn0;
         final long updatedAt;
+        final long elapsedRealtimeNanos;
 
         Snapshot(double lat, double lon, double alt, float speed, float bearing,
                  float accuracy, int satellites, float meanCn0, float maxCn0,
-                 long updatedAt) {
+                 long updatedAt, long elapsedRealtimeNanos) {
             this.lat = lat;
             this.lon = lon;
             this.alt = alt;
@@ -204,6 +206,7 @@ final class SystemHooks {
             this.meanCn0 = meanCn0;
             this.maxCn0 = maxCn0;
             this.updatedAt = updatedAt;
+            this.elapsedRealtimeNanos = elapsedRealtimeNanos;
         }
     }
 
@@ -273,14 +276,15 @@ final class SystemHooks {
     // ================================================================== 安装
 
     static int install(ClassLoader classLoader) {
-        int hooked = 0;
-        // 先建「注册者 → 接收方身份（包名 + uid）」映射，投递 hook 才能查到接收方
-        hooked += hookRegistrationTargets(classLoader);
-        hooked += hookLocationDelivery(classLoader);
-        hooked += hookLastLocation(classLoader);
-        hooked += hookGnssDelivery(classLoader);
+        final int registration = hookRegistrationTargets(classLoader);
+        final int delivery = hookLocationDelivery(classLoader);
+        final int query = hookLastLocation(classLoader);
+        final int gnss = hookGnssDelivery(classLoader);
+        final int hooked = registration + delivery + query + gnss;
         sHookCount = hooked;
-        log("system hooks=" + hooked + " (system_server 级定位/GNSS 注入)");
+        log("system hooks=" + hooked + " sdk=" + Build.VERSION.SDK_INT
+                + " registration=" + registration + " locationDelivery=" + delivery
+                + " locationQuery=" + query + " gnss=" + gnss);
         log("target scope: " + TargetScope.summary());
         // GNSS 卫星表没有“接收方”信息：按契约保持全局生效，这里说明一次
         log("gnss sv status: no target pkg info -> always applies globally");
@@ -675,6 +679,9 @@ final class SystemHooks {
      */
     private static final AtomicBoolean sLoggedDeliveryFired = new AtomicBoolean();
     private static final AtomicBoolean sLoggedLastLocationFired = new AtomicBoolean();
+    private static final AtomicBoolean sLoggedLastLocationReplaced = new AtomicBoolean();
+    private static final Set<String> sLoggedSnapshotSources =
+            Collections.synchronizedSet(new LinkedHashSet<String>());
     private static final AtomicBoolean sLoggedNoSnapshot = new AtomicBoolean();
     private static final AtomicBoolean sLoggedLastLocationNoSnapshot = new AtomicBoolean();
     private static final AtomicBoolean sLoggedSnapshotUnavailable = new AtomicBoolean();
@@ -778,15 +785,22 @@ final class SystemHooks {
             "com.android.server.location.LocationManagerService$LocationListenerTransport",
             "com.android.server.location.provider.LocationProviderManager$LocationRegistration",
             "com.android.server.location.provider.LocationProviderManager$LocationRegistration$1",
-            // Android 17（SDK 37）：三个 Transport 各自 deliverOnLocationChanged(LocationResult, IRemoteCallback)
+            // Android 12 起的三个 Transport；完成回调类型随版本变化。
             "com.android.server.location.provider.LocationProviderManager$LocationListenerTransport",
             "com.android.server.location.provider.LocationProviderManager$LocationPendingIntentTransport",
             "com.android.server.location.provider.LocationProviderManager$GetCurrentLocationTransport"
     };
 
     private static int hookLocationDelivery(ClassLoader classLoader) {
-        final int count = hookCandidates(classLoader, LOCATION_DELIVERY_CLASSES,
+        int count = hookCandidates(classLoader, LOCATION_DELIVERY_CLASSES,
                 LOCATION_DELIVERY_METHODS, LOCATION_HOOK, "location", false);
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+            count += hookCandidates(classLoader, new String[]{
+                    "com.android.server.LocationManagerService$Receiver",
+                    "com.android.server.location.LocationManagerService$Receiver"
+            }, Collections.singletonList("callLocationChangedLocked"),
+                    LEGACY_LOCATION_HOOK, "legacy location delivery", true);
+        }
         if (count == 0) {
             log("no location transport class found (版本差异)，改用 getLastLocation 兜底");
         }
@@ -835,6 +849,47 @@ final class SystemHooks {
     private static final Map<Class<?>, Object> sLocationsAccessors =
             Collections.synchronizedMap(new WeakHashMap<Class<?>, Object>());
     private static final Object NO_LOCATIONS_ACCESSOR = new Object();
+
+    private static final Callback LEGACY_LOCATION_HOOK = new Callback() {
+        @Override
+        protected void before(Param param) {
+            try {
+                if (param.args == null || param.args.length != 1
+                        || !(param.args[0] instanceof Location)) {
+                    return;
+                }
+                final boolean android11 = Build.VERSION.SDK_INT == Build.VERSION_CODES.R;
+                final Object receiver = param.thisObject;
+                final Object identity = Xp.getObjectField(receiver,
+                        android11 ? "mCallerIdentity" : "mIdentity");
+                final String packageName = (String) Xp.getObjectField(identity,
+                        android11 ? "packageName" : "mPackageName");
+                final Object permission = android11
+                        ? Xp.getObjectField(identity, "permissionLevel")
+                        : Xp.getObjectField(receiver, "mAllowedResolutionLevel");
+                // AOSP 两种 Receiver 都用级别 2 表示精确定位。
+                if (!Integer.valueOf(2).equals(permission) || packageName == null
+                        || !TargetScope.allowsDelivery(packageName)) {
+                    return;
+                }
+                final Snapshot snapshot = currentLocation();
+                if (snapshot == null) {
+                    logNoSnapshotOnce(sLoggedNoSnapshot, "legacy location delivery");
+                    return;
+                }
+                final Location location = new Location((Location) param.args[0]);
+                if (applySnapshot(location, snapshot, "callLocationChangedLocked")) {
+                    param.args[0] = location;
+                    if (!sLoggedFirstReplace) {
+                        sLoggedFirstReplace = true;
+                        log("system location replaced: legacy Receiver");
+                    }
+                }
+            } catch (Throwable t) {
+                logReplaceFailureOnce("legacy Receiver", "callLocationChangedLocked", t);
+            }
+        }
+    };
 
     /**
      * 替换投递给 App 的 Location / LocationResult；未在模拟时不改动。
@@ -935,8 +990,7 @@ final class SystemHooks {
     };
 
     /**
-     * 候选类表：A17 之前同步入口在 {@code LocationManagerService}（及其 {@code LocalService}），
-     * A17 搬到 {@code com.android.server.location.*.LocationProviderManager}。
+     * 缓存位置的服务类在 Android 11 改包名；Android 12 起还有 ProviderManager 层入口。
      *
      * <p>只认返回 {@link Location} 的重载——同名方法在该类里还有返回 {@code Address} /
      * {@code LocationAvailability} 的变体，误挂会把返回值改成 Location 让宿主 ClassCastException。
@@ -949,30 +1003,42 @@ final class SystemHooks {
             count = HookCompat.hookFirst(classLoader, "last-location", LAST_LOCATION_CLASSES,
                     LAST_LOCATION_METHODS, LAST_LOCATION_HOOK, Location.class, false);
         } catch (Throwable t) {
-            log("skip getLastLocation/getCurrentLocation: " + t);
+            log("skip getLastLocation: " + t);
             return 0;
         }
         if (count > 0) {
-            log("hooked getLastLocation/getCurrentLocation x" + count);
+            log("hooked getLastLocation x" + count);
         }
-        return 0;   // 不单独计数，避免日志夸大
+        return count;
     }
 
     /** getLastLocation / getCurrentLocation 的候选类（旧版本在前，互相独立、全部尝试）。 */
     private static final String[] LAST_LOCATION_CLASSES = {
+            "com.android.server.LocationManagerService",
             "com.android.server.location.LocationManagerService",
             "com.android.server.location.provider.LocationProviderManager",
             "com.android.server.location.LocationManagerService$LocalService"
     };
 
-    /** 同步取位置的方法名（{@code getLastLocation} 读缓存，{@code getCurrentLocation} 单次请求）。 */
-    private static final String[] LAST_LOCATION_METHODS = {"getLastLocation", "getCurrentLocation"};
+    /** 同步读取缓存位置。异步单次请求走投递链。 */
+    private static final String[] LAST_LOCATION_METHODS = {"getLastLocation"};
 
     /** 同步兜底路径的改写器（无状态，可跨方法/跨类复用）。 */
     private static final Callback LAST_LOCATION_HOOK = new Callback() {
         @Override
         protected void after(Param param) {
             try {
+                if (param.getThrowable() != null) {
+                    return;
+                }
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+                    final Context context = systemContext();
+                    if (!(param.getResult() instanceof Location) || context == null
+                            || context.checkCallingOrSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        return;
+                    }
+                }
                 // 诊断：先证明这条同步兜底路径有没有被调用（每进程一行）
                 logHookFiredOnce(sLoggedLastLocationFired, param, "last-location");
                 // 作用域门控：这类同步方法没有 transport 可查，
@@ -1001,6 +1067,9 @@ final class SystemHooks {
                 final String provider = result instanceof Location
                         ? ((Location) result).getProvider() : "gps";
                 param.setResult(buildLocation(snapshot, provider));
+                if (sLoggedLastLocationReplaced.compareAndSet(false, true)) {
+                    log("system location query replaced: " + methodNameOf(param));
+                }
             } catch (Throwable t) {
                 // 保留真实结果
             }
@@ -1056,6 +1125,16 @@ final class SystemHooks {
             // 取列表失败：可见 + 仍然尝试新建兜底
             logReplaceFailureOnce("LocationResult", methodName, t);
         }
+        if (locations != null && locations.size() > 1) {
+            // 当前快照只有一帧，不能用同一坐标和时间覆盖一整批历史定位。
+            final Location latest = locations.get(locations.size() - 1);
+            final Location replacement = latest == null
+                    ? buildLocation(snapshot, "gps") : new Location(latest);
+            if (latest != null && !applySnapshot(replacement, snapshot, methodName)) {
+                return NO_REPLACE;
+            }
+            return replaceWithSingleLocation(replacement, methodName);
+        }
         int items = 0;
         if (locations != null) {
             for (Location location : locations) {
@@ -1077,10 +1156,12 @@ final class SystemHooks {
             items = 0;
         }
         // 兜底：新建一个 LocationResult 塞回参数（A17 上 create/wrap 是否可用不假设）
-        final List<Location> fresh = new ArrayList<>(1);
-        fresh.add(buildLocation(snapshot, "gps"));
+        return replaceWithSingleLocation(buildLocation(snapshot, "gps"), methodName);
+    }
+
+    private static Replace replaceWithSingleLocation(Location location, String methodName) {
         try {
-            final Object rebuilt = createLocationResult(fresh);
+            final Object rebuilt = createLocationResult(Collections.singletonList(location));
             return rebuilt == null ? NO_REPLACE : new Replace(1, "LocationResult", rebuilt);
         } catch (Throwable t) {
             logReplaceFailureOnce("LocationResult", methodName, t);
@@ -1102,8 +1183,8 @@ final class SystemHooks {
             location.setLatitude(snapshot.lat);
             location.setLongitude(snapshot.lon);
             location.setAltitude(snapshot.alt);
-            location.setTime(System.currentTimeMillis());
-            location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+            location.setTime(snapshot.updatedAt);
+            location.setElapsedRealtimeNanos(snapshot.elapsedRealtimeNanos);
             location.setAccuracy(accuracy);
             location.setSpeed(snapshot.speed);
             location.setBearing(snapshot.bearing);
@@ -1119,20 +1200,22 @@ final class SystemHooks {
             // 精度三项只是附属信息：失败不影响位置本体，但同样要可见
             logReplaceFailureOnce("Location.accuracy", methodName, t);
         }
-        applySatellitesExtra(location, snapshot.satellites, methodName);
+        applySatellitesExtra(location, snapshot, methodName);
         return true;
     }
 
-    /** 保留 satellites extras（与主 App 快照一致）：合并而不是覆盖原有 extras。 */
-    private static void applySatellitesExtra(Location location, int satellites, String methodName) {
-        if (satellites <= 0) {
+    /** 合并卫星统计，并采用 AOSP GnssLocationProvider 的整数类型。 */
+    private static void applySatellitesExtra(Location location, Snapshot snapshot, String methodName) {
+        if (snapshot.satellites <= 0) {
             return;
         }
         try {
             final android.os.Bundle existing = location.getExtras();
             final android.os.Bundle extras =
                     existing == null ? new android.os.Bundle() : new android.os.Bundle(existing);
-            extras.putInt("satellites", satellites);
+            extras.putInt("satellites", snapshot.satellites);
+            extras.putInt("meanCn0", Math.round(snapshot.meanCn0));
+            extras.putInt("maxCn0", Math.round(snapshot.maxCn0));
             location.setExtras(extras);
         } catch (Throwable t) {
             // 位置本体已经改好，extras 只影响卫星数显示 → 记一条即可
@@ -1490,8 +1573,8 @@ final class SystemHooks {
         final Location location = new Location(provider == null ? "gps" : provider);
         location.setLatitude(snapshot.lat);
         location.setLongitude(snapshot.lon);
-        location.setTime(System.currentTimeMillis());
-        location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+        location.setTime(snapshot.updatedAt);
+        location.setElapsedRealtimeNanos(snapshot.elapsedRealtimeNanos);
         location.setAccuracy(snapshot.accuracy > 0 ? snapshot.accuracy : 5f);
         location.setAltitude(snapshot.alt);
         location.setSpeed(snapshot.speed);
@@ -1504,31 +1587,15 @@ final class SystemHooks {
         } catch (Throwable ignored) {
             // 低版本没有这些 setter
         }
-        if (snapshot.satellites > 0) {
-            try {
-                final android.os.Bundle extras = new android.os.Bundle();
-                extras.putInt("satellites", snapshot.satellites);
-                // 真实 GnssLocationProvider 也写这两个聚合值；很多 App 的「GPS 信号格」
-                // 就是读它们，缺了会直接判定为信号弱/无信号。
-                if (snapshot.meanCn0 > 0f) {
-                    extras.putFloat("meanCn0", snapshot.meanCn0);
-                }
-                if (snapshot.maxCn0 > 0f) {
-                    extras.putFloat("maxCn0", snapshot.maxCn0);
-                }
-                location.setExtras(extras);
-            } catch (Throwable ignored) {
-                // ignore
-            }
-        }
+        applySatellitesExtra(location, snapshot, "buildLocation");
         return location;
     }
 
     // ================================================================== GNSS 卫星下发
 
     /**
-     * 卫星投递方法名：旧版本为 {@code onSatelliteStatusChanged(GnssStatus)}；
-     * Android 17 真机 dexdump 确认 {@code GnssStatusProvider#onReportSvStatus(GnssStatus)} 是下发入口。
+     * 对象形式的卫星投递。AOSP Android 12 起使用 {@code GnssStatusProvider#onReportSvStatus}；
+     * Android 8–11 的数组回调单独安装。
      */
     private static final List<String> GNSS_DELIVERY_METHODS =
             Arrays.asList("onSatelliteStatusChanged", "onReportSvStatus");
@@ -1537,12 +1604,22 @@ final class SystemHooks {
             "com.android.server.location.GnssStatusListenerTransport",
             "com.android.server.location.gnss.GnssStatusListenerTransport",
             "android.location.GnssStatus$GnssStatusListenerTransport",
-            // Android 17（SDK 37）：GnssStatusProvider 继承 GnssListenerMultiplexer，
+            // Android 12 起：GnssStatusProvider 继承 GnssListenerMultiplexer，
             // onReportSvStatus(GnssStatus) 直接把卫星表下发给注册者（参数就是 GnssStatus）
             "com.android.server.location.gnss.GnssStatusProvider"
     };
 
     private static int hookGnssDelivery(ClassLoader classLoader) {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+            final int legacy = hookCandidates(classLoader, new String[]{
+                    "com.android.server.location.GnssStatusListenerHelper",
+                    "com.android.server.location.gnss.GnssStatusListenerHelper"
+            }, Collections.singletonList("onSvStatusChanged"), LEGACY_GNSS_HOOK,
+                    "legacy gnss", true);
+            if (legacy > 0) {
+                return legacy;
+            }
+        }
         return hookCandidates(classLoader, GNSS_DELIVERY_CLASSES, GNSS_DELIVERY_METHODS,
                 GNSS_HOOK, "gnss", true);
     }
@@ -1632,13 +1709,61 @@ final class SystemHooks {
         return enabled;
     }
 
+    private static final Callback LEGACY_GNSS_HOOK = new Callback() {
+        @Override
+        protected void before(Param param) {
+            try {
+                final Object[] args = param.args;
+                final boolean android11 = Build.VERSION.SDK_INT == Build.VERSION_CODES.R;
+                if (!LegacyGnssStatus.matches(args, android11)) {
+                    logGnssSkippedOnce("legacy signature mismatch");
+                    return;
+                }
+                final List<Satellite> satellites = currentSatellites();
+                if (satellites == null || satellites.isEmpty()) {
+                    return;
+                }
+                final int count = satellites.size();
+                final int[] svidFlags = new int[count];
+                final float[] cn0 = new float[count];
+                final float[] elevation = new float[count];
+                final float[] azimuth = new float[count];
+                final float[] carrier = new float[count];
+                for (int i = 0; i < count; i++) {
+                    final Satellite sat = satellites.get(i);
+                    svidFlags[i] = LegacyGnssStatus.pack(android11, sat.svid, sat.constellation,
+                            sat.hasEphemeris, sat.hasAlmanac, sat.usedInFix, sat.carrierHz > 0f);
+                    cn0[i] = sat.cn0;
+                    elevation[i] = sat.elevation;
+                    azimuth[i] = sat.azimuth;
+                    carrier[i] = sat.carrierHz;
+                }
+                args[0] = count;
+                args[1] = svidFlags;
+                args[2] = cn0;
+                args[3] = elevation;
+                args[4] = azimuth;
+                args[5] = carrier;
+                if (android11) {
+                    // 快照只提供天线载噪比。未设置基带标志，数组占位以满足 Android 11 签名。
+                    args[6] = new float[count];
+                }
+                setGnssState("built:legacy");
+                if (!sLoggedFirstGnss) {
+                    sLoggedFirstGnss = true;
+                    log("system gnss replaced: satellites=" + count + " (legacy arrays)");
+                }
+            } catch (Throwable t) {
+                logGnssSkippedOnce("legacy GNSS callback failed: " + t);
+            }
+        }
+    };
+
     private static final Callback GNSS_HOOK = new Callback() {
         @Override
         protected void before(Param param) {
             try {
-                // 卫星表与位置是两个独立维度：位置可能处于"暂停/停止移动但定位保持"
-                // （快照 active=false），而卫星表仍应注入——否则 App 会判定 GPS 信号弱、
-                // 直接拒绝开始跑步。这里只以"有没有合成卫星表"为准。
+                // 暂停与到达仍刷新定点快照，currentSatellites 会在会话真正结束后透传。
                 final List<Satellite> satellites = currentSatellites();
                 if (satellites == null || satellites.isEmpty()) {
                     // 没有卫星表可注入：与"系统 0 颗卫星"同一种结果（面板：无卫星可用）
@@ -2182,21 +2307,27 @@ final class SystemHooks {
      */
 
     private static Snapshot currentLocation() {
-        final long now = System.currentTimeMillis();
+        final long now = SystemClock.elapsedRealtime();
         if (now - sLocationAt < LOCATION_CACHE_MS) {
             return sLocation;   // 缓存命中：不读 prefs、不建连
         }
         sLocationAt = now;
         Snapshot parsed = readPrefsLocation();   // 1) world-readable prefs
+        String source = "prefs";
         if (parsed == null) {
             final String line = SnapshotClient.readLine(SnapshotClient.REQ_LOCATION,
                     SnapshotClient.DEFAULT_TIMEOUT_MS);   // 2) 主 App 的抽象套接字
             if (line != null) {
                 // 通道已答复；"" = 主 App 明确表示当前没有数据（不再花一次 Provider 读取）
                 parsed = line.isEmpty() ? null : parseLocationJson(line);
+                source = "socket";
             } else {
                 parsed = readProviderSnapshot();   // 3) 套接字不可用：回退 ContentProvider
+                source = "provider";
             }
+        }
+        if (parsed != null) {
+            logSnapshotSource("location", source);
         }
         sLocation = parsed;
         return parsed;
@@ -2218,31 +2349,14 @@ final class SystemHooks {
             return null;
         }
         // 解析复用 /location 的同一套契约（parseLocationJson），不重复实现
-        final Snapshot snapshot = parseLocationJson(json);
-        if (snapshot == null) {
-            return null;   // active=false：主 App 已停止会话，透传真实定位
-        }
-        if (!isFreshSnapshot(snapshot.updatedAt)) {
-            logPrefsStaleOnce(snapshot.updatedAt);
-            return null;
-        }
-        return snapshot;
-    }
-
-    /** prefs 快照是否新鲜：{@code updatedAt} 在 {@link #PREFS_STALE_MS} 内（时钟异常也算过期）。 */
-    private static boolean isFreshSnapshot(long updatedAt) {
-        if (updatedAt <= 0L) {
-            return false;
-        }
-        final long age = System.currentTimeMillis() - updatedAt;
-        return age >= 0L && age <= PREFS_STALE_MS;
+        return parseLocationJson(json);
     }
 
     /** prefs 快照过期：每进程一条（现场看到它就是"prefs 里只剩上一场会话的残留"）。 */
     private static void logPrefsStaleOnce(long updatedAt) {
         try {
             if (sLoggedPrefsStale.compareAndSet(false, true)) {
-                log("snapshot via prefs stale: updatedAt " + (System.currentTimeMillis() - updatedAt)
+                log("location snapshot stale: updatedAt " + (System.currentTimeMillis() - updatedAt)
                         + "ms ago, fallback");
             }
         } catch (Throwable ignored) {
@@ -2258,6 +2372,23 @@ final class SystemHooks {
                 logSnapshotUnavailableOnce("inactive snapshot");
                 return null;
             }
+            if (!root.optBoolean("systemInjection", true)) {
+                return null;
+            }
+            final long sampleTime = root.optLong("updatedAt", 0L);
+            final long sampleAgeMs = System.currentTimeMillis() - sampleTime;
+            if (sampleTime <= 0L || sampleAgeMs < 0L || sampleAgeMs > PREFS_STALE_MS) {
+                logPrefsStaleOnce(sampleTime);
+                return null;
+            }
+            final long nowNanos = SystemClock.elapsedRealtimeNanos();
+            final long sampleNanos = root.optLong("elapsedRealtimeNanos", 0L);
+            if (sampleNanos < 0L || sampleNanos > nowNanos) {
+                return null;
+            }
+            // 与旧版主应用兼容：旧快照只有墙钟，用快照年龄估算其单调时间。
+            final long elapsedNanos = sampleNanos > 0L ? sampleNanos
+                    : Math.max(1L, nowNanos - sampleAgeMs * 1_000_000L);
             return new Snapshot(
                     root.optDouble("lat"), root.optDouble("lon"),
                     root.optDouble("alt"), (float) root.optDouble("speed"),
@@ -2266,7 +2397,7 @@ final class SystemHooks {
                     root.optInt("satellites", 0),
                     (float) root.optDouble("meanCn0", 0),
                     (float) root.optDouble("maxCn0", 0),
-                    root.optLong("updatedAt", 0L));
+                    sampleTime, elapsedNanos);
         } catch (Throwable t) {
             logSnapshotUnavailableOnce("snapshot json: " + t.getClass().getName());
             return null;
@@ -2298,20 +2429,7 @@ final class SystemHooks {
                         if (column < 0) {
                             column = 1;
                         }
-                        final JSONObject root = new JSONObject(cursor.getString(column));
-                        if (root.optBoolean("active", false)) {
-                            parsed = new Snapshot(
-                                    root.optDouble("lat"), root.optDouble("lon"),
-                                    root.optDouble("alt"), (float) root.optDouble("speed"),
-                                    (float) root.optDouble("bearing"),
-                                    (float) root.optDouble("acc"),
-                                    root.optInt("satellites", 0),
-                                    (float) root.optDouble("meanCn0", 0),
-                                    (float) root.optDouble("maxCn0", 0),
-                                    root.optLong("updatedAt", 0L));
-                        } else {
-                            unavailable = "inactive snapshot";
-                        }
+                        parsed = parseLocationJson(cursor.getString(column));
                     }
                 }
             }
@@ -2326,24 +2444,42 @@ final class SystemHooks {
     }
 
     private static List<Satellite> currentSatellites() {
-        final long now = System.currentTimeMillis();
+        if (currentLocation() == null) {
+            // 卫星表可在会话内复用，但会话停止、过期或使用测试 Provider 时必须透传。
+            sSatellites = null;
+            sGnssAt = 0L;
+            return null;
+        }
+        final long now = SystemClock.elapsedRealtime();
         if (now - sGnssAt < GNSS_CACHE_MS) {
             return sSatellites;   // 缓存命中：不读 prefs、不建连
         }
         sGnssAt = now;
         List<Satellite> parsed = readPrefsSatellites();   // 1) world-readable prefs
+        String source = "prefs";
         if (parsed == null) {
             final String line = SnapshotClient.readLine(SnapshotClient.REQ_GNSS,
                     SnapshotClient.DEFAULT_TIMEOUT_MS);   // 2) 主 App 的抽象套接字
             if (line != null) {
                 // 通道已答复；"" = 主 App 当前没有卫星数据
                 parsed = line.isEmpty() ? null : parseSatellitesJson(line);
+                source = "socket";
             } else {
                 parsed = readProviderSatellites();   // 3) 套接字不可用：回退 ContentProvider
+                source = "provider";
             }
+        }
+        if (parsed != null) {
+            logSnapshotSource("gnss", source);
         }
         sSatellites = parsed;
         return parsed;
+    }
+
+    private static void logSnapshotSource(String kind, String source) {
+        if (sLoggedSnapshotSources.add(kind + ":" + source)) {
+            log("system " + kind + " snapshot read via " + source);
+        }
     }
 
     /**

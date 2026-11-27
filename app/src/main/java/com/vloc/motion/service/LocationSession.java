@@ -1,5 +1,7 @@
 package com.vloc.motion.service;
 
+import android.os.SystemClock;
+
 import java.util.Locale;
 
 /**
@@ -14,6 +16,7 @@ public final class LocationSession {
     public static final LocationSession INSTANCE = new LocationSession();
 
     public volatile boolean active;
+    private boolean systemInjection;
     public volatile double lat;
     public volatile double lon;
     public volatile double altitude;
@@ -26,6 +29,7 @@ public final class LocationSession {
     public volatile float meanCn0;
     public volatile float maxCn0;
     public volatile long updatedAt;
+    public volatile long elapsedRealtimeNanos;
 
     /** 单例供运行时使用；包内可见的构造函数供单元测试。 */
     LocationSession() {
@@ -41,6 +45,14 @@ public final class LocationSession {
     public void update(double lat, double lon, double altitude, float speedMps,
                        float bearingDeg, float accuracyMeters, int satellites,
                        float meanCn0, float maxCn0) {
+        update(lat, lon, altitude, speedMps, bearingDeg, accuracyMeters, satellites,
+                meanCn0, maxCn0, System.currentTimeMillis(), SystemClock.elapsedRealtimeNanos(), true);
+    }
+
+    synchronized void update(double lat, double lon, double altitude, float speedMps,
+                             float bearingDeg, float accuracyMeters, int satellites,
+                             float meanCn0, float maxCn0, long timeMs, long elapsedNanos,
+                             boolean systemInjection) {
         this.lat = lat;
         this.lon = lon;
         this.altitude = altitude;
@@ -50,24 +62,28 @@ public final class LocationSession {
         this.satellites = satellites;
         this.meanCn0 = meanCn0;
         this.maxCn0 = maxCn0;
+        this.systemInjection = systemInjection;
+        this.updatedAt = timeMs;
+        this.elapsedRealtimeNanos = elapsedNanos;
         this.active = true;
-        this.updatedAt = System.currentTimeMillis();
     }
 
-    public void clear() {
+    public synchronized void clear() {
         active = false;
+        systemInjection = false;
         updatedAt = 0L;
+        elapsedRealtimeNanos = 0L;
         satellites = 0;
     }
 
     /** 供 ContentProvider 下发的 JSON（模块侧按同一契约解析）。 */
-    public String toJson() {
+    public synchronized String toJson() {
         return String.format(Locale.US,
-                "{\"active\":%s,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,"
+                "{\"active\":%s,\"systemInjection\":%s,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,"
                         + "\"speed\":%.3f,\"bearing\":%.1f,\"acc\":%.1f,"
                         + "\"satellites\":%d,\"meanCn0\":%.1f,\"maxCn0\":%.1f,"
-                        + "\"updatedAt\":%d}",
-                active, lat, lon, altitude, speedMps, bearingDeg, accuracyMeters,
-                satellites, meanCn0, maxCn0, updatedAt);
+                        + "\"updatedAt\":%d,\"elapsedRealtimeNanos\":%d}",
+                active, systemInjection, lat, lon, altitude, speedMps, bearingDeg, accuracyMeters,
+                satellites, meanCn0, maxCn0, updatedAt, elapsedRealtimeNanos);
     }
 }

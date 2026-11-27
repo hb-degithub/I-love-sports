@@ -1,22 +1,20 @@
 # 传感器系统级注入（Zygisk 模块）
 
-> 状态：**已实现，待真机验证**（v0.34.0）。本项目自 v0.37.0 起只做虚拟定位与运动模拟，不含相机功能。
+> ARM64 原生路径依赖 ROM 同时提供下列两个 JNI 方法。已检查的 AOSP 版本及 Android 17 固件样本中未发现这两个方法。使用 LSPosed Java 监听器路径的应用应单独验证计步和 IMU。
 
 ## 1. 为什么需要 Zygisk
 
 | 模拟项 | LSPosed（进程内 Java Hook） | Zygisk（原生 JNI Hook） |
 |---|---|---|
-| 覆盖范围 | 只有勾选作用域的 App | **每个 App 进程自动注入**，无需勾选 |
-| 计步 / IMU | 只能拦 Java `SensorEventListener` | 拦 `SystemSensorManager` 的 JNI 分发点，**Java 与部分 NDK 路径都覆盖** |
+| 覆盖范围 | LSPosed 作用域内的 App | Zygisk 加载的 ARM64 App 进程，且 ROM 具备两个 JNI 方法 |
+| 计步 / IMU | Java `SensorEventListener` | ROM 特定的 `SystemSensorManager` JNI 分发点 |
 | 系统稳定性风险 | 低 | 中（但本模块只替换 JNI 函数指针，**不改写机器指令**） |
-
-所以"系统级"在传感器这一层的落地方案是：**Zygisk 注入每个 App 进程 + 改写传感器事件**。
 
 ## 2. 架构
 
 ```
 主 App（每帧）
-  └─ VlocStateFile.write(...)                       // 128 字节定长结构体
+  └─ VlocStateFile.write(...)                       // 112 字节定长结构体
        files/vloc_state.bin                          // App 私有目录
           └─ Magisk 模块 service.sh（root，每 100ms 复制）
                /data/local/tmp/vloc/state.bin        // chmod 644
@@ -60,8 +58,7 @@ adb logcat -s VLocZygisk
 
 - `state file mapped: /data/local/tmp/vloc/state.bin` —— 成功读到状态
 - `sensor hooks installed: 2/2` —— JNI hook 装上了
-- 若出现 `sensor hooks NOT installed (JNI signature mismatch on this ROM)`，说明该 ROM 的
-  `nativeDispatchSensorEvent` 签名不同，需要按 §7 反馈。
+- `sensor replay unavailable: 0/2` 或 `1/2 JNI hooks matched` 表示无法接管，模块会转发原始事件。
 
 Magisk 侧：
 
@@ -89,4 +86,4 @@ adb shell getprop ro.build.version.release
 adb shell getprop ro.product.model
 ```
 
-如果 hook 没装上，我会按你的 ROM 增加对应的 JNI 签名分支。
+如需进一步核对 ROM，先确认上述日志中的 JNI 匹配数及目标应用实际使用的传感器接口。

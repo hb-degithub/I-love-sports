@@ -46,44 +46,52 @@ public final class GnssCollector {
             return;
         }
         final Handler handler = new Handler(Looper.getMainLooper());
-        final boolean[] done = {false};
-        final GnssStatus.Callback statusCallback = new GnssStatus.Callback() {
-            @Override
-            public void onSatelliteStatusChanged(GnssStatus status) {
-                if (done[0] || status == null) {
+        class Collection extends GnssStatus.Callback implements Runnable {
+            private boolean done;
+
+            private void finish(GnssStatus status) {
+                if (done) {
                     return;
                 }
-                done[0] = true;
-                String json = toJson(status);
+                done = true;
+                handler.removeCallbacks(this);
+                try {
+                    lm.unregisterGnssStatusCallback(this);
+                } catch (RuntimeException e) {
+                    VLog.w(TAG, "unregisterGnssStatusCallback failed", e);
+                }
+                String json = status == null ? null : toJson(status);
                 if (json != null) {
                     RouteStore.saveGnssSnapshot(context, json);
                 }
                 callback.onSnapshot(json != null ? json : loadSaved(context));
             }
-        };
+
+            @Override
+            public void onSatelliteStatusChanged(GnssStatus status) {
+                if (status != null) {
+                    finish(status);
+                }
+            }
+
+            @Override
+            public void run() {
+                finish(null);
+            }
+        }
+        Collection collection = new Collection();
+        boolean registered;
         try {
-            lm.registerGnssStatusCallback(statusCallback, handler);
-        } catch (SecurityException e) {
-            VLog.w(TAG, "registerGnssStatusCallback denied", e);
-            callback.onSnapshot(loadSaved(context));
-            return;
+            registered = lm.registerGnssStatusCallback(collection, handler);
         } catch (RuntimeException e) {
             VLog.w(TAG, "registerGnssStatusCallback failed", e);
-            callback.onSnapshot(loadSaved(context));
-            return;
+            registered = false;
         }
-        handler.postDelayed(() -> {
-            if (done[0]) {
-                return;
-            }
-            done[0] = true;
-            try {
-                lm.unregisterGnssStatusCallback(statusCallback);
-            } catch (RuntimeException ignored) {
-                // 忽略
-            }
+        if (registered) {
+            handler.postDelayed(collection, COLLECT_TIMEOUT_MS);
+        } else {
             callback.onSnapshot(loadSaved(context));
-        }, COLLECT_TIMEOUT_MS);
+        }
     }
 
     private static String toJson(GnssStatus status) {

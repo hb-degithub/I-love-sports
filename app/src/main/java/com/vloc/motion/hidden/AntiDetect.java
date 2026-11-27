@@ -2,13 +2,19 @@ package com.vloc.motion.hidden;
 
 import android.location.Location;
 import android.location.LocationManager;
+import android.os.Handler;
+import android.os.Looper;
 
 import com.vloc.motion.core.DetectionAvoidance;
 import android.os.Build;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.Executor;
 import java.util.Locale;
 
 import com.vloc.motion.hidden.compat.Callback;
@@ -39,7 +45,9 @@ final class AntiDetect {
     private static final String LOCATION_MANAGER_CLASS = "android.location.LocationManager";
 
     private static volatile boolean sLoggedProviders;
-    private static volatile boolean sLoggedNmea;
+    private static final Map<Object, Executor> NMEA_LISTENERS = new WeakHashMap<>();
+    private static final Runnable NMEA_TICK = AntiDetect::publishNmea;
+    private static Handler nmeaHandler;
     private static volatile boolean sLoggedTime;
     private static volatile boolean sLoggedAccuracy;
 
@@ -47,17 +55,13 @@ final class AntiDetect {
     }
 
     static int install(ClassLoader classLoader) {
-        final boolean active = StepReplay.snapshotActive();
-        if (!active) {
-            // 未在模拟：不安装任何改写，避免对真实定位产生任何影响
-            log("anti-detect skipped (not simulating)");
-            return 0;
+        int hooked = hookNmea(classLoader);
+        if (!StepReplay.snapshotActive()) {
+            return hooked;
         }
-        int hooked = 0;
         hooked += hookProviderList(classLoader);
         hooked += hookTimestampConsistency(classLoader);
         hooked += hookAccuracyJitter(classLoader);
-        hooked += hookNmea(classLoader);
         log("anti-detect hooks=" + hooked + "/4");
         return hooked;
     }
@@ -138,61 +142,40 @@ final class AntiDetect {
     
     // ============================================================ 2. 时间戳一致性
 
-    /**
-     * 保证 {@code Location.elapsedRealtimeNanos} 与 {@code time} 同步推进。
-     *
-     * <p>检测思路：真实 GPS 每帧两套时钟一起前进；mock 若只写其中一个（或都固定），
-     * 差值会漂移。这里在读取时按"当前时刻"校正，使差值始终等于开机以来的固定偏移。
-     */
+    /** 仅为缺少单调时间的旧定位提供回退。已有的采样时间保持原值。 */
     private static int hookTimestampConsistency(ClassLoader classLoader) {
         try {
             final Class<?> location = locationClass(classLoader);
             if (location == null) {
-                return 0;   // 类缺失：只记了候选日志，跳过本条 hook
+                return 0;
             }
-            int count = 0;
-            for (String getter : new String[]{"getElapsedRealtimeNanos", "getElapsedRealtimeUncertaintyNanos"}) {
-                try {
-                    Xp.hook(Xp.findMethodExact(location, getter), new Callback() {
-                        @Override
-                        protected void after(Param param) {
-                            try {
-                                if (!StepReplay.snapshotActive()) {
-                                    return;
-                                }
-                                final Location self = (Location) param.thisObject;
-                                if (self == null) {
-                                    return;
-                                }
-                                // 用墙钟时间反推"应该"的 elapsedRealtime，使两者差值恒定
-                                long wall = self.getTime();
-                                if (wall <= 0) {
-                                    return;
-                                }
-                                long drift = System.currentTimeMillis() - wall;
-                                // 只修正明显不一致（>300ms），避免每帧都改动引入抖动
-                                if (drift > 300L) {
-                                    long expectedNanos = android.os.SystemClock.elapsedRealtimeNanos()
-                                            - drift * 1_000_000L;
-                                    if (expectedNanos > 0) {
-                                        self.setElapsedRealtimeNanos(expectedNanos);
-                                        if (!sLoggedTime) {
-                                            sLoggedTime = true;
-                                            log("location timestamp drift corrected: " + drift + "ms");
-                                        }
-                                    }
-                                }
-                            } catch (Throwable ignored) {
-                                // ignore
+            Xp.hook(Xp.findMethodExact(location, "getElapsedRealtimeNanos"), new Callback() {
+                @Override
+                protected void after(Param param) {
+                    try {
+                        if (!(param.getResult() instanceof Long) || (Long) param.getResult() != 0L
+                                || !StepReplay.snapshotActive()) {
+                            return;
+                        }
+                        final Location fix = (Location) param.thisObject;
+                        final long wall = fix.getTime();
+                        final long ageMs = System.currentTimeMillis() - wall;
+                        final long nowNanos = android.os.SystemClock.elapsedRealtimeNanos();
+                        if (wall > 0L && ageMs >= 0L && ageMs <= nowNanos / 1_000_000L) {
+                            final long elapsedNanos = nowNanos - ageMs * 1_000_000L;
+                            fix.setElapsedRealtimeNanos(elapsedNanos);
+                            param.setResult(elapsedNanos);
+                            if (!sLoggedTime) {
+                                sLoggedTime = true;
+                                log("location missing elapsed realtime restored");
                             }
                         }
-                    });
-                    count++;
-                } catch (Throwable ignored) {
-                    // 该 getter 在此版本不存在
+                    } catch (Throwable ignored) {
+                        // 保留系统返回值
+                    }
                 }
-            }
-            return count > 0 ? 1 : 0;
+            });
+            return 1;
         } catch (Throwable t) {
             log("hookTimestampConsistency failed: " + t);
             return 0;
@@ -263,37 +246,40 @@ final class AntiDetect {
             if (manager == null) {
                 return 0;   // 类缺失：只记了候选日志，跳过本条 hook
             }
-            // GpsStatus.NmeaListener（旧接口）与 OnNmeaMessageListener（API 24+）
             int count = 0;
             for (Method method : manager.getDeclaredMethods()) {
-                if (!"addNmeaListener".equals(method.getName())) {
+                final boolean add = "addNmeaListener".equals(method.getName());
+                if (!add && !"removeNmeaListener".equals(method.getName())) {
                     continue;
                 }
                 try {
                     Xp.hook(method, new Callback() {
                         @Override
                         protected void after(Param param) {
-                            try {
-                                if (!StepReplay.snapshotActive() || param.args == null) {
-                                    return;
+                            if (param.args == null || param.hasThrowable()
+                                    || Boolean.FALSE.equals(param.getResult())) {
+                                return;
+                            }
+                            Object listener = null;
+                            Executor executor = Runnable::run;
+                            for (Object arg : param.args) {
+                                if (arg instanceof android.location.OnNmeaMessageListener
+                                        || arg instanceof android.location.GpsStatus.NmeaListener) {
+                                    listener = arg;
+                                } else if (arg instanceof Executor) {
+                                    executor = (Executor) arg;
+                                } else if (arg instanceof Handler) {
+                                    executor = ((Handler) arg)::post;
                                 }
-                                Object listener = param.args[0];
-                                if (listener == null) {
-                                    return;
-                                }
-                                startNmeaFeeder(listener);
-                                if (!sLoggedNmea) {
-                                    sLoggedNmea = true;
-                                    log("NMEA feeder started for " + listener.getClass().getName());
-                                }
-                            } catch (Throwable ignored) {
-                                // ignore
+                            }
+                            if (listener != null) {
+                                updateNmeaListener(listener, executor, add);
                             }
                         }
                     });
                     count++;
                 } catch (Throwable ignored) {
-                    // ignore
+                    // 此签名无法挂载时保留原生 NMEA 回调。
                 }
             }
             return count > 0 ? 1 : 0;
@@ -303,33 +289,79 @@ final class AntiDetect {
         }
     }
 
-    /** 每秒给监听者投递一条 GGA + RMC，坐标来自当前快照。 */
-    private static void startNmeaFeeder(final Object listener) {
-        final android.os.Handler handler =
-                new android.os.Handler(android.os.Looper.getMainLooper());
-        handler.post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    if (!StepReplay.snapshotActive()) {
-                        return;   // 模拟结束：停止投递，交回真实 NMEA
+    private static void updateNmeaListener(Object listener, Executor executor, boolean add) {
+        synchronized (NMEA_LISTENERS) {
+            if (add) {
+                if (nmeaHandler == null) {
+                    final Looper looper = Looper.getMainLooper();
+                    if (looper == null) {
+                        return;
                     }
-                    final StepReplay.StepsSnapshot snapshot = StepReplay.currentSnapshot();
-                    final double[] latLon = currentLatLon();
-                    if (latLon != null) {
-                        final long now = System.currentTimeMillis();
-                        deliverNmea(listener, DetectionAvoidance.buildGga(latLon[0], latLon[1], now, 10, 50.0));
-                        deliverNmea(listener, DetectionAvoidance.buildRmc(latLon[0], latLon[1], now, 0.0, 0.0));
-                    }
-                    handler.postDelayed(this, 1000L);
-                } catch (Throwable ignored) {
-                    // ignore
+                    nmeaHandler = new Handler(looper);
+                }
+                final boolean first = NMEA_LISTENERS.isEmpty();
+                NMEA_LISTENERS.put(listener, executor);
+                if (first) {
+                    nmeaHandler.removeCallbacks(NMEA_TICK);
+                    nmeaHandler.post(NMEA_TICK);
+                }
+            } else {
+                NMEA_LISTENERS.remove(listener);
+                if (nmeaHandler != null && NMEA_LISTENERS.isEmpty()) {
+                    nmeaHandler.removeCallbacks(NMEA_TICK);
                 }
             }
-        });
+        }
     }
 
-    private static double[] currentLatLon() {
+    /** 每个进程只读取一次同帧数据，再向仍注册的监听器发布。 */
+    private static void publishNmea() {
+        final Map<Object, Executor> listeners;
+        synchronized (NMEA_LISTENERS) {
+            if (NMEA_LISTENERS.isEmpty()) {
+                return;
+            }
+            listeners = new HashMap<>(NMEA_LISTENERS);
+            nmeaHandler.postDelayed(NMEA_TICK, 1000L);
+        }
+        final org.json.JSONObject frame = currentLocationFrame();
+        if (frame == null) {
+            return;
+        }
+        final long timeMs = frame.optLong("updatedAt", 0L);
+        final double lat = frame.optDouble("lat");
+        final double lon = frame.optDouble("lon");
+        final long ageMs = System.currentTimeMillis() - timeMs;
+        if (timeMs <= 0L || ageMs < 0L || ageMs > 5_000L
+                || !Double.isFinite(lat) || !Double.isFinite(lon)) {
+            return;
+        }
+        final String gga = DetectionAvoidance.buildGga(lat, lon, timeMs,
+                frame.optInt("satellites", 0), frame.optDouble("alt", 0.0));
+        final String rmc = DetectionAvoidance.buildRmc(lat, lon, timeMs,
+                frame.optDouble("speed", 0.0), frame.optDouble("bearing", 0.0));
+        for (Map.Entry<Object, Executor> entry : listeners.entrySet()) {
+            final Object listener = entry.getKey();
+            final Executor executor = entry.getValue();
+            try {
+                executor.execute(() -> {
+                    synchronized (NMEA_LISTENERS) {
+                        if (NMEA_LISTENERS.get(listener) != executor) {
+                            return;
+                        }
+                    }
+                    if (System.currentTimeMillis() - timeMs <= 5_000L) {
+                        deliverNmea(listener, gga, timeMs);
+                        deliverNmea(listener, rmc, timeMs);
+                    }
+                });
+            } catch (RuntimeException e) {
+                log("NMEA callback executor rejected delivery: " + e.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private static org.json.JSONObject currentLocationFrame() {
         try {
             final android.content.Context context = StepReplay.currentApplication();
             if (context == null) {
@@ -349,21 +381,21 @@ final class AntiDetect {
                 if (!json.optBoolean("active", false)) {
                     return null;
                 }
-                return new double[]{json.optDouble("lat"), json.optDouble("lon")};
+                return json;
             }
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private static void deliverNmea(Object listener, String sentence) {
+    private static void deliverNmea(Object listener, String sentence, long timeMs) {
         try {
             if (listener instanceof android.location.OnNmeaMessageListener) {
-                ((android.location.OnNmeaMessageListener) listener).onNmeaMessage(sentence, 0L);
+                ((android.location.OnNmeaMessageListener) listener).onNmeaMessage(sentence, timeMs);
                 return;
             }
             // 旧接口 android.location.GpsStatus$NmeaListener
-            Xp.callMethod(listener, "onNmeaReceived", 0L, sentence);
+            Xp.callMethod(listener, "onNmeaReceived", timeMs, sentence);
         } catch (Throwable t) {
             log("deliverNmea failed: " + t);
         }

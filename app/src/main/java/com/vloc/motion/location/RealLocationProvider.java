@@ -8,6 +8,7 @@ import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -87,10 +88,16 @@ public final class RealLocationProvider {
         final boolean[] done = {false};
         final LocationListener[] listenerRef = new LocationListener[1];
 
+        final CancellationSignal cancellation = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ? new CancellationSignal() : null;
         final Runnable timeout = () -> {
             if (!done[0]) {
                 done[0] = true;
-                unregister(locationManager, listenerRef[0]);
+                if (cancellation != null) {
+                    cancellation.cancel();
+                } else {
+                    unregister(locationManager, listenerRef[0]);
+                }
                 callback.onError("定位超时：请确认系统定位已开启，或到室外/窗边重试");
             }
         };
@@ -123,12 +130,11 @@ public final class RealLocationProvider {
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                locationManager.getCurrentLocation(provider, null,
+                locationManager.getCurrentLocation(provider, cancellation,
                         context.getMainExecutor(), location -> {
                             if (!done[0] && location != null) {
                                 done[0] = true;
                                 handler.removeCallbacks(timeout);
-                                unregister(locationManager, listenerRef[0]);
                                 callback.onLocation(location);
                             }
                         });

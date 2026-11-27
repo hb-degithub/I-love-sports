@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.location.Location;
+import android.location.LocationManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -152,9 +153,7 @@ public class LocationService extends Service {
     private static final long SYSTEM_MODULE_HEARTBEAT_MS = HookHeartbeatStore.FRESH_MS;
     /** 系统级注入但模块不在线时的统一错误文案（UI 直接展示）。 */
     private static final String SYSTEM_MODULE_MISSING_MSG =
-            "系统级注入已开启，但未检测到模块活动：请确认模块已在 LSPosed 启用、作用域勾选"
-                    + "「系统框架」后重启手机；或关闭「系统级注入」改用 root 注入。"
-                    + "可打开「模块状态」查看各进程心跳";
+            "未检测到近期的系统定位快照读取或有效的系统框架心跳。可在「模块状态」查看各进程心跳。";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final RoutePlayer player = new RoutePlayer();
@@ -741,6 +740,9 @@ public class LocationService extends Service {
     /** 服务不退出、只重置播放/注入状态（用于"重新开始"）。 */
     private void resetForRestart() {
         stopTicker();
+        LocationSession.INSTANCE.clear();
+        GnssSession.INSTANCE.clear();
+        SnapshotPrefs.INSTANCE.stop();
         releaseInjector();
         hideOverlay();
         releaseWakeLock();
@@ -766,9 +768,13 @@ public class LocationService extends Service {
         gnssSourceLogged = null;
     }
 
-    /** 采集真实卫星分布（用于模块回放 GnssStatus），失败则复用上次快照。 */
+    /** 采集真实卫星分布，忽略已经停止或被替换的会话所发起的采集。 */
     private void collectGnssSnapshot() {
+        final int seq = sessionSeq;
         GnssCollector.collect(this, json -> {
+            if (isStalePrepare(seq)) {
+                return;
+            }
             // 自动模式的判据只有这一份"本次采集结果"：null / 空 / 解析不出卫星 → 回退合成
             gnssCollectedJson = json;
             gnssCollectResolved = true;
@@ -777,11 +783,9 @@ public class LocationService extends Service {
                 // （否则模块会先用真实卫星注入，下一秒才被合成表覆盖）
                 return;
             }
-            if (json != null) {
+            if (hasSatellites(json)) {
                 GnssSession.INSTANCE.set(json);
-                if (hasSatellites(json)) {
-                    logGnssSource("collected");
-                }
+                logGnssSource("collected");
             }
         });
     }
@@ -1164,7 +1168,7 @@ public class LocationService extends Service {
             return new PrepareResult(true, null);
         }
         // 没有既有痕迹：主动触发一次定位读取，逼 system_server 里的模块回读快照
-        probeSystemModule();
+        final String probe = probeSystemModule();
         final long deadline = SystemClock.elapsedRealtime() + SYSTEM_MODULE_PROBE_WAIT_MS;
         while (SystemClock.elapsedRealtime() < deadline) {
             if (isSystemModuleOnline()) {
@@ -1173,11 +1177,43 @@ public class LocationService extends Service {
             }
             SystemClock.sleep(SYSTEM_MODULE_PROBE_POLL_MS);
         }
-        // 仍无痕迹：绝不再"假成功"，走与 root 失败相同的失败路径
-        VLog.w(TAG, "system inject enabled but no module evidence: no snapshot read within "
-                + SYSTEM_MODULE_FRESH_MS + "ms (probe waited " + SYSTEM_MODULE_PROBE_WAIT_MS
-                + "ms) and no system heartbeat within " + SYSTEM_MODULE_HEARTBEAT_MS + "ms");
-        return PrepareResult.failed(session, SYSTEM_MODULE_MISSING_MSG);
+        if (isSystemModuleOnline()) {
+            return new PrepareResult(true, null);
+        }
+        final String detail = startupDiagnostics(probe);
+        VLog.w(TAG, detail);
+        return PrepareResult.failed(session, detail);
+    }
+
+    private String startupDiagnostics(String probe) {
+        final long now = System.currentTimeMillis();
+        final long uptime = SystemClock.elapsedRealtime();
+        final long seen = StepSession.INSTANCE.moduleSystemReadAt;
+        List<HookHeartbeatStore.Beat> beats = HookHeartbeatStore.beats(this);
+        StringBuilder detail = new StringBuilder(SYSTEM_MODULE_MISSING_MSG)
+                .append(" 定位探测：").append(probe)
+                .append("；SDK=").append(Build.VERSION.SDK_INT)
+                .append("；开机时长=").append(uptime / 1000).append("秒")
+                .append("；本次会话系统读取=");
+        if (seen == 0) {
+            detail.append("未记录");
+        } else {
+            detail.append("距今 ").append(now - seen).append("ms");
+        }
+        int frameworkCount = 0;
+        for (HookHeartbeatStore.Beat beat : beats) {
+            if (HookHeartbeatStore.isSystemServerProcess(beat.process)) {
+                frameworkCount++;
+                detail.append("；").append(beat.process)
+                        .append(" kind=").append(beat.kind)
+                        .append(" SDK=").append(beat.sdk)
+                        .append(" hooks=").append(beat.hooks)
+                        .append(" 模块版本号=").append(beat.ver)
+                        .append(" 距今=").append((now - beat.at) / 1000).append("秒");
+            }
+        }
+        return detail.append("；框架心跳记录数=").append(frameworkCount)
+                .append("，其他进程记录数=").append(beats.size() - frameworkCount).toString();
     }
 
     /**
@@ -1190,7 +1226,7 @@ public class LocationService extends Service {
      *       窗口 {@link #SYSTEM_MODULE_FRESH_MS}（5 秒）——启动阶段的严格证据。</li>
      *   <li><b>系统框架心跳</b>：模块注入 {@code android} 进程后 insert 了一条
      *       {@code kind=system} 的心跳（{@link HookHeartbeatStore}）。窗口
-     *       {@link #SYSTEM_MODULE_HEARTBEAT_MS}（24 小时），SDK 一致优先。</li>
+     *       {@link #SYSTEM_MODULE_HEARTBEAT_MS}（24 小时），必须来自系统框架且 SDK 一致。</li>
      * </ol>
      *
      * <p>为什么要加第 2 条：目标 App 可能暂时没请求定位（刚开机、被切后台、用户还没打开），
@@ -1238,8 +1274,18 @@ public class LocationService extends Service {
 
     /** 最近 {@link #SYSTEM_MODULE_HEARTBEAT_MS} 内有没有 {@code kind=system} 的心跳。 */
     private boolean systemHeartbeatFresh() {
-        return HookHeartbeatStore.freshestSystem(getApplicationContext(),
-                SYSTEM_MODULE_HEARTBEAT_MS, Build.VERSION.SDK_INT) != null;
+        return systemFrameworkBeat() != null;
+    }
+
+    private HookHeartbeatStore.Beat systemFrameworkBeat() {
+        final HookHeartbeatStore.Beat beat = HookHeartbeatStore.freshestSystem(getApplicationContext(),
+                SYSTEM_MODULE_HEARTBEAT_MS, Build.VERSION.SDK_INT);
+        if (beat == null || !HookHeartbeatStore.isSystemServerProcess(beat.process)
+                || beat.sdk != Build.VERSION.SDK_INT || beat.hooks <= 0
+                || beat.at < System.currentTimeMillis() - SystemClock.elapsedRealtime()) {
+            return null;
+        }
+        return beat;
     }
 
     /** 日志用：说明这次判活靠哪条证据（快照读取 or 系统框架心跳），失败时说明两条都没有。 */
@@ -1250,8 +1296,7 @@ public class LocationService extends Service {
         if (age >= 0L && age <= SYSTEM_MODULE_FRESH_MS) {
             return "module read our snapshot " + age + "ms ago";
         }
-        HookHeartbeatStore.Beat beat = HookHeartbeatStore.freshestSystem(getApplicationContext(),
-                SYSTEM_MODULE_HEARTBEAT_MS, Build.VERSION.SDK_INT);
+        final HookHeartbeatStore.Beat beat = systemFrameworkBeat();
         if (beat != null) {
             return "system heartbeat from " + beat.process + " (" + beat.hooks + " hooks, "
                     + (now - beat.at) + "ms ago)";
@@ -1265,32 +1310,33 @@ public class LocationService extends Service {
     /**
      * 主动探测：本进程读一次"最后已知位置"。
      *
-     * <p>system_server 里的模块挂了 {@code getLastLocation/getCurrentLocation} 的
-     * after-hook（{@code hidden/SystemHooks.java:203-219}），hook 里会调用
+     * <p>system_server 里的模块挂了 {@code getLastLocation} 的 after-hook，hook 里会调用
      * {@code currentLocation()} → query 本应用的 /location 快照，从而留下真实读取痕迹。
-     * 权限不足 / ROM 差异导致失败时静默忽略，由调用方继续轮询到超时。
+     * 记录每个 provider 的调用结果，不记录坐标。
      */
-    private void probeSystemModule() {
+    private String probeSystemModule() {
         try {
-            android.location.LocationManager lm =
-                    (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
-            if (lm == null) {
-                return;
+            LocationManager manager = (LocationManager) getSystemService(LOCATION_SERVICE);
+            if (manager == null) {
+                return "系统定位服务不可用";
             }
-            try {
-                if (lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
-                    lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER);
-                }
-            } catch (Throwable ignored) {
-                // 未授予定位权限 / provider 不可用：换下一个
+            return "GPS " + probeProvider(manager, LocationManager.GPS_PROVIDER)
+                    + "，网络 " + probeProvider(manager, LocationManager.NETWORK_PROVIDER);
+        } catch (RuntimeException e) {
+            return "获取定位服务失败（" + e.getClass().getSimpleName() + "）";
+        }
+    }
+
+    private String probeProvider(LocationManager manager, String provider) {
+        try {
+            if (LocationManager.GPS_PROVIDER.equals(provider) && !manager.isProviderEnabled(provider)) {
+                return "已关闭，跳过读取";
             }
-            try {
-                lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER);
-            } catch (Throwable ignored) {
-                // 同上
-            }
-        } catch (Throwable t) {
-            VLog.w(TAG, "probe system module failed", t);
+            return manager.getLastKnownLocation(provider) == null ? "无缓存位置" : "已读取缓存位置";
+        } catch (SecurityException e) {
+            return "访问被拒绝";
+        } catch (RuntimeException e) {
+            return "调用失败（" + e.getClass().getSimpleName() + "）";
         }
     }
 
@@ -1379,6 +1425,7 @@ public class LocationService extends Service {
     };
 
     private void stopTicker() {
+        handler.removeCallbacks(autoStopRunnable);
         if (ticker != null) {
             handler.removeCallbacks(ticker);
             ticker = null;
@@ -1388,12 +1435,14 @@ public class LocationService extends Service {
     private void pushSpotLocation() {
         Fix fix = applyRealismFix(spotLat, spotLon, baseAltitude, 0.0, 0.0);
         // 系统级注入：本进程不写测试 Provider，但要发布快照给模块
+        final long timeMs = System.currentTimeMillis();
+        final long elapsedNanos = SystemClock.elapsedRealtimeNanos();
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
                 fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites,
-                fix.meanCn0, fix.maxCn0);
+                fix.meanCn0, fix.maxCn0, timeMs, elapsedNanos, sessionSystemInject);
         if (injector != null) {
             try {
-                injector.push(fix, System.currentTimeMillis());
+                injector.push(fix, timeMs, elapsedNanos);
             } catch (RuntimeException e) {
                 failInjection(e);
                 return;
@@ -1423,9 +1472,11 @@ public class LocationService extends Service {
 
     private void injectFix(Fix fix) {
         // 无论哪种注入方式，都先把最新快照发布给模块（系统级注入在 system_server 读取它）
+        final long timeMs = System.currentTimeMillis();
+        final long elapsedNanos = SystemClock.elapsedRealtimeNanos();
         LocationSession.INSTANCE.update(fix.lat, fix.lon, fix.altitudeMeters,
                 fix.speedMps, fix.bearingDeg, fix.accuracyMeters, fix.satellites,
-                fix.meanCn0, fix.maxCn0);
+                fix.meanCn0, fix.maxCn0, timeMs, elapsedNanos, sessionSystemInject);
         if (injector == null) {
             // 系统级注入：本进程不写测试 Provider，由 system_server 里的模块改写定位。
             // 但只有"能证明模块在动"时才允许空转，否则界面会显示运行中、里程在涨，
@@ -1460,7 +1511,7 @@ public class LocationService extends Service {
             return;
         }
         try {
-            injector.push(fix, System.currentTimeMillis());
+            injector.push(fix, timeMs, elapsedNanos);
         } catch (RuntimeException e) {
             failInjection(e);
         }
@@ -1562,7 +1613,7 @@ public class LocationService extends Service {
      */
     private void publishNativeSensorState(double dt, double speed, double bearing) {
         try {
-            if (!RouteStore.loadSystemInject(this)) {
+            if (!sessionSystemInject) {
                 if (nativeImuTick != -1L) {
                     nativeImuTick = -1L;
                     VlocStateFile.clear();
@@ -1695,6 +1746,8 @@ public class LocationService extends Service {
         // 先让仍在后台准备的会话过期：它之后的 post 会被 isStalePrepare 丢弃并自行释放
         ++sessionSeq;
         stopTicker();
+        LocationSession.INSTANCE.clear();
+        GnssSession.INSTANCE.clear();
         // 紧接着摘掉快照套接字：模块必须立刻停止改写、回到真实定位，不能继续读到本场快照。
         // stop() 幂等、且最多等待守护线程 500ms（见 SnapshotServer），不会拖住主线程收尾。
         SnapshotServer.INSTANCE.stop();
@@ -1723,9 +1776,7 @@ public class LocationService extends Service {
         lastHoldPushMs = 0L;
         EnvSession.INSTANCE.clear();
         StepSession.INSTANCE.clear();
-        LocationSession.INSTANCE.clear();
         VlocStateFile.clear();
-        GnssSession.INSTANCE.clear();
         cancelSystemModuleAlert();
         session.mode = Session.Mode.IDLE;
         session.paused = false;

@@ -40,6 +40,23 @@ public class LocationSessionTest {
     }
 
     @Test
+    public void serializesSampleTimesWithTheSameFix() throws Exception {
+        LocationSession session = new LocationSession();
+        session.update(1, 2, 3, 4, 5, 6, 7, 8, 9, 1700000000000L, 123456789L, false);
+
+        JSONObject firstRead = new JSONObject(session.toJson());
+        JSONObject secondRead = new JSONObject(session.toJson());
+        assertTrue(firstRead.getBoolean("active"));
+        assertFalse(firstRead.getBoolean("systemInjection"));
+        assertEquals(1700000000000L, firstRead.getLong("updatedAt"));
+        assertEquals(123456789L, firstRead.getLong("elapsedRealtimeNanos"));
+        assertEquals(firstRead.getLong("updatedAt"), secondRead.getLong("updatedAt"));
+        assertEquals(firstRead.getLong("elapsedRealtimeNanos"), secondRead.getLong("elapsedRealtimeNanos"));
+        assertEquals(4.0, secondRead.getDouble("speed"), 0.001);
+        assertEquals(5.0, secondRead.getDouble("bearing"), 0.001);
+    }
+
+    @Test
     public void clearStopsInjection() throws Exception {
         LocationSession session = new LocationSession();
         session.update(1, 2, 3, 4, 5, 6, 7);
@@ -47,6 +64,7 @@ public class LocationSessionTest {
         JSONObject json = new JSONObject(session.toJson());
         assertFalse("停止模拟后模块必须透传真实定位", json.getBoolean("active"));
         assertEquals(0L, json.getLong("updatedAt"));
+        assertEquals(0L, json.getLong("elapsedRealtimeNanos"));
     }
 
     @Test

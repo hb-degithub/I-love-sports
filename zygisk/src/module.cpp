@@ -261,7 +261,7 @@ bool rewriteValues(int type, jfloatArray valuesArray, JNIEnv *env) {
 void dispatchHook(JNIEnv *env, jclass clazz, jint handle, jfloatArray values,
                   jint accuracy, jlong timestamp) {
     int type = typeOfHandle(handle);
-    if (type != 0) {
+    if (gOrigNextEvent != nullptr && type != 0) {
         rewriteValues(type, values, env);
     }
     if (gOrigDispatch != nullptr) {
@@ -350,10 +350,10 @@ public:
             hooked++;
         }
 
-        if (hooked > 0) {
-            LOG("sensor hooks installed: %d/2 (process hooked)", hooked);
+        if (hooked == 2) {
+            LOG("sensor hooks installed: 2/2");
         } else {
-            LOG("sensor hooks NOT installed (JNI signature mismatch on this ROM)");
+            LOG("sensor replay unavailable: %d/2 JNI hooks matched; using original events", hooked);
         }
     }
 

@@ -309,6 +309,10 @@ public final class EnvProvider extends ContentProvider {
         if (HookHeartbeatStore.normalizeKind(kind) == null) {
             return null;
         }
+        if (HookHeartbeatStore.isSystemServerProcess(process)
+                && Binder.getCallingUid() != Process.SYSTEM_UID) {
+            return null;
+        }
         final long now = System.currentTimeMillis();
         final long at = rawAt == null || rawAt <= 0L ? now : rawAt;
         if (!HookHeartbeatStore.isValidAt(at, now)) {
