@@ -3,7 +3,7 @@
 > **专注虚拟定位与跑步模拟**：root 注入定位、路径播放、拟真轨迹、GNSS 卫星回放、
 > 计步 / IMU / 姿态回放、LSPosed 隐藏模块、system_server 系统级注入、Zygisk 传感器模块。
 >
-> 当前版本 **v0.37.1** · 相机 / 虚拟摄像头相关功能已于 v0.37.0 **完全移除**。
+> 最新正式发布 **v0.48.6** · 相机 / 虚拟摄像头相关功能已于 v0.37.0 **完全移除**。
 
 <p>
   <a href="https://github.com/hb-degithub/I-love-sports/actions/workflows/android.yml">
@@ -112,11 +112,11 @@ Android 虚拟定位 App：通过 **root** 向系统注入伪造定位，可在�
 
 | 文件 | 说明 |
 |---|---|
-| `virtual-motion-0.37.1.apk` | 主 App + 内置隐藏模块（`Releases` 里下载） |
-| `vloc-zygisk-v0.37.1.zip` | Zygisk 传感器模块（可选，Magisk 刷入） |
+| `virtual-motion-0.48.6.apk` | 主 App + 内置隐藏模块（`Releases` 里下载） |
+| `vloc-zygisk-v0.48.6.zip` | Zygisk 传感器模块（可选，Magisk 刷入） |
 
 ```bash
-adb install -r virtual-motion-0.37.1.apk
+adb install -r virtual-motion-0.48.6.apk
 ```
 
 > 升级提示：如果之前装过独立的隐藏模块，先 `adb uninstall com.vloc.motion.hidden`，
@@ -239,6 +239,21 @@ root 授权
 - 默认：LSPosed 模块在目标 App 进程内合成传感器事件（按步态波形）
 - 可选：**Zygisk 模块**注入每个 App 进程，在 `SystemSensorManager` 的 JNI 分发点改写，
   无需作用域（见 `docs/zygisk-sensors.md`）
+
+## Android 版本兼容性
+
+当前主分支声明最低 Android 8.0（API 26），使用 SDK 35 编译，目标 SDK 为 34。以下结果来自主分支的 Android Lint 检查和 Android 17 真机短测；正式发布包之后的主分支改动需单独验证。
+
+| 系统版本 | 当前验证结果 |
+|---|---|
+| Android 7.1 及更早（API ≤ 25） | 低于 APK 安装要求。 |
+| Android 8.0–8.1（API 26–27） | Lint 指出快照服务有三处将 `LocalServerSocket` 作为 `Closeable` 传入关闭函数。该类型关系从 API 28 才成立，旧系统关闭连接或停止服务时有兼容风险。 |
+| Android 9（API 28） | 本次本地模拟器因缺少 KVM 访问权限未能启动，尚无本次运行验证结果。 |
+| Android 10–13（API 29–33） | 前台服务启动路径传入了 API 34 引入的 `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`。Lint 已提示版本差异，实际影响仍待对应系统验证。 |
+| Android 14–16（API 34–36） | 本轮没有在这些版本上执行端到端测试。 |
+| Android 17（API 37） | 一台真机在软重启后记录到系统框架心跳。运行中连续三次读取到更新的应用侧 GNSS 卫星快照；接收端的卫星回调和速度精度仍待验证。 |
+
+普通单次定位在 API 26–29 使用 `requestSingleUpdate()`，从 API 30 起使用 `getCurrentLocation()`。系统框架私有接口还需按系统版本和 ROM 实测。
 
 ## 已知限制
 
