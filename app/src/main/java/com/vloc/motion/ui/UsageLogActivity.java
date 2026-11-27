@@ -89,7 +89,7 @@ public class UsageLogActivity extends AppCompatActivity {
         ExecutorService service = executor;
         executor = null;
         if (service != null) {
-            service.shutdownNow();
+            service.shutdown();
         }
         super.onDestroy();
     }
@@ -119,26 +119,18 @@ public class UsageLogActivity extends AppCompatActivity {
     }
 
     /** 删除 / 清空：在后台线程改盘，再读回最新列表。 */
-    private void mutate(Runnable action) {
+    private void mutate(java.util.function.BooleanSupplier action, String success) {
         executor().execute(() -> {
+            boolean changed = false;
             try {
-                action.run();
+                changed = action.getAsBoolean();
             } catch (RuntimeException e) {
                 Log.w(TAG, "修改使用记录失败", e);
             }
-            List<UsageLog.Entry> loaded;
-            try {
-                loaded = UsageLog.list(getApplicationContext());
-            } catch (RuntimeException e) {
-                Log.w(TAG, "读取使用记录失败", e);
-                loaded = new ArrayList<>();
-            }
-            final List<UsageLog.Entry> result = loaded;
+            final String outcome = changed ? success : "未能确认删除，请重新查看使用记录";
             post(() -> {
-                loading = false;
-                entries.clear();
-                entries.addAll(result);
-                refresh();
+                toast(outcome);
+                startLoad();
             });
         });
     }
@@ -194,8 +186,7 @@ public class UsageLogActivity extends AppCompatActivity {
                 .setPositiveButton("删除这条", (dialog, which) -> {
                     long id = entry.id;
                     // 删除 + 重新读取都在后台线程，主线程只等回调刷新
-                    mutate(() -> UsageLog.delete(getApplicationContext(), id));
-                    toast("已删除");
+                    mutate(() -> UsageLog.delete(getApplicationContext(), id), "已删除");
                 })
                 .setNegativeButton("关闭", null)
                 .show();
@@ -211,8 +202,7 @@ public class UsageLogActivity extends AppCompatActivity {
                 .setTitle("清空全部使用记录")
                 .setMessage("将删除全部 " + entries.size() + " 条记录，清空后不可恢复。")
                 .setPositiveButton("清空", (dialog, which) -> {
-                    mutate(() -> UsageLog.clear(getApplicationContext()));
-                    toast("已清空");
+                    mutate(() -> UsageLog.clear(getApplicationContext()), "已清空");
                 })
                 .setNegativeButton("取消", null)
                 .show();

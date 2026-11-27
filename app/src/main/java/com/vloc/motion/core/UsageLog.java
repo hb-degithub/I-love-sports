@@ -24,7 +24,7 @@ import java.util.List;
  * 给用户回顾"刚才跑了什么"，没必要无限增长；50 条大约相当于一周的日常使用量。
  *
  * <p><b>写入方式</b>：{@link #record} / {@link #delete} / {@link #updateCleanup} 都是
- * "读整份 JSON → 改 → 写回"，用 {@link #LOCK} 串行化；落盘一律 {@code apply()}（异步），
+ * "读整份 JSON → 改 → 写回"，用 {@link #LOCK} 串行化；自动记录使用 {@code apply()}，手动删除在后台线程确认落盘，
  * 不阻塞调用线程（会话停止流程在主线程）。读改写窗口很短（最多 50 条），可以接受。
  *
  * <p><b>容错</b>：JSON 损坏 / 机型上的 prefs 读异常一律视为"没有记录"，返回空列表，
@@ -218,15 +218,16 @@ public final class UsageLog {
     }
 
     /** 清空全部记录（设置项不受影响：独立 prefs）。 */
-    public static void clear(Context context) {
+    public static boolean clear(Context context) {
         if (context == null) {
-            return;
+            return false;
         }
         synchronized (LOCK) {
             try {
-                prefs(context).edit().remove(KEY_ENTRIES).apply();
+                return prefs(context).edit().remove(KEY_ENTRIES).commit();
             } catch (RuntimeException e) {
                 Log.w(TAG, "clear failed: " + e);
+                return false;
             }
         }
     }
@@ -252,7 +253,7 @@ public final class UsageLog {
             if (!removed) {
                 return false;
             }
-            return save(context, all);
+            return save(context, all, true);
         }
     }
 
@@ -342,12 +343,20 @@ public final class UsageLog {
 
     /** 写回整份记录；失败只记日志（记录功能不能影响主流程）。 */
     private static boolean save(Context context, List<Entry> entries) {
+        return save(context, entries, false);
+    }
+
+    private static boolean save(Context context, List<Entry> entries, boolean confirmWrite) {
         JSONArray array = new JSONArray();
         for (Entry entry : entries) {
             array.put(entry.toJson());
         }
         try {
-            prefs(context).edit().putString(KEY_ENTRIES, array.toString()).apply();
+            SharedPreferences.Editor edit = prefs(context).edit().putString(KEY_ENTRIES, array.toString());
+            if (confirmWrite) {
+                return edit.commit();
+            }
+            edit.apply();
             return true;
         } catch (RuntimeException e) {
             Log.w(TAG, "write failed: " + e);
